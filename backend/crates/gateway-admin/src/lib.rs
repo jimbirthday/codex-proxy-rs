@@ -355,6 +355,7 @@ pub async fn initialize(
         registry.clone(),
         snapshot.clone(),
         probe.clone(),
+        store.proxies(),
     ));
     let backup_ports = store.backup();
     let backups = Arc::new(DefaultBackupService::new(
@@ -446,6 +447,9 @@ pub async fn initialize(
     .map_err(|_| AdminError::internal("导入 Worker 注册信息不合法"))?;
     worker_contributions.push(WorkerContribution::Registration(registration));
     worker_contributions.extend(freeze_recovery_worker_contribution(freeze_recovery)?);
+    worker_contributions.push(turn_state_renewal_worker_contribution(
+        use_case::accounts::TurnStateRenewalTask::new(accounts),
+    )?);
     Ok(AdminBundle {
         services,
         worker_contributions,
@@ -500,6 +504,32 @@ fn freeze_recovery_worker_contribution(
     )
     .map_err(|_| AdminError::internal("冻结恢复 Worker 注册信息不合法"))?;
     Ok(vec![WorkerContribution::Registration(registration)])
+}
+
+/// Turn state 是进程内运行态，每个实例都需要独立续采，因此不申请集群 leader lease。
+fn turn_state_renewal_worker_contribution(
+    task: use_case::accounts::TurnStateRenewalTask,
+) -> Result<WorkerContribution, AdminError> {
+    let id = WorkerId::try_new(WorkerKind::TurnStateRenewal, OPENAI_PROVIDER_KIND)
+        .map_err(|_| AdminError::internal("Turn state Worker ID 不合法"))?;
+    let schedule = WorkerSchedule::try_new(
+        use_case::accounts::TURN_STATE_RENEWAL_INTERVAL,
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+        Duration::from_secs(15 * 60),
+        Duration::from_secs(5 * 60),
+    )
+    .map_err(|_| AdminError::internal("Turn state Worker 调度配置不合法"))?;
+    WorkerRegistration::try_new(
+        id,
+        WorkerRunnable::Scheduled {
+            schedule,
+            lease: None,
+            task: Box::new(task),
+        },
+    )
+    .map(WorkerContribution::Registration)
+    .map_err(|_| AdminError::internal("Turn state Worker 注册信息不合法"))
 }
 
 fn provider_kind(value: &'static str) -> Result<ProviderKind, AdminError> {

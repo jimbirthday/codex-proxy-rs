@@ -165,9 +165,13 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
         test_wire_profile(),
     )
     .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(1))));
+    let payload_sent_count = AtomicUsize::new(0);
+    let payload_sent = || {
+        payload_sent_count.fetch_add(1, Ordering::SeqCst);
+    };
 
     let response = backend
-        .create_response(
+        .create_response_stream_with_pool_account_and_payload_sent(
             &request,
             CodexRequestContext {
                 trace: None,
@@ -189,11 +193,17 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
                 turn_id: None,
                 account_selection: Default::default(),
             },
+            None,
+            Some(&payload_sent),
         )
         .await
         .expect("websocket response");
+    let response = collect_backend_response(response, Instant::now())
+        .await
+        .expect("collect websocket response");
     let payload = server.await.expect("header server task");
 
+    assert_eq!(payload_sent_count.load(Ordering::SeqCst), 1);
     assert!(response.body.contains("resp_ws_security"));
     assert_eq!(payload["prompt_cache_key"], "client-thread");
     let metadata = payload["client_metadata"]

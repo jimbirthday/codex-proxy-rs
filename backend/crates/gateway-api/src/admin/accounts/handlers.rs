@@ -55,6 +55,18 @@ where
             get(test_account_connection::<S>),
         )
         .route(
+            "/api/admin/accounts/turn-state",
+            get(account_turn_state::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/overview",
+            get(account_turn_state_overview::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/probe",
+            post(probe_account_turn_state::<S>),
+        )
+        .route(
             "/api/admin/accounts/oauth/start",
             post(start_account_authorization::<S>),
         )
@@ -605,4 +617,71 @@ where
             Ok(Event::default().data(data))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+async fn account_turn_state<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<TurnStateRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let (account_id, model) = query.into_command().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .accounts()
+        .turn_state_snapshot(&account_id, &model)
+        .await
+        .map_err(map_service_error)?
+        .map(TurnStateSnapshotData::from);
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(result),
+    ))
+}
+
+async fn account_turn_state_overview<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .accounts()
+        .turn_state_overview()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(
+            result
+                .into_iter()
+                .map(TurnStateOverviewEntryData::from)
+                .collect::<Vec<_>>(),
+        ),
+    ))
+}
+
+async fn probe_account_turn_state<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<TurnStateRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let (account_id, model) = request.into_command().map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .accounts()
+        .probe_turn_state(account_id, model)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateProbeData::from(result)),
+    ))
 }

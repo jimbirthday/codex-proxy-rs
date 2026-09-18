@@ -85,6 +85,7 @@ impl CodexBackendClient {
         &self,
         upstream_request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
+        payload_sent: Option<&(dyn Fn() + Sync)>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
         let headers = self.request_headers_for_http_response(upstream_request, context)?;
         let headers_started_at = Instant::now();
@@ -121,6 +122,9 @@ impl CodexBackendClient {
             body
         };
         let response = outbound.body(body).send().await?;
+        if let Some(payload_sent) = payload_sent {
+            payload_sent();
+        }
         let upstream_headers_ms = elapsed_duration_millis(headers_started_at.elapsed());
         let http_version = http_version_name(response.version()).to_string();
         let status = response.status();
@@ -216,11 +220,34 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
         pool_account_id: Option<&str>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
+        self.create_response_stream_with_pool_account_and_payload_sent(
+            request,
+            context,
+            pool_account_id,
+            None,
+        )
+        .await
+    }
+
+    /// 与常规发送相同，并在业务 payload 已确认写入 transport 后通知调用方。
+    #[doc(hidden)]
+    pub async fn create_response_stream_with_pool_account_and_payload_sent(
+        &self,
+        request: &CodexResponsesRequest,
+        context: CodexRequestContext<'_>,
+        pool_account_id: Option<&str>,
+        payload_sent: Option<&(dyn Fn() + Sync)>,
+    ) -> CodexClientResult<CodexBackendStreamingResponse> {
         let prepared = self
             .prepare_response_transport_with_pool_account(request, context, pool_account_id)
             .await?;
-        self.create_response_stream_with_prepared(request, context, prepared)
-            .await
+        self.create_response_stream_with_prepared_and_payload_sent(
+            request,
+            context,
+            prepared,
+            payload_sent,
+        )
+        .await
     }
 
     /// 在发送 payload 前完成 transport 选择和可取消的 WebSocket opening。
@@ -393,12 +420,12 @@ impl CodexBackendClient {
         })
     }
 
-    #[doc(hidden)]
-    pub(crate) async fn create_response_stream_with_prepared(
+    async fn create_response_stream_with_prepared_and_payload_sent(
         &self,
         request: &CodexResponsesRequest,
         context: CodexRequestContext<'_>,
         prepared: PreparedResponseTransport,
+        payload_sent: Option<&(dyn Fn() + Sync)>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
         let PreparedResponseTransport {
             requirement,
@@ -414,7 +441,7 @@ impl CodexBackendClient {
         );
         match route {
             PreparedResponseRoute::Http => self
-                .create_response_stream_http_sse(request, context)
+                .create_response_stream_http_sse(request, context, payload_sent)
                 .await
                 .map(|mut response| {
                     merge_preparation_metrics(&mut response.transport_metrics, metrics);
@@ -436,6 +463,9 @@ impl CodexBackendClient {
                 )
                 .await
                 .map_err(websocket_exchange_error_to_client_error)?;
+                if let Some(payload_sent) = payload_sent {
+                    payload_sent();
+                }
                 if requirement.allows_connection_restart() {
                     match await_websocket_delivery_boundary(&mut exchange).await {
                         Ok(DeliveryBoundary::Ready) => {}

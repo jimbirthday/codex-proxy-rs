@@ -376,6 +376,9 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
+| `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
+| `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，通过全部已保存代理探测并立即替换有效 state，返回触发类型及每个代理的状态码、耗时和结果；未配置代理时拒绝请求 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -514,6 +517,36 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 - `sendState` 为 `not_sent`、`sent`、`ambiguous`，非 Provider 错误为 `null`。
 - `error`、`providerErrorCode`、`providerErrorType`、`upstreamStatus`、`upstreamContentType` 和
   `upstreamBody` 是实际捕获的原始诊断字段；缺失时为 `null`，不会由本地猜测或翻译。
+
+### Codex turn state 探测
+
+OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存态 `current_turn_state`。只有恰好一个、
+原始长度为 292 字节且可作为 HTTP HeaderValue 的 `x-codex-turn-state` 才会进入缓存；成功采集后固定保留
+1 小时，读取不会续期。后续 Responses HTTP/SSE 与 WebSocket 请求在账号和模型选择完成后，若客户端没有
+同一 turn 的 state，则通过 `x-codex-turn-state` 请求头注入精确匹配的缓存值。上游返回 312 时只清除当前
+账号与模型的状态；服务重启会清空运行态，不会把 state 写入 PostgreSQL、Redis、审计或日志。
+
+管理端从所选账号的实时模型目录取得 `modelId`，不在前后端写死探测模型。
+`GET /api/admin/accounts/turn-state/overview` 只读取当前 Provider 内存中已采集、已探测或已失效的账号/模型键，
+不触发上游请求，也不返回 state 原文。管理端将该结果与 OAuth 账号目录合并，因此从未探测的账号也会显示为“未获取”。
+`POST /api/admin/accounts/turn-state/probe` 使用该模型尝试当前代理目录中的全部代理，不包含直连，最多同时探测 4 个代理；
+即使某个代理已获取 state，也会继续完成其余尝试并返回 `attempts`。每项包含代理标识、名称、请求是否成功、
+HTTP 状态码、耗时、是否取得 state 和安全诊断文案；最近 20 次结果保存在对应账号与模型的进程内历史中。
+`stateAcquired` 只表示响应头或兼容响应正文包含有效 state，state 原文不会返回；最先成功完成的代理立即成为
+当前状态来源。`stateSource` 区分业务响应采集、管理员手动探测和后台自动轮换。`stateFirstAppliedAt` 仅在
+携带该值的业务请求实际越过上游发送边界后出现：HTTP/SSE 已取得上游响应，或 WebSocket `response.create`
+已成功写入连接；读取缓存、组装请求和仅完成 WebSocket 握手都不算应用。轮换期间迟到的旧请求不会标记新值。
+`nextRotationAt` 是进入 5 分钟续采窗口的时间。单代理超时为 30 秒，探测不会计入网关的普通业务用量，
+但仍会实际请求上游模型。
+
+没有成功出口时保留旧 state（若仍在 TTL 内）；如果任一出口返回 312 且没有新 state，则撤销当前账号与模型的
+旧值。每个实例每 45 秒检查本进程持有的账号/模型状态；剩余 TTL 不足 5 分钟或已被 312 撤销时，自动通过
+代理目录续采。相同账号与模型的自动续采和手动探测互斥，避免较晚完成的旧探测覆盖新结果。
+
+[OpenAI 官方 Codex](https://github.com/openai/codex/blob/7498521d288b9b3b96ffba4eedf089d8d6e06a84/codex-rs/core/src/client.rs#L270-L297)
+将 `x-codex-turn-state` 定义为同一 turn 内的 sticky-routing token，并禁止跨 turn 复用；
+这里的 1 小时 TTL、292/312 和跨 turn 注入属于基于外部运行观察的兼容能力，不是官方公开协议。
+缓存因此严格按账号与实际模型隔离，不假设 state 可跨模型复用；API Key 账号不支持该探测。
 
 ### 后台导入任务
 

@@ -1,11 +1,11 @@
 //! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
 
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::TryStreamExt as _;
+use futures::{StreamExt as _, TryStreamExt as _};
 use gateway_admin::model::Revision;
 use gateway_admin::model::accounts::AccountRecord;
 use gateway_admin::model::observability::{
@@ -28,6 +28,10 @@ use gateway_admin::model::provider_credentials::{
     QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::quota_forecast_sampling::QuotaForecastObservation;
+use gateway_admin::model::turn_state::{
+    TurnStateOverviewEntry, TurnStateProbeAttempt, TurnStateProbeResult, TurnStateProbeSubject,
+    TurnStateProbeTarget, TurnStateSnapshot, TurnStateSource,
+};
 use gateway_admin::ports::provider::{ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind};
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
@@ -46,6 +50,7 @@ use gateway_core::routing::{ProviderKind, UpstreamModelId};
 use secrecy::{ExposeSecret as _, SecretString};
 use serde::Deserialize;
 use serde_json::{Map, Number, Value};
+use uuid::Uuid;
 
 use crate::credential::{
     CodexAccountQuotaSnapshot, CodexCredentialAdmin, CodexCredentialAdminError,
@@ -61,15 +66,45 @@ use crate::credential::{
     CodexCredentialCodec, CodexOAuthSecret, oauth_owner_ref, parse_access_token_expiration,
 };
 use crate::transport::CodexWebSocketPool;
+use crate::transport::client::read_capped_response_body;
 use crate::transport::profile::{
     CodexDesktopReleaseSnapshot, CodexDesktopReleaseStatus, CodexWireProfile, CodexWireProfileState,
 };
+use crate::transport::{CODEX_RESPONSES_PATH, build_account_http_client, endpoint_url};
 use crate::transport::{
     CodexProfileAvatar, CodexProfileStatistics, OpenAiBillingUsage, openai_billing_breakdown,
 };
+use crate::turn_state::TurnStateStore;
 
 const PROVIDER_NAME: &str = "openai";
 const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
+const TURN_STATE_PROBE_CONCURRENCY: usize = 4;
+const MAX_TURN_STATE_PROBE_BODY_BYTES: usize = 64 * 1024;
+
+fn single_turn_state_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all("x-codex-turn-state").iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
+fn probe_error_message(value: &Value) -> Option<String> {
+    let error = value.get("error").unwrap_or(value);
+    let message = error.get("message").and_then(Value::as_str)?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let code = error
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|code| !code.is_empty());
+    Some(match code {
+        Some(code) => format!("上游错误 [{code}]：{message}"),
+        None => format!("上游错误：{message}"),
+    })
+}
 
 /// OpenAI 对终态 Admin port 的唯一实现。
 pub(crate) struct OpenAiAdminProvider {
@@ -83,6 +118,8 @@ pub(crate) struct OpenAiAdminProvider {
     catalog: Arc<CodexCredentialCatalogService>,
     websocket_pool: Arc<CodexWebSocketPool>,
     desktop_release: CodexDesktopReleaseStatus,
+    base_url: String,
+    turn_states: TurnStateStore,
 }
 
 pub(crate) struct OpenAiAdminServices {
@@ -91,6 +128,8 @@ pub(crate) struct OpenAiAdminServices {
     pub(crate) profile_statistics: Arc<CodexCredentialProfileService>,
     pub(crate) quota: Arc<CodexCredentialQuotaService>,
     pub(crate) catalog: Arc<CodexCredentialCatalogService>,
+    pub(crate) base_url: String,
+    pub(crate) turn_states: TurnStateStore,
 }
 
 impl OpenAiAdminProvider {
@@ -114,6 +153,8 @@ impl OpenAiAdminProvider {
             catalog: services.catalog,
             websocket_pool,
             desktop_release,
+            base_url: services.base_url,
+            turn_states: services.turn_states,
         }
     }
 
@@ -159,6 +200,222 @@ impl OpenAiAdminProvider {
         .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
         Ok(incoming)
     }
+
+    async fn probe_turn_state_impl(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+        targets: Vec<TurnStateProbeTarget>,
+        trigger: TurnStateSource,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        let account = self.account(account_id).await?;
+        if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
+        }
+        let repository = crate::credential::CodexCredentialRepository::new(self.accounts.clone());
+        let credential = repository
+            .load_runtime_credential(&account)
+            .await
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired))?;
+        let authorization = credential
+            .authentication
+            .authorization_header()
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired))?;
+        let cookie_header = (!credential.cookies.is_empty()).then(|| {
+            credential
+                .cookies
+                .iter()
+                .map(|cookie| format!("{}={}", cookie.name, cookie.value.expose_secret()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        });
+        let profile = self.profile.snapshot();
+        let mut headers = crate::transport::headers::build_codex_model_headers(
+            &profile,
+            authorization.expose_secret(),
+            account.upstream_account_id(),
+        )
+        .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-client-request-id"),
+            reqwest::header::HeaderValue::from_str(&Uuid::now_v7().to_string())
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+        );
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-codex-routing-hint"),
+            reqwest::header::HeaderValue::from_str(&format!("model={}", model.as_str()))
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+        );
+        if let Some(cookie) = cookie_header.as_deref() {
+            headers.insert(
+                reqwest::header::COOKIE,
+                reqwest::header::HeaderValue::from_str(cookie)
+                    .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?,
+            );
+        }
+        let body = serde_json::json!({
+            "model": model.as_str(),
+            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with exactly OK."}]}],
+            "stream": true,
+            "store": false
+        });
+        let base_url = self.base_url.clone();
+        let account_id_value = account.id().as_str().to_owned();
+        let model_value = model.as_str().to_owned();
+        let started_at = Utc::now();
+        let mut outcomes =
+            futures::stream::iter(targets.into_iter().enumerate().map(|(index, target)| {
+                let headers = headers.clone();
+                let body = body.clone();
+                let base_url = base_url.clone();
+                let account_id = account_id_value.clone();
+                async move {
+                    let started = Instant::now();
+                    let result = async {
+                        let client = build_account_http_client(&account_id, Some(&target.proxy))
+                            .map_err(|_| ())?;
+                        let body = serde_json::to_vec(&body).map_err(|_| ())?;
+                        let body = zstd::stream::encode_all(std::io::Cursor::new(body), 3)
+                            .map_err(|_| ())?;
+                        let mut headers = headers;
+                        headers.insert(
+                            reqwest::header::HeaderName::from_static("x-client-request-id"),
+                            reqwest::header::HeaderValue::from_str(&Uuid::now_v7().to_string())
+                                .map_err(|_| ())?,
+                        );
+                        let response = client
+                            .post(endpoint_url(&base_url, CODEX_RESPONSES_PATH))
+                            .headers(headers)
+                            .header(reqwest::header::CONTENT_ENCODING, "zstd")
+                            .timeout(Duration::from_secs(30))
+                            .body(body)
+                            .send()
+                            .await
+                            .map_err(|_| ())?;
+                        let status = response.status().as_u16();
+                        let header_state = single_turn_state_header(response.headers())
+                            .filter(|value| TurnStateStore::is_valid_state(value))
+                            .map(ToOwned::to_owned);
+                        let (state, response_message) = if header_state.is_some() {
+                            (header_state, None)
+                        } else {
+                            let body = read_capped_response_body(
+                                response,
+                                MAX_TURN_STATE_PROBE_BODY_BYTES,
+                            )
+                            .await
+                            .map_err(|_| ())?;
+                            let json = (!body.limit_exceeded())
+                                .then(|| serde_json::from_str::<Value>(&body.into_string()).ok())
+                                .flatten();
+                            let state = json
+                                .as_ref()
+                                .and_then(|value| value.get("current_turn_state"))
+                                .and_then(Value::as_str)
+                                .filter(|value| TurnStateStore::is_valid_state(value))
+                                .map(ToOwned::to_owned)
+                                .or_else(|| {
+                                    json.as_ref()
+                                        .and_then(|value| value.get("error"))
+                                        .and_then(|value| value.get("current_turn_state"))
+                                        .and_then(Value::as_str)
+                                        .filter(|value| TurnStateStore::is_valid_state(value))
+                                        .map(ToOwned::to_owned)
+                                });
+                            let message = json.as_ref().and_then(probe_error_message);
+                            (state, message)
+                        };
+                        Ok::<_, ()>((status, state, response_message))
+                    }
+                    .await;
+                    let latency_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    (index, target, latency_ms, result)
+                }
+            }))
+            .buffer_unordered(TURN_STATE_PROBE_CONCURRENCY);
+        let mut attempts = Vec::new();
+        let mut active_target_id = None;
+        let mut state_expires_at = None;
+        while let Some((index, target, latency_ms, probe_result)) = outcomes.next().await {
+            let attempt = match probe_result {
+                Ok((status, Some(state), _)) => {
+                    if active_target_id.is_none() {
+                        state_expires_at = self.turn_states.put(account_id, model, state, trigger);
+                        if state_expires_at.is_some() {
+                            active_target_id = Some(target.id.clone());
+                        }
+                    }
+                    TurnStateProbeAttempt {
+                        target_id: target.id,
+                        target_label: target.label,
+                        success: true,
+                        status_code: Some(status),
+                        latency_ms,
+                        state_acquired: true,
+                        message: "已获取 current_turn_state".to_owned(),
+                    }
+                }
+                Ok((status, None, response_message)) => TurnStateProbeAttempt {
+                    target_id: target.id,
+                    target_label: target.label,
+                    success: false,
+                    status_code: Some(status),
+                    latency_ms,
+                    state_acquired: false,
+                    message: response_message.unwrap_or_else(|| {
+                        if status == 312 {
+                            "上游返回 312，状态已撤销".to_owned()
+                        } else {
+                            "响应未包含 current_turn_state".to_owned()
+                        }
+                    }),
+                },
+                Err(()) => TurnStateProbeAttempt {
+                    target_id: target.id,
+                    target_label: target.label,
+                    success: false,
+                    status_code: None,
+                    latency_ms,
+                    state_acquired: false,
+                    message: "请求失败或超时".to_owned(),
+                },
+            };
+            attempts.push((index, attempt));
+        }
+        attempts.sort_unstable_by_key(|(index, _)| *index);
+        let attempts = attempts.into_iter().map(|(_, attempt)| attempt).collect();
+        let result = TurnStateProbeResult {
+            account_id: account_id.as_str().to_owned(),
+            model: model_value,
+            started_at,
+            finished_at: Utc::now(),
+            trigger,
+            active_target_id,
+            state_expires_at,
+            attempts,
+        };
+        if result.active_target_id.is_none()
+            && result
+                .attempts
+                .iter()
+                .any(|attempt| attempt.status_code == Some(312))
+        {
+            self.turn_states
+                .invalidate(account_id, model, "probe_upstream_312");
+        }
+        self.turn_states
+            .record_probe(account_id, model, result.clone());
+        Ok(result)
+    }
 }
 
 #[async_trait]
@@ -193,6 +450,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
 
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
         self.websocket_pool.evict_account(account_id.as_str()).await;
+        self.turn_states.remove_account(account_id);
     }
 
     async fn account_facts_changed(&self, account_ids: &[ProviderAccountId]) {
@@ -207,6 +465,33 @@ impl ProviderAdmin for OpenAiAdminProvider {
                 "OpenAI model catalog invalidation failed after account commit"
             );
         }
+    }
+
+    async fn probe_turn_state(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+        targets: Vec<TurnStateProbeTarget>,
+        trigger: TurnStateSource,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        self.probe_turn_state_impl(account_id, model, targets, trigger)
+            .await
+    }
+
+    fn turn_state_snapshot(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+    ) -> Option<TurnStateSnapshot> {
+        self.turn_states.snapshot(account_id, model)
+    }
+
+    fn turn_state_overview(&self) -> Vec<TurnStateOverviewEntry> {
+        self.turn_states.overview()
+    }
+
+    fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        self.turn_states.due_subjects()
     }
 
     fn connection_test_operation(

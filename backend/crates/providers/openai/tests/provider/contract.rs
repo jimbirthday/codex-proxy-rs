@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::{Duration, SystemTime};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -569,10 +572,14 @@ fn generate_with_persisted_session_context(
 }
 
 fn http_generate_operation() -> Operation {
+    http_generate_operation_for_model("gpt-5.4")
+}
+
+fn http_generate_operation_for_model(model: &str) -> Operation {
     let payload = ProtocolPayload::json_object(
         "openai",
         Map::from_iter([
-            ("model".to_owned(), json!("gpt-5.4")),
+            ("model".to_owned(), json!(model)),
             ("input".to_owned(), json!("hello")),
         ]),
     )
@@ -582,8 +589,16 @@ fn http_generate_operation() -> Operation {
 }
 
 fn planned_request(provider_name: &str, operation: Operation) -> ProviderRequest {
+    planned_request_with_model(provider_name, "gpt-5.4", operation)
+}
+
+fn planned_request_with_model(
+    provider_name: &str,
+    model: &str,
+    operation: Operation,
+) -> ProviderRequest {
     let provider = ProviderKind::new(provider_name).expect("provider");
-    let upstream_model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
+    let upstream_model = UpstreamModelId::new(model).expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
     let account_scope = Arc::new(FrozenAccountScope::new(
         Arc::new(RuntimeAccountDirectory::new(BTreeMap::from([(
@@ -4379,6 +4394,209 @@ async fn new_or_unidentified_turn_should_not_restore_previous_turn_state() {
         .await;
         assert!(captured_header_values(&request, "x-codex-turn-state").is_empty());
     }
+}
+
+#[tokio::test]
+async fn observed_turn_state_should_feed_the_next_request_without_entering_continuation_storage() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let turn_state = "s".repeat(292);
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-codex-turn-state", turn_state.clone())
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = provider_with_base_url(&store, server.uri());
+    let mut first_session = None;
+    for request_id in ["req_turn_state_seed", "req_turn_state_reuse"] {
+        let mut stream = provider
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context(request_id, CancellationToken::new()),
+            )
+            .await
+            .expect("prepare turn state request");
+        while let Some(event) = stream.next().await {
+            let event = event.expect("turn state response");
+            if request_id == "req_turn_state_seed"
+                && let Some(update) = event.session_update()
+            {
+                first_session = Some(update.payload().clone());
+            }
+        }
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("captured turn state requests");
+    assert!(captured_header_values(&requests[0], "x-codex-turn-state").is_empty());
+    assert_eq!(
+        captured_header_values(&requests[1], "x-codex-turn-state"),
+        vec![turn_state.into_bytes()]
+    );
+    assert!(
+        first_session
+            .expect("first response session update")
+            .get("turn_state")
+            .is_none_or(Value::is_null)
+    );
+}
+
+#[tokio::test]
+async fn observed_turn_state_should_require_exactly_292_bytes() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-codex-turn-state", "too-short")
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = provider_with_base_url(&store, server.uri());
+
+    for request_id in [
+        "req_turn_state_invalid_seed",
+        "req_turn_state_invalid_reuse",
+    ] {
+        let mut stream = provider
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context(request_id, CancellationToken::new()),
+            )
+            .await
+            .expect("prepare turn state request");
+        while let Some(event) = stream.next().await {
+            event.expect("turn state response");
+        }
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("captured turn state requests");
+    assert!(captured_header_values(&requests[1], "x-codex-turn-state").is_empty());
+}
+
+#[tokio::test]
+async fn observed_turn_state_should_not_cross_model_boundaries() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let turn_state = "m".repeat(292);
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .insert_header("x-codex-turn-state", turn_state)
+                .set_body_string(CAPTURE_COMPLETED_SSE),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    let provider = provider_with_base_url(&store, server.uri());
+
+    for (request_id, model) in [
+        ("req_turn_state_model_seed", "gpt-5.4"),
+        ("req_turn_state_other_model", "gpt-5.4-mini"),
+    ] {
+        let mut stream = provider
+            .execute(
+                planned_request_with_model(
+                    "openai",
+                    model,
+                    http_generate_operation_for_model(model),
+                ),
+                context(request_id, CancellationToken::new()),
+            )
+            .await
+            .expect("prepare turn state request");
+        while let Some(event) = stream.next().await {
+            event.expect("turn state response");
+        }
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("captured turn state requests");
+    assert!(captured_header_values(&requests[1], "x-codex-turn-state").is_empty());
+}
+
+#[tokio::test]
+async fn upstream_312_should_invalidate_observed_turn_state_before_the_next_request() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let server = MockServer::start().await;
+    let response_index = Arc::new(AtomicUsize::new(0));
+    let turn_state = "s".repeat(292);
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with({
+            let response_index = Arc::clone(&response_index);
+            let turn_state = turn_state.clone();
+            move |_request: &wiremock::Request| match response_index.fetch_add(1, Ordering::SeqCst)
+            {
+                0 => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .insert_header("x-codex-turn-state", turn_state.clone())
+                    .set_body_string(CAPTURE_COMPLETED_SSE),
+                1 => ResponseTemplate::new(312)
+                    .insert_header("content-type", "application/json")
+                    .set_body_json(json!({"error": {"message": "state revoked"}})),
+                _ => ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(CAPTURE_COMPLETED_SSE),
+            }
+        })
+        .expect(3)
+        .mount(&server)
+        .await;
+    let provider = provider_with_base_url(&store, server.uri());
+
+    for (request_id, should_fail) in [
+        ("req_turn_state_seed", false),
+        ("req_turn_state_revoked", true),
+        ("req_turn_state_after_revoke", false),
+    ] {
+        let mut stream = provider
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context(request_id, CancellationToken::new()),
+            )
+            .await
+            .expect("prepare turn state request");
+        let mut failed = false;
+        while let Some(event) = stream.next().await {
+            failed |= event.is_err();
+        }
+        assert_eq!(failed, should_fail, "{request_id}");
+    }
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("captured turn state requests");
+    assert!(captured_header_values(&requests[0], "x-codex-turn-state").is_empty());
+    assert_eq!(
+        captured_header_values(&requests[1], "x-codex-turn-state"),
+        vec![turn_state.into_bytes()]
+    );
+    assert!(captured_header_values(&requests[2], "x-codex-turn-state").is_empty());
 }
 
 #[tokio::test]

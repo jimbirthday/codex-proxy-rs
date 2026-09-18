@@ -36,7 +36,7 @@ pub use self::{
         CodexBackendSseStream, CodexBackendStreamingResponse, CodexBackendTransport,
         CodexClientError, CodexClientResult, CodexRateLimitUpdates, CodexRequestContext,
         CodexResponseMetadataUpdates, CodexTransportDecision, CodexTransportMetrics,
-        build_reqwest_client,
+        build_account_http_client, build_reqwest_client,
     },
     diagnostics::{CodexUpstreamDiagnostics, CodexUpstreamSendPhase},
     endpoints::{

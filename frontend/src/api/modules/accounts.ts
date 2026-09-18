@@ -153,6 +153,64 @@ export interface Account {
   groups: AccountGroupRef[]
 }
 
+export interface TurnStateProbeAttempt {
+  targetId: string
+  targetLabel: string
+  success: boolean
+  statusCode: number | null
+  latencyMs: number
+  stateAcquired: boolean
+  message: string
+}
+
+export interface TurnStateProbe {
+  accountId: string
+  model: string
+  startedAt: string
+  finishedAt: string
+  trigger: TurnStateSource
+  activeTargetId: string | null
+  stateExpiresAt: string | null
+  attempts: TurnStateProbeAttempt[]
+}
+
+export interface TurnStateSnapshot {
+  accountId: string
+  model: string
+  stateCapturedAt: string | null
+  stateFirstAppliedAt: string | null
+  stateExpiresAt: string | null
+  nextRotationAt: string | null
+  stateSource: TurnStateSource | null
+  probeHistory: TurnStateProbe[]
+  invalidatedAt: string | null
+  invalidationReason: string | null
+}
+
+export interface TurnStateOverviewEntry {
+  accountId: string
+  model: string
+  stateAvailable: boolean
+  stateCapturedAt: string | null
+  stateFirstAppliedAt: string | null
+  stateExpiresAt: string | null
+  nextRotationAt: string | null
+  stateSource: TurnStateSource | null
+  latestProbeAt: string | null
+  latestProbeSucceeded: boolean
+  latestProbeActiveTargetId: string | null
+  latestProbeActiveTargetLabel: string | null
+  latestProbeAttemptCount: number
+  invalidatedAt: string | null
+  invalidationReason: string | null
+}
+
+export type TurnStateSource = 'upstream_response' | 'manual_probe' | 'automatic_renewal'
+
+export interface TurnStateRequestParam extends AccountIdParam {
+  modelId: string
+}
+
 export interface AccountQuotaForecast {
   period: 'weekly' | 'monthly'
   targetDays: number
@@ -658,5 +716,32 @@ export function updateAccountApiKey(data: { accountId: string, baseUrl: string, 
     url: '/api/admin/accounts/rotate',
     method: 'POST',
     data: { provider: 'openai', ...data },
+  })
+}
+
+export function getAccountTurnState(data: TurnStateRequestParam, options: RequestOptions = {}) {
+  return request<TurnStateSnapshot | null>({
+    url: '/api/admin/accounts/turn-state',
+    method: 'GET',
+    params: data,
+    ...options,
+  })
+}
+
+export function getTurnStateOverview(options: RequestOptions = {}) {
+  return request<TurnStateOverviewEntry[]>({
+    url: '/api/admin/accounts/turn-state/overview',
+    method: 'GET',
+    ...options,
+  })
+}
+
+export function probeAccountTurnState(data: TurnStateRequestParam, options: RequestOptions = {}) {
+  return request<TurnStateProbe>({
+    url: '/api/admin/accounts/turn-state/probe',
+    method: 'POST',
+    data,
+    timeout: 30 * 60 * 1000,
+    ...options,
   })
 }

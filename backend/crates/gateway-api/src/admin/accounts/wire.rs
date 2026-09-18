@@ -575,6 +575,35 @@ impl AccountActionRequest {
     }
 }
 
+/// Codex turn state 查询与探测必须绑定账号和实际上游模型。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateRequest {
+    pub account_id: String,
+    pub model_id: String,
+}
+
+impl TurnStateRequest {
+    pub fn validate(&self) -> Result<(), WireValidationError> {
+        require_account_id(&self.account_id, "accountId")?;
+        if self.model_id.trim().is_empty() || self.model_id.chars().any(char::is_control) {
+            return Err(WireValidationError::new("modelId"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn into_command(
+        self,
+    ) -> Result<(ProviderAccountId, UpstreamModelId), WireValidationError> {
+        self.validate()?;
+        Ok((
+            ProviderAccountId::new(self.account_id)
+                .map_err(|_| WireValidationError::new("accountId"))?,
+            UpstreamModelId::new(self.model_id).map_err(|_| WireValidationError::new("modelId"))?,
+        ))
+    }
+}
+
 /// 主动额度重置卡消费请求。幂等键由 UI 生成并在不确定重试时复用，与官方一致。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -918,6 +947,134 @@ impl From<ProviderResetCreditResult> for AccountResetCreditResultData {
         Self {
             code: result.code,
             credit: result.credit.map(AccountResetCreditView::from),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateSnapshotData {
+    pub account_id: String,
+    pub model: String,
+    pub state_captured_at: Option<String>,
+    pub state_first_applied_at: Option<String>,
+    pub state_expires_at: Option<String>,
+    pub next_rotation_at: Option<String>,
+    pub state_source: Option<&'static str>,
+    pub probe_history: Vec<TurnStateProbeData>,
+    pub invalidated_at: Option<String>,
+    pub invalidation_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateOverviewEntryData {
+    pub account_id: String,
+    pub model: String,
+    pub state_available: bool,
+    pub state_captured_at: Option<String>,
+    pub state_first_applied_at: Option<String>,
+    pub state_expires_at: Option<String>,
+    pub next_rotation_at: Option<String>,
+    pub state_source: Option<&'static str>,
+    pub latest_probe_at: Option<String>,
+    pub latest_probe_succeeded: bool,
+    pub latest_probe_active_target_id: Option<String>,
+    pub latest_probe_active_target_label: Option<String>,
+    pub latest_probe_attempt_count: usize,
+    pub invalidated_at: Option<String>,
+    pub invalidation_reason: Option<String>,
+}
+
+impl From<gateway_admin::model::turn_state::TurnStateOverviewEntry> for TurnStateOverviewEntryData {
+    fn from(value: gateway_admin::model::turn_state::TurnStateOverviewEntry) -> Self {
+        Self {
+            account_id: value.account_id,
+            model: value.model,
+            state_available: value.state_available,
+            state_captured_at: value.state_captured_at.map(|time| time.to_rfc3339()),
+            state_first_applied_at: value.state_first_applied_at.map(|time| time.to_rfc3339()),
+            state_expires_at: value.state_expires_at.map(|time| time.to_rfc3339()),
+            next_rotation_at: value.next_rotation_at.map(|time| time.to_rfc3339()),
+            state_source: value.state_source.map(|source| source.as_str()),
+            latest_probe_at: value.latest_probe_at.map(|time| time.to_rfc3339()),
+            latest_probe_succeeded: value.latest_probe_succeeded,
+            latest_probe_active_target_id: value.latest_probe_active_target_id,
+            latest_probe_active_target_label: value.latest_probe_active_target_label,
+            latest_probe_attempt_count: value.latest_probe_attempt_count,
+            invalidated_at: value.invalidated_at.map(|time| time.to_rfc3339()),
+            invalidation_reason: value.invalidation_reason,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeData {
+    pub account_id: String,
+    pub model: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub trigger: &'static str,
+    pub active_target_id: Option<String>,
+    pub state_expires_at: Option<String>,
+    pub attempts: Vec<TurnStateAttemptData>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateAttemptData {
+    pub target_id: String,
+    pub target_label: String,
+    pub success: bool,
+    pub status_code: Option<u16>,
+    pub latency_ms: u64,
+    pub state_acquired: bool,
+    pub message: String,
+}
+
+impl From<gateway_admin::model::turn_state::TurnStateProbeResult> for TurnStateProbeData {
+    fn from(value: gateway_admin::model::turn_state::TurnStateProbeResult) -> Self {
+        Self {
+            account_id: value.account_id,
+            model: value.model,
+            started_at: value.started_at.to_rfc3339(),
+            finished_at: value.finished_at.to_rfc3339(),
+            trigger: value.trigger.as_str(),
+            active_target_id: value.active_target_id,
+            state_expires_at: value.state_expires_at.map(|time| time.to_rfc3339()),
+            attempts: value.attempts.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+impl From<gateway_admin::model::turn_state::TurnStateProbeAttempt> for TurnStateAttemptData {
+    fn from(value: gateway_admin::model::turn_state::TurnStateProbeAttempt) -> Self {
+        Self {
+            target_id: value.target_id,
+            target_label: value.target_label,
+            success: value.success,
+            status_code: value.status_code,
+            latency_ms: value.latency_ms,
+            state_acquired: value.state_acquired,
+            message: value.message,
+        }
+    }
+}
+
+impl From<gateway_admin::model::turn_state::TurnStateSnapshot> for TurnStateSnapshotData {
+    fn from(value: gateway_admin::model::turn_state::TurnStateSnapshot) -> Self {
+        Self {
+            account_id: value.account_id,
+            model: value.model,
+            state_captured_at: value.state_captured_at.map(|time| time.to_rfc3339()),
+            state_first_applied_at: value.state_first_applied_at.map(|time| time.to_rfc3339()),
+            state_expires_at: value.state_expires_at.map(|time| time.to_rfc3339()),
+            next_rotation_at: value.next_rotation_at.map(|time| time.to_rfc3339()),
+            state_source: value.state_source.map(|source| source.as_str()),
+            probe_history: value.probe_history.into_iter().map(Into::into).collect(),
+            invalidated_at: value.invalidated_at.map(|time| time.to_rfc3339()),
+            invalidation_reason: value.invalidation_reason,
         }
     }
 }

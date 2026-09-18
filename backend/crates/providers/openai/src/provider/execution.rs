@@ -182,6 +182,7 @@ pub(super) struct ColdResponse {
     pub(super) websocket_retry_count: u32,
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
+    pub(super) turn_states: crate::turn_state::TurnStateStore,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -327,6 +328,7 @@ pub(super) async fn create_response_attempt(
     request: &CodexResponsesRequest,
     request_context: CodexRequestContext<'_>,
     account_id: &str,
+    payload_sent: Option<&(dyn Fn() + Sync)>,
     deadline: SystemTime,
     cancellation: &CancellationToken,
 ) -> Result<CodexBackendStreamingResponse, CodexHandshakeAttemptError> {
@@ -337,10 +339,11 @@ pub(super) async fn create_response_attempt(
         biased;
         _ = cancellation.cancelled() => Err(CodexHandshakeAttemptError::Cancelled),
         _ = tokio::time::sleep(handshake_deadline) => Err(CodexHandshakeAttemptError::Timeout),
-        response = client.create_response_stream_with_pool_account(
+        response = client.create_response_stream_with_pool_account_and_payload_sent(
             request,
             request_context,
             Some(account_id),
+            payload_sent,
         ) => response.map_err(CodexHandshakeAttemptError::Client),
     }
 }
@@ -571,10 +574,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         websocket_retry_count,
         stream_max_retries,
         mut session_capture,
+        turn_states,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
         let allows_account_state_mutation = lease.allows_account_state_mutation();
+        let account_turn_state_enabled = matches!(
+            lease.authentication(),
+            crate::credential::CodexRuntimeAuthentication::OAuth(_)
+        );
         let failure_context = OpenAiFailureContext {
             client: &client,
             selector: &selector,
@@ -604,6 +612,15 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         );
         let request_transport_requirement = transport_requirement(&request);
         let trace = context.trace();
+        let applied_turn_state = account_turn_state_enabled
+            .then(|| request.turn_state.clone())
+            .flatten()
+            .map(|state| (active_account.id().clone(), upstream_model.clone(), state));
+        let mark_turn_state_applied = || {
+            if let Some((account_id, model, state)) = applied_turn_state.as_ref() {
+                turn_states.mark_applied(account_id, model, state);
+            }
+        };
         let response = create_response_attempt(
             &client,
             &request,
@@ -617,6 +634,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 account_selection,
             ).with_trace(&trace),
             active_account.id().as_str(),
+            Some(&mark_turn_state_applied),
             context.deadline(),
             &cancellation,
         )
@@ -639,6 +657,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let response = match response {
             Ok(response) => response,
             Err(mut failure) => {
+                if account_turn_state_enabled && failure.error.upstream_status() == Some(312) {
+                    turn_states.invalidate(active_account.id(), &upstream_model, "upstream_312");
+                }
                 if let Some(policy) = websocket_failure_policy {
                     apply_websocket_recovery_policy(
                         &mut failure,
@@ -669,6 +690,14 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 return;
             }
         };
+        if account_turn_state_enabled && let Some(state) = response.turn_state.clone() {
+            let _ = turn_states.put(
+                active_account.id(),
+                &upstream_model,
+                state,
+                gateway_admin::model::turn_state::TurnStateSource::UpstreamResponse,
+            );
+        }
         if !accepts_backend_transport(transport_policy, response.transport) {
             let failure = MappedProviderFailure::plain(provider_error(
                 ProviderErrorKind::Protocol,
@@ -689,7 +718,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             } else {
                 OpenAiContinuationScope::ReplayRequired
             });
-            capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
+            if capture.turn_state.is_some() {
+                capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
+            }
         }
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
             &response,
@@ -744,6 +775,12 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .with_requested_service_tier(request.service_tier())
             .with_request_tool_pricing(upstream_model.as_str(), request.tools())
             .with_raw_sse_passthrough();
+        let turn_state_capture = AccountTurnStateCapture {
+            store: &turn_states,
+            account_id: active_account.id(),
+            model: &upstream_model,
+            enabled: account_turn_state_enabled,
+        };
         let mut pre_commit_events = PreCommitClientEvents::new();
         loop {
             let Some(stream_deadline) = remaining(context.deadline()) else {
@@ -808,6 +845,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         &mut session_capture,
                         &mut observation_state,
                         &mut decoder,
+                        &turn_state_capture,
                     )
                     .await;
                     let observation_event = if rate_limits_changed || metadata_merge.is_some() {
@@ -882,6 +920,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 &mut session_capture,
                 &mut observation_state,
                 &mut decoder,
+                &turn_state_capture,
             )
             .await;
             let metadata_changed = metadata_merge.unwrap_or(false);
@@ -1059,6 +1098,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             &mut session_capture,
             &mut observation_state,
             &mut decoder,
+            &turn_state_capture,
         )
         .await
         .unwrap_or(false);
@@ -1127,11 +1167,19 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     })
 }
 
+struct AccountTurnStateCapture<'a> {
+    store: &'a crate::turn_state::TurnStateStore,
+    account_id: &'a gateway_core::account::ProviderAccountId,
+    model: &'a gateway_core::routing::UpstreamModelId,
+    enabled: bool,
+}
+
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
     decoder: &mut CodexCanonicalDecoder,
+    turn_state_capture: &AccountTurnStateCapture<'_>,
 ) -> Option<bool> {
     let updates = updates?;
     let mut pending = updates.lock().await;
@@ -1143,7 +1191,17 @@ async fn merge_response_metadata_updates(
     }
     let mut changed = false;
     if let Some(turn_state) = turn_state {
-        if let Some(capture) = session_capture.as_mut() {
+        if turn_state_capture.enabled {
+            let _ = turn_state_capture.store.put(
+                turn_state_capture.account_id,
+                turn_state_capture.model,
+                turn_state.clone(),
+                gateway_admin::model::turn_state::TurnStateSource::UpstreamResponse,
+            );
+        }
+        if let Some(capture) = session_capture.as_mut()
+            && capture.turn_state.is_some()
+        {
             capture.turn_state = Some(turn_state.clone());
         }
         changed |= observation_state.merge_client_header("x-codex-turn-state", &turn_state);

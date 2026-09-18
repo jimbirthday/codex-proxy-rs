@@ -41,10 +41,12 @@ pub(super) fn diagnostics(
 }
 
 pub(super) fn turn_state(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get("x-codex-turn-state")
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string)
+    let mut values = headers.get_all("x-codex-turn-state").iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(ToString::to_string)
 }
 
 pub(super) fn set_cookie_headers(headers: &HeaderMap) -> Vec<String> {

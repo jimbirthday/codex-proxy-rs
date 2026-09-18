@@ -4,6 +4,7 @@ mod admin;
 pub mod config;
 mod provider;
 mod session_transport;
+mod turn_state;
 
 use std::sync::Arc;
 
@@ -26,6 +27,7 @@ use crate::transport::profile::{
     CodexArtifactProfileCache, CodexDesktopReleaseService, OfficialCodexDesktopReleaseTransport,
 };
 use crate::transport::{CodexWebSocketPool, build_reqwest_client};
+use crate::turn_state::TurnStateStore;
 
 pub use config::{CodexWireProfileConfig, OpenAiConfig, OpenAiConfigError};
 pub use provider::{
@@ -99,6 +101,7 @@ pub async fn initialize(
     let websocket_pool = Arc::new(CodexWebSocketPool::with_config(
         config.websocket_pool_config(),
     ));
+    let turn_states = TurnStateStore::new();
     let catalog = Arc::new(CodexCredentialCatalogService::new(
         repository.clone(),
         profile.clone(),
@@ -144,6 +147,7 @@ pub async fn initialize(
             config.stream_max_retries(),
         )
         .map_err(OpenAiInitializeError::Provider)?
+        .with_turn_state_store(turn_states.clone())
         .with_session_identity(session_identity),
     );
     let token_client = Arc::new(
@@ -194,6 +198,8 @@ pub async fn initialize(
             profile_statistics,
             quota: Arc::clone(&quota),
             catalog: Arc::clone(&catalog),
+            base_url: config.base_url().to_owned(),
+            turn_states,
         },
         websocket_pool,
         desktop_release_status,

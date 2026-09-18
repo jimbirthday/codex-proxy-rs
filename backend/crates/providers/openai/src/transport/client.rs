@@ -810,22 +810,22 @@ pub(super) fn truncate_for_error(body: &str) -> String {
     body.chars().take(200).collect()
 }
 
-pub(super) struct CappedResponseBody {
+pub(crate) struct CappedResponseBody {
     bytes: Vec<u8>,
     limit_exceeded: bool,
 }
 
 impl CappedResponseBody {
-    pub(super) const fn limit_exceeded(&self) -> bool {
+    pub(crate) const fn limit_exceeded(&self) -> bool {
         self.limit_exceeded
     }
 
-    pub(super) fn into_string(self) -> String {
+    pub(crate) fn into_string(self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
 }
 
-pub(super) async fn read_capped_response_body(
+pub(crate) async fn read_capped_response_body(
     response: ReqwestResponse,
     max_bytes: usize,
 ) -> Result<CappedResponseBody, reqwest::Error> {

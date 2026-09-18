@@ -271,6 +271,28 @@ client，OIDC 的 JWKS 缓存与单飞归属对应出口状态。自动刷新提
 代理认证信息仅通过敏感账号导出返回，列表、详情、Debug 和普通审计不得暴露；数据库及备份按凭据保护。
 输入字段、协议支持与导入校验见 [账号 API](api.md#5-账号)。
 
+### Codex turn state 运行态
+
+OpenAI Provider 按 OAuth 账号与实际上游模型维护不透明的 `current_turn_state` 运行态。它只存在 Provider
+进程内存，只接受单个且原始长度恰好为 292 字节的合法 HeaderValue，并在采集 1 小时后固定过期，读取不续期。
+正常 Responses 响应携带有效 `x-codex-turn-state` 时刷新对应账号/模型状态；收到上游 312 时只使当前键失效。
+账号和模型选择完成后，若请求没有同一客户端 turn 的 state，Provider 将精确匹配的值注入上游
+`x-codex-turn-state` 请求头，HTTP/SSE 与 WebSocket 共用这一规则。
+
+管理端从账号实时模型目录选择模型，探测只遍历已保存的代理目录获取 state，不提供直连探测；未配置代理时
+拒绝发起探测。接口仅返回代理诊断、TTL、State 来源、首次实际发送业务请求的时间、下次轮换时间和对应键最近
+20 次探测记录；HTTP/SSE 取得上游响应或 WebSocket `response.create` 成功写入后才确认发送，读取缓存、构造请求
+和 WebSocket 握手不改变应用状态。确认时再次核对账号、模型与 state 原文，旧请求不能标记已轮换的新值。
+账号总览只读聚合内存中已见键的脱敏状态，不发起上游请求。两类视图都不返回 state 原文，也不写 PostgreSQL、
+Redis、审计或日志；进程重启会丢失该运行态。
+每个实例独立运行无 leader 租约的续采 Worker，在 TTL 剩余不足 5 分钟或 312 失效后，通过代理目录自动
+替换；相同账号/模型的自动与手动探测互斥。
+
+[OpenAI 官方 Codex](https://github.com/openai/codex/blob/7498521d288b9b3b96ffba4eedf089d8d6e06a84/codex-rs/core/src/client.rs#L270-L297)
+当前只把该头定义为同一 turn 内的 sticky-routing token，并明确禁止跨 turn 复用；1 小时 TTL、292/312
+语义和跨 turn 注入来自外部运行观察，不是官方公开合同。本能力有意扩展官方作用域，可能随上游变化失效；
+因此状态按账号和实际模型隔离，不作跨模型复用。API Key 账号不启用该兼容能力。
+
 ### Codex 原生生图与认证
 
 管理端导出的 Codex 配置使用代理 Bearer 密钥，并声明服务端托管账号认证。

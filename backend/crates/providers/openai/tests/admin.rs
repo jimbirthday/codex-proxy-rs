@@ -17,11 +17,13 @@ use gateway_admin::model::provider_credentials::{
     ProviderExportCredentialInput, ProviderQuotaRequest, ProviderQuotaWindowRole,
     QuotaLocalUsageAttribution,
 };
+use gateway_admin::model::turn_state::{TurnStateProbeTarget, TurnStateSource};
 use gateway_admin::model::{MutationActor, MutationContext, Revision};
 use gateway_admin::ports::provider::ProviderAdminErrorKind;
 use gateway_core::account::{
-    CredentialRevision, CredentialState, OpaqueProviderData, ProviderAccount, ProviderAccountId,
-    ProviderAccountStore, QuotaAccessChange, QuotaEvidence, QuotaObservation, QuotaState,
+    CredentialRevision, CredentialState, OpaqueProviderData, OutboundProxy, ProviderAccount,
+    ProviderAccountId, ProviderAccountStore, QuotaAccessChange, QuotaEvidence, QuotaObservation,
+    QuotaState,
 };
 use gateway_core::engine::provider::ProviderRequest;
 use gateway_core::engine::{
@@ -719,6 +721,172 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
         Some("header.id-token.signature")
     );
     assert!(exported_account.get("token").is_none());
+}
+
+#[tokio::test]
+async fn turn_state_probe_uses_selected_model_and_records_every_target() {
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_oauth_credential(ImportCodexOAuthCredential {
+            account_id: "acct_turn_state_probe".to_owned(),
+            name: "turn state probe".to_owned(),
+            secret: secret("turn-state-probe-access"),
+            verified_account: profile("chatgpt-turn-state-probe"),
+            next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+            enabled: true,
+        })
+        .await;
+    let account = store
+        .account("acct_turn_state_probe")
+        .expect("turn state account");
+    let server = MockServer::start().await;
+    let state = "s".repeat(292);
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", state)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(3)
+        .mount(&server)
+        .await;
+    let mut config = valid_config();
+    config.config.api.base_url = server.uri();
+    let bundle = provider_openai::initialize(
+        config.config.clone(),
+        provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+    )
+    .await
+    .expect("OpenAI turn state bundle");
+    let admin = bundle.admin_provider();
+    let model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
+    let proxy = OutboundProxy::parse(&server.uri()).expect("probe proxy");
+
+    let result = admin
+        .probe_turn_state(
+            account.id(),
+            &model,
+            vec![
+                TurnStateProbeTarget {
+                    id: "saved-egress-a".to_owned(),
+                    label: "已保存出口 A".to_owned(),
+                    proxy: proxy.clone(),
+                },
+                TurnStateProbeTarget {
+                    id: "saved-egress-b".to_owned(),
+                    label: "已保存出口 B".to_owned(),
+                    proxy,
+                },
+            ],
+            TurnStateSource::ManualProbe,
+        )
+        .await
+        .expect("turn state probe");
+
+    assert_eq!(result.model, "gpt-5.4");
+    assert_eq!(result.attempts.len(), 2);
+    assert!(result.attempts.iter().all(|attempt| attempt.state_acquired));
+    let snapshot = admin
+        .turn_state_snapshot(account.id(), &model)
+        .expect("turn state snapshot");
+    assert_eq!(snapshot.probe_history, vec![result]);
+    let overview = admin.turn_state_overview();
+    assert_eq!(overview.len(), 1);
+    let overview = &overview[0];
+    assert_eq!(overview.account_id, "acct_turn_state_probe");
+    assert_eq!(overview.model, "gpt-5.4");
+    assert!(overview.state_available);
+    assert!(overview.state_captured_at.is_some());
+    assert!(overview.state_first_applied_at.is_none());
+    assert!(overview.state_expires_at.is_some());
+    assert!(overview.next_rotation_at.is_some());
+    assert_eq!(overview.state_source, Some(TurnStateSource::ManualProbe));
+    assert!(overview.latest_probe_succeeded);
+    assert_eq!(overview.latest_probe_attempt_count, 2);
+    let active_target_id = overview
+        .latest_probe_active_target_id
+        .as_deref()
+        .expect("overview active target");
+    let active_attempt = snapshot.probe_history[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.target_id == active_target_id)
+        .expect("active target attempt");
+    assert_eq!(
+        overview.latest_probe_active_target_label.as_deref(),
+        Some(active_attempt.target_label.as_str())
+    );
+
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        Map::from_iter([
+            ("model".to_owned(), json!("gpt-5.4")),
+            ("input".to_owned(), json!("apply cached state")),
+        ]),
+    )
+    .expect("probe follow-up payload")
+    .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+    let mut stream = bundle
+        .core_provider()
+        .execute(
+            initialized_provider_request(operation, account.id().as_str()),
+            initialized_attempt_context("req_apply_turn_state", account.id().as_str()),
+        )
+        .await
+        .expect("prepare request with turn state");
+    while let Some(event) = stream.next().await {
+        event.expect("turn state follow-up response");
+    }
+    let applied_snapshot = admin
+        .turn_state_snapshot(account.id(), &model)
+        .expect("applied turn state snapshot");
+    assert!(applied_snapshot.state_first_applied_at.is_some());
+    assert_eq!(
+        applied_snapshot.state_source,
+        Some(TurnStateSource::ManualProbe)
+    );
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("turn state probe requests");
+    assert_eq!(requests.len(), 3);
+    assert!(requests.iter().take(2).all(|request| {
+        let body = request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| value.eq_ignore_ascii_case("zstd"))
+            .and_then(|_| {
+                zstd::stream::decode_all(std::io::Cursor::<&[u8]>::new(request.body.as_ref())).ok()
+            })
+            .and_then(|body| serde_json::from_slice::<Value>(&body).ok());
+        body.as_ref()
+            .and_then(|body| body.get("model").and_then(Value::as_str))
+            == Some("gpt-5.4")
+            && body
+                .as_ref()
+                .and_then(|body| body.get("stream").and_then(Value::as_bool))
+                == Some(true)
+            && body
+                .as_ref()
+                .and_then(|body| body.get("input"))
+                .and_then(Value::as_array)
+                .and_then(|input| input.first())
+                .and_then(|item| item.get("type").and_then(Value::as_str))
+                == Some("message")
+    }));
+    assert_eq!(
+        requests[2]
+            .headers
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok())
+            .map(str::len),
+        Some(292)
+    );
 }
 
 #[tokio::test]
