@@ -45,6 +45,7 @@ fn account(id: &str) -> ProviderAccount {
 fn candidate(id: &str, in_flight: u32, remaining: Option<u64>) -> AccountCandidate {
     AccountCandidate {
         account: account(id),
+        routing_state_ready: None,
         signals: AccountRuntimeSignals {
             in_flight,
             last_started_at: None,
@@ -211,6 +212,7 @@ fn inconclusive_quota_observation_cannot_erase_confirmed_access() {
 fn diagnostic_selection_bypasses_all_local_account_eligibility() {
     let observed_at = SystemTime::now();
     let exhausted = AccountCandidate {
+        routing_state_ready: None,
         account: account("acct_exhausted").with_account_facts(
             true,
             CredentialState::Ready,
@@ -229,6 +231,7 @@ fn diagnostic_selection_bypasses_all_local_account_eligibility() {
         },
     };
     let disabled = AccountCandidate {
+        routing_state_ready: None,
         account: account("acct_disabled").with_account_facts(
             false,
             CredentialState::Ready,

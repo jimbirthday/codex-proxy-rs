@@ -374,6 +374,9 @@ impl AccountQuotaSignals {
 pub struct AccountCandidate {
     pub account: ProviderAccount,
     pub signals: AccountRuntimeSignals,
+    /// Provider 对当前请求模型的路由状态就绪投影；None 表示不适用。
+    /// 仅 Smart 在同权重层中优先就绪账号，不改变资格与会话亲和。
+    pub routing_state_ready: Option<bool>,
 }
 
 /// 一次账号选择看到的可调度并发槽快照。
@@ -719,8 +722,13 @@ fn select_smart_candidate<'a>(
     default_concurrency: NonZeroU32,
     cursor: u64,
 ) -> Option<&'a AccountCandidate> {
+    let has_ready_state = candidates
+        .iter()
+        .any(|candidate| candidate.routing_state_ready == Some(true));
     let mut ranked = candidates
         .iter()
+        // 不适用此状态的账号仍正常竞争；全部未就绪时沿用原有评分。
+        .filter(|candidate| !has_ready_state || candidate.routing_state_ready != Some(false))
         .map(|candidate| (*candidate, smart_score(candidate, default_concurrency)))
         .collect::<Vec<_>>();
     let best_score = ranked

@@ -9,7 +9,7 @@ use gateway_core::account::{
     AccountCandidate, AccountCapacitySnapshot, AccountEligibilityPolicy, AccountErrorReason,
     AccountFeedbackStats, AccountRuntimeSignals, AccountSchedulingBlocker, AccountSelectionContext,
     AccountSelector, AccountStatus, CredentialState, PreferredAccountSelection, ProviderAccount,
-    ProviderAccountId, QuotaEvidence,
+    ProviderAccountId, QuotaEvidence, RotationStrategy,
 };
 use gateway_core::concurrency::{CapacityWait, ConcurrencyWaitQueue, QueueRejection};
 use gateway_core::engine::{AttemptContext, ContinuationAttempt};
@@ -18,7 +18,7 @@ use gateway_core::provider_ports::{
     ProviderSchedulingLeaseRequest, ProviderSessionAffinityKey, ProviderSessionAffinityPort,
     ProviderSessionExclusionPort, ProviderSessionExclusions, ProviderStoreError,
 };
-use gateway_core::routing::ProviderKind;
+use gateway_core::routing::{ProviderKind, UpstreamModelId};
 use secrecy::ExposeSecret;
 use thiserror::Error;
 use url::Url;
@@ -114,6 +114,7 @@ pub(crate) struct CodexCyberPolicyScope {
 }
 
 pub struct CodexCredentialSelector {
+    turn_states: Option<crate::turn_state::TurnStateStore>,
     waiting: ConcurrencyWaitQueue<ProviderAccountId>,
     provider_kind: ProviderKind,
     repository: CodexCredentialRepository,
@@ -270,6 +271,7 @@ impl CodexCredentialSelector {
         cookie_policy: CodexCookiePolicy,
     ) -> Self {
         Self {
+            turn_states: None,
             provider_kind,
             repository,
             leases,
@@ -281,6 +283,14 @@ impl CodexCredentialSelector {
             waiting: ConcurrencyWaitQueue::default(),
             account_feedback,
         }
+    }
+
+    pub(crate) fn with_turn_state_store(
+        mut self,
+        store: crate::turn_state::TurnStateStore,
+    ) -> Self {
+        self.turn_states = Some(store);
+        self
     }
 
     pub async fn select(
@@ -435,7 +445,7 @@ impl CodexCredentialSelector {
                 )
                 .await?;
             let round_robin_cursor = scheduling.round_robin_cursor();
-            let candidates = accounts
+            let mut candidates = accounts
                 .into_iter()
                 .map(|account| {
                     let health = self
@@ -457,7 +467,11 @@ impl CodexCredentialSelector {
                         .with_provider_quota(self.quota.scheduling_signals(&account))
                         .with_rate_limit(rate_limits.get(account.id()).copied().flatten())
                         .with_runtime_health(health.0, health.1);
-                    AccountCandidate { account, signals }
+                    AccountCandidate {
+                        account,
+                        signals,
+                        routing_state_ready: None,
+                    }
                 })
                 .collect::<Vec<_>>();
             let continuation_account = match request.attempt.continuation_attempt() {
@@ -528,14 +542,29 @@ impl CodexCredentialSelector {
             let mut shortest_retry = None;
             let base_excluded = excluded.clone();
             let policy = request.attempt.account_selection_policy();
+            let state_model = upstream_model.and_then(|model| UpstreamModelId::new(model).ok());
 
             loop {
+                let now = SystemTime::now();
+                if !diagnostic
+                    && policy.strategy() == RotationStrategy::Smart
+                    && let Some((store, model)) =
+                        self.turn_states.as_ref().zip(state_model.as_ref())
+                {
+                    // 每次重选重读就绪事实，租约竞争期间的失效不能沿用旧优先级。
+                    let ready = store.ready_accounts(&account_ids, model, now);
+                    for candidate in &mut candidates {
+                        candidate.routing_state_ready = (candidate.account.authentication_kind()
+                            == CODEX_AUTHENTICATION_KIND_OAUTH)
+                            .then(|| ready.contains(candidate.account.id()));
+                    }
+                }
                 let preferred = pinned_account
                     .clone()
                     .or_else(|| affinity.preferred_account().cloned());
                 let mut context = AccountSelectionContext {
                     policy,
-                    now: SystemTime::now(),
+                    now,
                     excluded_accounts: excluded.clone(),
                     preferred_account: preferred.clone(),
                     preferred_account_overrides_weight: true,
