@@ -128,7 +128,7 @@ function upstreamSendStateText(value: string | null | undefined) {
 
     <div class="flex min-h-0 min-w-0 flex-col">
       <p v-if="error && !loading" role="alert" class="text-cp-sm text-cp-error-text">
-        {{ error }}。请刷新重试。
+        {{ error }}，请刷新重试
       </p>
       <BaseTable
         v-else

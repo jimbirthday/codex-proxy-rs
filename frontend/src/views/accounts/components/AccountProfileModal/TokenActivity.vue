@@ -47,7 +47,7 @@ const monthLabels = computed(() =>
     <BaseEmpty
       v-if="dailyUsage === null"
       title="暂无 Token 活动"
-      description="本次未获取到每日 Token 活动。"
+      description="本次未获取到每日 Token 活动"
       size="sm"
       surface="none"
     />

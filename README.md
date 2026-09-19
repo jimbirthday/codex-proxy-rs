@@ -12,12 +12,26 @@
 [![GHCR](https://img.shields.io/badge/GHCR-codex--proxy--rs-2496ED?logo=docker&logoColor=white&style=flat-square)](https://github.com/zyycn/codex-proxy-rs/pkgs/container/codex-proxy-rs)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
 
-[快速开始](#快速开始) · [客户端接入](#客户端接入) · [文档](#文档) · [社区](#社区) · [许可证](#许可证)
+[快速预览](#快速预览) · [快速开始](#快速开始) · [客户端接入](#客户端接入) · [文档](#文档) · [社区](#社区) · [许可证](#许可证)
 
 </div>
 
 > [!NOTE]
 > 本项目提供 Responses API，不支持 `/v1/chat/completions`。接入前请确认客户端支持 Responses 协议。
+
+## 快速预览
+
+无需部署，打开 [快速预览服务](https://codex-proxy-rs.ainz.cc) 即可体验管理端的系统概览、账号分组、代理管理与用量统计。
+
+| 登录信息 | 值 |
+| --- | --- |
+| 地址 | <https://codex-proxy-rs.ainz.cc> |
+| 登录身份 | 管理员 |
+| 账号 | `admin@cpr.local` |
+| 密码 | `039c18de2aeac46d23ead7766bb07bbbe3747233c66a128e` |
+
+预览服务运行已发布版本，展示的账号、代理与使用记录均为模拟数据，每天北京时间 `00:00` 自动生成当天数据。
+这是公开共享的功能预览环境，不提供真实模型调用；请勿导入真实账号、密钥或其他敏感信息。
 
 ## 快速开始
 
@@ -72,9 +86,6 @@ API Key 持有者可在同一登录页切换登录身份，进入 `/key-usage` �
 2. 按需建立账号分组，再创建客户端密钥并选择可用分组。**不选分组表示可使用全部账号**。
 3. 打开密钥的「使用密钥」，复制客户端配置。
 
-账号自动冻结默认关闭，可在「系统设置 → 运行参数」中启用。启用后，账号频繁命中上游容量错误时
-会暂停调度并显示为限流中；若开启恢复前探测，冷却到期后需探测成功才恢复。
-
 ## 客户端接入
 
 **Codex CLI / 桌面端**：在「使用密钥」中按操作系统复制配置，或通过 CCSwitch 导入。
@@ -99,12 +110,20 @@ curl http://127.0.0.1:8080/v1/models \
 - [客户端接入与生图](deploy/README.md#客户端配置)
 - [部署、备份与恢复](deploy/README.md)
 - [API 参考](docs/api.md)
+- [模型定价与手动同步](docs/api.md#模型定价)
 - [系统架构](docs/architecture.md)
 - [管理端主题](docs/theme.md)
 - [数据库迁移](backend/migrations/README.md)
 - [贡献与审查](CONTRIBUTING.md)
 
 ## 社区
+
+欢迎到 [Discussions 讨论区](https://github.com/zyycn/codex-proxy-rs/discussions)交流：
+[使用问答](https://github.com/zyycn/codex-proxy-rs/discussions/categories/使用问答)、
+[想法讨论](https://github.com/zyycn/codex-proxy-rs/discussions/categories/想法讨论)、
+[实验反馈](https://github.com/zyycn/codex-proxy-rs/discussions/categories/实验反馈)与
+[经验分享](https://github.com/zyycn/codex-proxy-rs/discussions/categories/经验分享)。
+明确的 Bug 或功能需求请使用 [Issue 模板](https://github.com/zyycn/codex-proxy-rs/issues/new/choose)，无需先发讨论。
 
 感谢 [LINUX DO](https://linux.do) 社区提供开放、友善的技术交流平台。
 

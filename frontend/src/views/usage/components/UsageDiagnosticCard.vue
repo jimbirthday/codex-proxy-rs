@@ -196,7 +196,7 @@ function diagnosticNameDisplay(name: string) {
           <div
             class="flex items-center justify-end gap-1.5 whitespace-nowrap text-right font-mono leading-none tabular-nums"
             :aria-label="`错误 ${formatCompactNumber(row.errorCount)}，未完成 ${formatCompactNumber(row.nonCompletionCount)}`"
-            :title="`错误率 ${formatPercent(row.errorRate)}；未完成率 ${formatPercent(row.nonCompletionRate)}`"
+            :title="`错误率 ${formatPercent(row.errorRate)}，未完成率 ${formatPercent(row.nonCompletionRate)}`"
           >
             <strong :class="row.errorCount > 0 ? 'text-cp-error-text' : 'text-cp-text-quaternary'">
               {{ formatCompactNumber(row.errorCount) }}

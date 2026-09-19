@@ -51,7 +51,7 @@ use use_case::{
 const OPENAI_PROVIDER_KIND: &str = "openai";
 const XAI_PROVIDER_KIND: &str = "xai";
 const MINIMUM_INITIAL_PASSWORD_BYTES: usize = 12;
-const WEAK_INITIAL_PASSWORDS: &[&str] = &[
+const WEAK_ADMIN_PASSWORDS: &[&str] = &[
     "",
     "admin",
     "123456",
@@ -149,7 +149,7 @@ impl AdminConfig {
         let password = self.default_password.expose().trim();
         if password.len() < MINIMUM_INITIAL_PASSWORD_BYTES
             || password.contains('$')
-            || WEAK_INITIAL_PASSWORDS.contains(&password.to_ascii_lowercase().as_str())
+            || WEAK_ADMIN_PASSWORDS.contains(&password.to_ascii_lowercase().as_str())
         {
             return Err(AdminConfigError::WeakInitialPassword);
         }
@@ -296,6 +296,7 @@ impl AdminBundle {
 
 /// 组合根提供给控制面的运行能力；与配置和存储端口分别传入。
 pub struct AdminRuntimePorts {
+    pub pricing_source: Arc<dyn ports::pricing::PricingSource>,
     pub providers: Vec<Arc<dyn ProviderAdmin>>,
     pub snapshot: Arc<dyn SnapshotControl>,
     pub account_probe: Arc<dyn AccountProbe>,
@@ -317,6 +318,7 @@ pub async fn initialize(
     runtime: AdminRuntimePorts,
 ) -> Result<AdminBundle, AdminError> {
     let AdminRuntimePorts {
+        pricing_source,
         providers,
         snapshot,
         account_probe: probe,
@@ -374,6 +376,7 @@ pub async fn initialize(
         store.client_keys(),
         store.observability(),
     ));
+    let profile_provider = Arc::clone(&openai);
     let openai = Arc::new(DefaultOpenAiService::new(
         openai,
         store.accounts(),
@@ -407,17 +410,21 @@ pub async fn initialize(
         client_keys: Arc::new(DefaultClientKeyService::new(
             store.client_keys(),
             snapshot.clone(),
+            Arc::clone(&profile_provider),
         )),
         client_distribution: Arc::new(DefaultClientDistributionService::new(client_distribution)),
         observability: Arc::new(DefaultObservabilityService::new(
             store.observability(),
             store.accounts(),
             store.settings(),
-            registry,
+            registry.clone(),
         )),
         settings: Arc::new(DefaultSettingsService::new(
             store.settings(),
             snapshot.clone(),
+            profile_provider,
+            registry,
+            pricing_source,
         )),
         system: Arc::new(DefaultSystemService::new(system)),
         openai,

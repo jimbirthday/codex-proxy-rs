@@ -1,5 +1,6 @@
 import type { Ref } from 'vue'
 import type { getApiKeys } from '@/api'
+import type { ClientProfileSelection } from '@/api/modules/client-profiles'
 import { ref, shallowRef, watch } from 'vue'
 import {
   createApiKey,
@@ -17,6 +18,7 @@ import { useIdSet } from '@/composables/useIdSet'
 type ApiKeyRow = Awaited<ReturnType<typeof getApiKeys>>['items'][number]
 
 export interface ApiKeyFormValue {
+  openaiClientProfileOverride: ClientProfileSelection | null
   customKey: string
   name: string
   label: string
@@ -62,6 +64,7 @@ export function useApiKeyMutations(options: {
   function openEdit(key: ApiKeyRow) {
     editingKey.value = key
     form.value = {
+      openaiClientProfileOverride: key.openaiClientProfileOverride ? { ...key.openaiClientProfileOverride } : null,
       customKey: '',
       name: key.name,
       label: key.label ?? '',
@@ -96,6 +99,7 @@ export function useApiKeyMutations(options: {
     await savingKeyAction.run(
       async () => {
         const payload = {
+          openaiClientProfileOverride: form.value.openaiClientProfileOverride,
           name: form.value.name.trim(),
           label: form.value.label.trim() || null,
           groupIds: [...new Set(form.value.groupIds)],
@@ -134,7 +138,7 @@ export function useApiKeyMutations(options: {
   }
 
   function validateForm() {
-    for (const [label, value] of [['日限额', form.value.dailyLimitUsd], ['周限额', form.value.weeklyLimitUsd]]) {
+    for (const [label, value] of [['日限额', form.value.dailyLimitUsd], ['7日限额', form.value.weeklyLimitUsd]]) {
       if (value.trim() && !/^\d{1,10}(?:\.\d{1,10})?$/.test(value.trim())) {
         toast.warning(`${label}必须是非负金额，最多 10 位小数`)
         return false
@@ -294,6 +298,7 @@ export function useApiKeyMutations(options: {
 
 function emptyForm(): ApiKeyFormValue {
   return {
+    openaiClientProfileOverride: null,
     customKey: '',
     name: '',
     label: '',

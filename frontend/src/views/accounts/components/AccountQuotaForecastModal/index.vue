@@ -29,13 +29,13 @@ const { report, loading, refreshing, error, load, refresh } = useAccountQuotaFor
 )
 const { now, pause, resume } = useNow({ interval: 30_000, controls: true })
 const options = [
-  { label: '周额度', value: 'weekly' },
+  { label: '7日额度', value: 'weekly' },
   { label: '月额度', value: 'monthly' },
 ]
 const forecast = computed(() => report.value?.forecasts.find(item => item.period === period.value))
 const unavailableReason = computed(() => {
   if (forecast.value?.source && new Date(forecast.value.source.resetAt) <= now.value)
-    return '额度窗口已过期，请刷新账号额度后重试。'
+    return '额度窗口已过期，请刷新账号额度后重试'
   return forecast.value?.unavailableReason ?? null
 })
 
@@ -85,7 +85,7 @@ function handleExplanationKeydown(event: KeyboardEvent) {
       <div aria-live="polite" :aria-busy="loading || refreshing">
         <ForecastSkeleton v-if="loading || refreshing" />
         <div v-else-if="error && !report" class="grid rounded-cp-card bg-cp-fill-tertiary/70 [html[data-theme=light]_&]:bg-cp-fill-quaternary/70">
-          <BaseEmpty title="预测加载失败" description="暂时无法取得预测数据，请重新加载。" surface="none" class="min-h-80 content-center">
+          <BaseEmpty title="预测加载失败" description="暂时无法取得预测数据，请重新加载" surface="none" class="min-h-80 content-center">
             <template #action>
               <BaseButton variant="secondary" @click="load">
                 重新加载
@@ -122,16 +122,16 @@ function handleExplanationKeydown(event: KeyboardEvent) {
               仅供参考
             </h4>
             <p class="m-0">
-              按已记录数据估算，缺失的用量或费用可能使结果偏低。结果会随使用的模型和方式变化，并非官方承诺额度。
+              按已记录数据估算，缺失的用量或费用可能使结果偏低，结果会随使用的模型和方式变化，并非官方承诺额度
             </p>
             <p v-if="forecast?.lowSample" class="m-0">
-              目前数据还较少，结果可能有较大波动。
+              目前数据还较少，结果可能有较大波动
             </p>
             <p v-if="forecast?.extrapolated" class="m-0">
-              本页预测为折算值，剩余量仍按{{ forecast.source?.label ?? '当前周期' }}计算。
+              本页预测为折算值，剩余量仍按{{ forecast.source?.label ?? '当前周期' }}计算
             </p>
             <p class="m-0">
-              剩余量以数据更新时间为准；等价费用不是实际账单或账户余额。
+              剩余量以数据更新时间为准，等价费用不是实际账单或账户余额
             </p>
           </section>
         </BasePopover>

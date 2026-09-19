@@ -9,7 +9,7 @@ use super::TestDatabase;
 
 fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
-        disable_fast: None,
+        openai_client_profile: None,
         request_location_enabled: false,
         request_location: Default::default(),
         admin_api_key: None,
@@ -432,27 +432,73 @@ async fn decompression_setting_should_persist_and_reach_snapshot_facts() {
 }
 
 #[tokio::test]
-async fn disable_fast_persists_and_omitted_updates_preserve_the_restriction() {
-    let Some(database) = TestDatabase::create("disable_fast_settings").await else {
+async fn request_profile_initialization_is_idempotent_and_old_updates_preserve_it() {
+    use gateway_core::{
+        account::OpaqueProviderData, provider_ports::ProviderRuntimePolicyPort,
+        routing::ProviderKind,
+    };
+    let Some(database) = TestDatabase::create("request_profiles").await else {
         return;
     };
     let repository = PgRuntimeSettingsRepository::new(database.pool.clone());
-    let initial = repository.load_runtime_settings().await.unwrap();
-    assert!(!initial.disable_fast);
-    for (value, expected) in [(Some(true), true), (None, true), (Some(false), false)] {
-        let mut update = settings_with_margin(1_800);
-        update.disable_fast = value;
-        let revision = repository.update_runtime_settings(update).await.unwrap();
-        let reloaded = repository.load_runtime_settings().await.unwrap();
-        assert_eq!(reloaded.disable_fast, expected);
-        assert_eq!(reloaded.config_revision, revision);
-        use gateway_store::postgres::{PgRuntimeSnapshotRepository, RuntimeSnapshotRepository};
-        let snapshot = PgRuntimeSnapshotRepository::new(database.pool.clone())
-            .load_runtime_snapshot()
+    let provider = ProviderKind::new("openai").unwrap();
+    let document = |name| {
+        OpaqueProviderData::new(
+            serde_json::json!({"marker":name})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let initial = document("imported");
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, initial.clone())
             .await
-            .unwrap();
-        assert_eq!(snapshot.settings.disable_fast, expected);
-        assert_eq!(snapshot.config_revision, revision);
-    }
+            .unwrap(),
+        initial
+    );
+    let revision = repository
+        .load_runtime_settings()
+        .await
+        .unwrap()
+        .config_revision;
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("ignored"))
+            .await
+            .unwrap(),
+        initial
+    );
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .config_revision,
+        revision
+    );
+    repository
+        .update_runtime_settings(settings_with_margin(3600))
+        .await
+        .unwrap();
+    assert_eq!(
+        repository
+            .load_runtime_settings()
+            .await
+            .unwrap()
+            .openai_client_profile,
+        Some(initial)
+    );
+    let mut update = settings_with_margin(3600);
+    update.openai_client_profile = Some(document("edited"));
+    repository.update_runtime_settings(update).await.unwrap();
+    assert_eq!(
+        repository
+            .initialize_request_profile(&provider, document("old-yaml"))
+            .await
+            .unwrap(),
+        document("edited")
+    );
     database.close().await;
 }

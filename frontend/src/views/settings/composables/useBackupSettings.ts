@@ -137,7 +137,7 @@ export function useBackupSettings() {
         retentionCount: Number(schedule.retentionCount) || 0,
       })
       applySettings(data)
-      toast.success('调度配置已保存')
+      toast.success('备份计划已保存')
       return true
     }
     catch {

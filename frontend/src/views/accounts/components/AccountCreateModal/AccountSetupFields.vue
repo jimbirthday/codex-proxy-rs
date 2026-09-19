@@ -43,7 +43,7 @@ const form = defineModel<AccountCreateForm>({ required: true })
         v-model="form.notes"
         :rows="3"
         :maxlength="500"
-        placeholder="最多 500 字，可不填。"
+        placeholder="最多 500 字，可不填"
         :disabled="disabled"
       />
     </BaseFormItem>

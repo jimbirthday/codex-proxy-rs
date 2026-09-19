@@ -46,6 +46,16 @@ use crate::transport::{
 use super::client::*;
 
 impl CodexBackendClient {
+    pub(crate) const fn profile_state(&self) -> &CodexWireProfileState {
+        &self.profile
+    }
+
+    /// 请求只持有自己的画像副本；连接池和 HTTP client 继续共享既有资源。
+    pub fn with_request_profile(mut self, profile: super::profile::CodexWireProfile) -> Self {
+        self.profile = CodexWireProfileState::new(profile);
+        self
+    }
+
     /// 构造客户端。
     pub fn new(
         client: Client,
@@ -60,6 +70,7 @@ impl CodexBackendClient {
             outbound_proxy: None,
             egress_key: String::new(),
             base_url,
+            official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
             protocol: OpenAiUpstreamProtocol::Codex,
             profile,
             websocket_pool: None,

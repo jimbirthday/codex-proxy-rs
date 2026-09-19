@@ -29,8 +29,8 @@ const showSecret = shallowRef(false)
 const busy = computed(() => props.saving || props.testing)
 const title = computed(() => props.proxy ? '编辑代理' : '新增代理')
 const connectionDescription = computed(() => props.proxy
-  ? '留空保留当前连接和认证信息；填写新地址时，请包含所需的用户名和密码。'
-  : '支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H，可在地址中包含用户名和密码。')
+  ? '留空保留当前连接和认证信息，填写新地址时，请包含所需的用户名和密码'
+  : '支持 HTTP、HTTPS、SOCKS5 和 SOCKS5H，可在地址中包含用户名和密码')
 
 watch(open, () => {
   showSecret.value = false
@@ -63,7 +63,7 @@ watch(open, () => {
       <BaseSwitch v-model="customLocation" label="自定义时区位置" show-label :disabled="busy" />
       <RequestLocationFields v-if="customLocation" v-model="location" :disabled="busy" />
       <p v-if="proxy?.accountCount && proxyUrl.trim()" class="m-0 text-cp-sm text-cp-warning-text">
-        将更新 {{ proxy.accountCount }} 个关联账号的出口。
+        将更新 {{ proxy.accountCount }} 个关联账号的出口
       </p>
     </BaseForm>
     <template #footer>

@@ -264,13 +264,17 @@ impl ProviderStreamAccountFeedback {
         {
             return;
         }
-        self.stats.report(
-            &self.provider_kind,
-            &self.account_id,
+        let feedback = if error.kind() == ProviderErrorKind::UpstreamCapacityUnavailable {
+            AccountAttemptFeedback::CapacityRejected {
+                first_output_ms: self.first_output_ms,
+            }
+        } else {
             AccountAttemptFeedback::Failed {
                 first_output_ms: self.first_output_ms,
-            },
-        );
+            }
+        };
+        self.stats
+            .report(&self.provider_kind, &self.account_id, feedback);
         self.reported = true;
     }
 }
@@ -479,6 +483,14 @@ impl fmt::Debug for ProviderRequest {
 /// 新的 attempt 再次调用。
 #[async_trait]
 pub trait Provider: Send + Sync {
+    /// 从已冻结的配置解析请求身份；只读取本地发布资料，不执行网络请求。
+    fn resolve_request_profile(
+        &self,
+        configuration: &crate::account::OpaqueProviderData,
+    ) -> Result<crate::account::OpaqueProviderData, ProviderError> {
+        Ok(configuration.clone())
+    }
+
     /// 返回编译期注册名称。
     fn name(&self) -> &'static str;
 

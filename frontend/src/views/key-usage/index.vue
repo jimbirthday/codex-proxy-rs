@@ -30,7 +30,7 @@ const { items, currentPage, pageSize, total, loading: recordsLoading, error: rec
           </BaseInput>
         </div>
         <p v-if="overviewError" role="alert" class="m-0 rounded-cp-lg bg-cp-error-container px-4 py-3 text-cp-sm text-cp-error-text">
-          {{ overviewError }}{{ overview ? '，暂时保留上次结果。' : '，请点击顶部刷新重试。' }}
+          {{ overviewError }}{{ overview ? '，暂时保留上次结果' : '，请点击顶部刷新重试' }}
         </p>
         <template v-if="overview">
           <KeyUsageSummary :summary="overview.summary" />

@@ -112,6 +112,7 @@ pub struct AccountRuntimeSignals {
 }
 
 const ACCOUNT_FEEDBACK_EWMA_ALPHA: f64 = 0.2;
+const ACCOUNT_CAPACITY_FAILURE_EWMA_ALPHA: f64 = 0.4;
 const ACCOUNT_FAILURE_RATE_HALF_LIFE: Duration = Duration::from_secs(15 * 60);
 const EMPTY_FEEDBACK_SAMPLE: u64 = f64::NAN.to_bits();
 
@@ -120,6 +121,7 @@ const EMPTY_FEEDBACK_SAMPLE: u64 = f64::NAN.to_bits();
 pub enum AccountAttemptFeedback {
     Succeeded { first_output_ms: Option<u64> },
     Failed { first_output_ms: Option<u64> },
+    CapacityRejected { first_output_ms: Option<u64> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -150,13 +152,12 @@ impl DecayingAccountFailureRate {
             * 0.5_f64.powf(elapsed.as_secs_f64() / ACCOUNT_FAILURE_RATE_HALF_LIFE.as_secs_f64())
     }
 
-    fn report_at(&mut self, sample: f64, now: Instant) {
+    fn report_at(&mut self, sample: f64, alpha: f64, now: Instant) {
         let now = self
             .updated_at
             .map_or(now, |updated_at| updated_at.max(now));
         let decayed = self.value_at(now);
-        self.value =
-            ACCOUNT_FEEDBACK_EWMA_ALPHA * sample + (1.0 - ACCOUNT_FEEDBACK_EWMA_ALPHA) * decayed;
+        self.value = alpha * sample + (1.0 - alpha) * decayed;
         self.updated_at = Some(now);
     }
 }
@@ -173,14 +174,21 @@ impl Default for AccountFeedback {
 
 impl AccountFeedback {
     fn report_at(&self, feedback: AccountAttemptFeedback, now: Instant) {
-        let (failure, first_output_ms) = match feedback {
-            AccountAttemptFeedback::Succeeded { first_output_ms } => (0.0, first_output_ms),
-            AccountAttemptFeedback::Failed { first_output_ms } => (1.0, first_output_ms),
+        let (failure, alpha, first_output_ms) = match feedback {
+            AccountAttemptFeedback::Succeeded { first_output_ms } => {
+                (0.0, ACCOUNT_FEEDBACK_EWMA_ALPHA, first_output_ms)
+            }
+            AccountAttemptFeedback::Failed { first_output_ms } => {
+                (1.0, ACCOUNT_FEEDBACK_EWMA_ALPHA, first_output_ms)
+            }
+            AccountAttemptFeedback::CapacityRejected { first_output_ms } => {
+                (1.0, ACCOUNT_CAPACITY_FAILURE_EWMA_ALPHA, first_output_ms)
+            }
         };
         self.failure_rate
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .report_at(failure, now);
+            .report_at(failure, alpha, now);
         if let Some(first_output_ms) = first_output_ms.filter(|value| *value > 0) {
             update_feedback_ewma(&self.first_output_ms, first_output_ms as f64);
         }

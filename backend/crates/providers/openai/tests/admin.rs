@@ -78,7 +78,7 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     assert_eq!(bundle.core_provider().name(), "openai");
     assert_eq!(bundle.admin_provider().provider_kind().as_str(), "openai");
     let contributions = bundle.take_worker_contributions();
-    assert_eq!(contributions.len(), 5);
+    assert_eq!(contributions.len(), 7);
     assert!(
         contributions
             .iter()
@@ -106,6 +106,8 @@ async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions
     };
     assert_eq!(schedule.interval(), APPCAST_POLL_INTERVAL);
     for (owner, interval) in [
+        ("openai-cli-release", APPCAST_POLL_INTERVAL),
+        ("openai-platform-desktop-release", APPCAST_POLL_INTERVAL),
         ("openai", Duration::from_secs(30)),
         (
             "openai-model-catalog",
@@ -292,13 +294,40 @@ async fn initialized_provider_keeps_thread_spawn_transport_conversations_distinc
 }
 
 #[tokio::test]
+async fn copying_builtin_prices_keeps_cache_read_and_write_fallback_costs() {
+    use provider_openai::transport::{
+        OpenAiBillingUsage, openai_billing_breakdown, openai_billing_breakdown_with_override,
+    };
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .unwrap();
+    let prices = bundle.admin_provider().pricing_catalog();
+    for model in ["gpt-4", "gpt-4o", "gpt-6-astra"] {
+        let usage = OpenAiBillingUsage::new(100, 10, 20, 15);
+        let inherited = openai_billing_breakdown(model, usage, None).unwrap();
+        let copied =
+            openai_billing_breakdown_with_override(model, usage, None, Some(&prices[model]))
+                .unwrap();
+        assert_eq!(inherited.total_amount(), copied.total_amount(), "{model}");
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing() {
     let config = valid_config();
     let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
         .await
         .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
-    let profile = admin.dashboard_wire_profile().expect("wire profile");
+    let baseline = admin.dashboard_wire_profile().expect("official baseline");
+    assert_eq!(
+        baseline.release.as_ref().map(|release| release.status),
+        Some(DesktopReleaseStatus::Unchecked)
+    );
+    let profile = admin
+        .configured_wire_profile(&config.config.initial_client_profile().unwrap())
+        .expect("imported fixed profile");
     assert_eq!(profile.version, "0.102.0");
     assert_eq!(profile.build, None);
     assert_eq!(profile.target.os_type, "Mac OS");
@@ -315,10 +344,7 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
             .map(|attribute| attribute.value.as_str()),
         Some("Codex Desktop; 1.2026.190")
     );
-    assert_eq!(
-        profile.release.as_ref().map(|release| release.status),
-        Some(DesktopReleaseStatus::Unchecked)
-    );
+    assert!(profile.release.is_none());
     let billing = admin
         .calculated_billing(&ProviderBillingInput {
             upstream_model_id: "gpt-4o".to_owned(),
@@ -4436,6 +4462,7 @@ impl ProviderArtifactProfileCachePort for TestArtifactProfiles {
     fn read<'a>(
         &'a self,
         _provider_kind: &'a ProviderKind,
+        _artifact_key: &'a str,
     ) -> BoxFuture<'a, Result<Option<ProviderArtifactProfile>, ProviderStoreError>> {
         Box::pin(async { Ok(None) })
     }

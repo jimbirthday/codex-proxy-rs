@@ -35,6 +35,58 @@ fn report_failure(
 }
 
 #[test]
+fn capacity_rejections_should_raise_failure_rate_faster_than_regular_failures() {
+    let (feedback, provider, account) = feedback_subject();
+    let observed_at = Instant::now();
+    let mut failure_rates = Vec::new();
+    for _ in 0..2 {
+        feedback.report_at(
+            &provider,
+            &account,
+            AccountAttemptFeedback::CapacityRejected {
+                first_output_ms: None,
+            },
+            observed_at,
+        );
+        failure_rates.push(
+            feedback
+                .scheduling_signals_at(&provider, &account, observed_at)
+                .0,
+        );
+    }
+
+    assert_eq!(failure_rates, [Some(4_000), Some(6_400)]);
+}
+
+#[test]
+fn capacity_failure_rate_should_keep_time_decay_and_success_recovery() {
+    let (feedback, provider, account) = feedback_subject();
+    let observed_at = Instant::now();
+    feedback.report_at(
+        &provider,
+        &account,
+        AccountAttemptFeedback::CapacityRejected {
+            first_output_ms: Some(100),
+        },
+        observed_at,
+    );
+    let recovered_at = observed_at + FAILURE_RATE_HALF_LIFE;
+    feedback.report_at(
+        &provider,
+        &account,
+        AccountAttemptFeedback::Succeeded {
+            first_output_ms: Some(200),
+        },
+        recovered_at,
+    );
+
+    assert_eq!(
+        feedback.scheduling_signals_at(&provider, &account, recovered_at),
+        (Some(1_600), Some(120)),
+    );
+}
+
+#[test]
 fn account_failure_rate_should_halve_after_one_half_life() {
     let (feedback, provider, account) = feedback_subject();
     let observed_at = Instant::now();

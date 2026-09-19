@@ -290,7 +290,7 @@ function presetSwatches(preset: ThemeColorPreset) {
       <div
         class="rounded-cp-lg bg-cp-primary-container px-3 py-3 text-[10px] leading-normal font-emphasis text-cp-primary-on-container"
       >
-        固定无边设计；圆角塑形，阴影分层。
+        固定无边设计，圆角塑形，阴影分层
       </div>
       <ThemeNumberTokenField
         label="通用圆角"

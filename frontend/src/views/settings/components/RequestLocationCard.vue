@@ -11,10 +11,10 @@ const enabled = defineModel<boolean>('enabled', { required: true })
 </script>
 
 <template>
-  <BaseCard title="请求时区与位置" description="开启后覆盖 Codex 请求的时区与位置，代理自定义配置优先">
+  <BaseCard title="请求位置覆盖" description="覆盖 Codex 请求中的时区与位置字段，账号出站代理的自定义位置优先">
     <template #body>
       <div>
-        <BaseSwitch v-model="enabled" label="启用" show-label :disabled="disabled" />
+        <BaseSwitch v-model="enabled" label="启用位置覆盖" show-label :disabled="disabled" />
       </div>
       <BaseForm class="mt-4 max-w-6xl">
         <RequestLocationFields v-model="location" :disabled="disabled || !enabled" />

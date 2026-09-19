@@ -223,7 +223,7 @@ export function useAccountResetCredits(options: {
           ...operation,
           hasTransportFailure: true,
         }
-        toast.warning('消费结果暂不确定；重试会复用同一个请求标识', { duration: 5000 })
+        toast.warning('消费结果暂不确定，重试会复用同一个请求标识', { duration: 5000 })
       }
       else {
         target.pendingOperation = null

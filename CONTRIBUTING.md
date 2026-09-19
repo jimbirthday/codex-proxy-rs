@@ -4,7 +4,16 @@
 
 本文定义协作流程与审查标准；模块职责以 [系统架构](docs/architecture.md) 为准，视觉规则以 [管理端主题](docs/theme.md) 为准。没有明确约定时遵循相邻实现；具体页面的布局决定不自动成为全项目限制。
 
-## 提交 Issue
+## 交流与反馈
+
+[讨论区](https://github.com/zyycn/codex-proxy-rs/discussions) 用于使用问答、想法讨论、实验反馈和经验分享。
+提问时按需补充版本、部署方式、已尝试的方法及脱敏信息；问题解决后，请在「使用问答」中标记有帮助的答案。
+
+明确的 Bug、具体功能需求或协作规则建议使用 Issue，无需先开讨论。
+讨论形成可执行事项后，可以新建 Issue 并互相附链接；已有 Issue 的后续信息继续补充在原帖，避免重复记录。
+围绕问题友善交流，欢迎不同使用场景和方案观点。
+
+### 提交 Issue
 
 按场景选择 [接口问题反馈](.github/ISSUE_TEMPLATE/api-bug-report.yml)、[常规问题反馈](.github/ISSUE_TEMPLATE/general-bug-report.yml) 或 [功能建议](.github/ISSUE_TEMPLATE/feature-request.yml) 表单，按对应提示提供信息。故障反馈填写实际运行版本和中转链路；接口问题区分客户端显示与网关实际响应，页面问题附相关截图或录屏。
 

@@ -10,12 +10,12 @@ export const rotationOptions = [
     description: '优先选择额度窗口更快重置的账号，适合在重置前消耗剩余额度',
   },
   {
-    label: '轮询',
+    label: '轮询调度',
     value: 'round_robin',
     description: '在可用候选账号间按顺序轮转，分配结果最可预测',
   },
   {
-    label: '粘滞',
+    label: '粘性调度',
     value: 'sticky',
     description: '优先复用最近使用的账号，直到不可用后再切换',
   },

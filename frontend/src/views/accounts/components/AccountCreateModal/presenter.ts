@@ -84,7 +84,7 @@ function resolveModal(
   else if (input.form.mode === 'oauth')
     description = '通过浏览器授权导入 OpenAI 账号'
   else if (input.form.mode === 'access_token')
-    description = '逐行粘贴 Access Token；未包含 Refresh Token 时无法自动续期'
+    description = '逐行粘贴 Access Token，未包含 Refresh Token 时无法自动续期'
   else if (input.form.mode === 'refresh_token')
     description = '逐行粘贴 Refresh Token，导入时将自动换取 Access Token'
 

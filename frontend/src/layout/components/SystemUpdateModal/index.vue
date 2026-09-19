@@ -14,13 +14,13 @@ import { computed, nextTick, shallowRef, useTemplateRef, watch } from 'vue'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
 import BaseEmpty from '@/components/base/BaseEmpty.vue'
+import BaseMarkdown from '@/components/base/BaseMarkdown/index.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import { toast } from '@/components/base/BaseToast'
 import { normalizeSystemVersion, useSystemUpdateStore } from '@/stores/modules/system-update'
 import { errorMessage } from '@/utils/async'
 import { formatTime } from '@/utils/date'
-import { renderReleaseNotes } from './markdown'
 import {
   resolveSystemUpdateLogClasses,
   resolveSystemUpdatePresentation,
@@ -77,7 +77,7 @@ const updateLogRows = computed(() =>
   })),
 )
 
-const renderedReleaseNotes = computed(() => renderReleaseNotes(updateInfo.value?.notes))
+const hasReleaseNotes = computed(() => Boolean(updateInfo.value?.notes?.trim()))
 
 const showUpdateProgress = computed(
   () => hasUpdate.value || updating.value || restarting.value || updateLogRows.value.length > 0,
@@ -256,7 +256,7 @@ watch(
       </section>
 
       <section
-        v-if="renderedReleaseNotes"
+        v-if="hasReleaseNotes"
         class="grid gap-2 rounded-cp-card bg-cp-fill-quaternary px-4 py-3.5"
       >
         <div class="flex items-center justify-between gap-3">
@@ -269,7 +269,7 @@ watch(
         </div>
         <BaseScrollbar class="-mx-4" max-height="160px">
           <div class="px-4">
-            <div class="release-notes" v-html="renderedReleaseNotes" />
+            <BaseMarkdown :source="updateInfo?.notes" />
           </div>
         </BaseScrollbar>
       </section>
@@ -401,89 +401,3 @@ watch(
     </div>
   </BaseConfirmModal>
 </template>
-
-<style scoped>
-.release-notes {
-  color: var(--cp-color-text);
-  font-size: 12px;
-  font-weight: var(--font-weight-emphasis);
-  line-height: 1.65;
-  overflow-wrap: anywhere;
-}
-
-.release-notes :deep(*) {
-  max-width: 100%;
-}
-
-.release-notes :deep(:first-child) {
-  margin-top: 0;
-}
-
-.release-notes :deep(:last-child) {
-  margin-bottom: 0;
-}
-
-.release-notes :deep(h1),
-.release-notes :deep(h2),
-.release-notes :deep(h3),
-.release-notes :deep(h4) {
-  margin: 12px 0 6px;
-  color: var(--cp-color-text);
-  font-size: 12px;
-  font-weight: var(--font-weight-heavy);
-  line-height: 1.4;
-}
-
-.release-notes :deep(p) {
-  margin: 0 0 8px;
-}
-
-.release-notes :deep(ul),
-.release-notes :deep(ol) {
-  margin: 0 0 8px;
-  padding-left: 18px;
-}
-
-.release-notes :deep(li) {
-  margin: 3px 0;
-}
-
-.release-notes :deep(a) {
-  color: var(--cp-color-link);
-  font-weight: 700;
-  text-decoration: none;
-}
-
-.release-notes :deep(a:hover) {
-  color: var(--cp-color-link-hover);
-}
-
-.release-notes :deep(code) {
-  border-radius: 5px;
-  background: var(--cp-color-fill-tertiary);
-  color: var(--cp-color-text);
-  font-family: var(--font-mono);
-  font-size: 11px;
-  padding: 1px 5px;
-}
-
-.release-notes :deep(pre) {
-  margin: 8px 0;
-  overflow-x: auto;
-  border-radius: var(--cp-border-radius);
-  background: var(--cp-color-bg-container);
-  padding: 8px 10px;
-}
-
-.release-notes :deep(pre code) {
-  background: transparent;
-  padding: 0;
-}
-
-.release-notes :deep(blockquote) {
-  margin: 8px 0;
-  border-left: 3px solid var(--cp-color-split);
-  color: var(--cp-color-text-secondary);
-  padding-left: 10px;
-}
-</style>

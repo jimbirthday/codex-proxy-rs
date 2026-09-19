@@ -156,7 +156,7 @@ function handleRequestConsume(creditId: string) {
             上次操作结果待确认
           </p>
           <p class="mt-1 mb-0 text-cp-xs leading-normal font-emphasis text-cp-text-secondary">
-            请继续确认上次重置结果。
+            请继续确认上次重置结果
           </p>
         </div>
         <BaseButton size="sm" variant="soft" :disabled="loading || consuming || !canRequestConsume" @click="requestConsume">
@@ -200,7 +200,7 @@ function handleRequestConsume(creditId: string) {
             class="mx-4 mt-0 mb-4 rounded-cp bg-cp-error-container px-4 py-3 text-cp-xs leading-normal font-emphasis text-cp-error-on-container"
             role="status"
           >
-            {{ loadError }}，请刷新重试。
+            {{ loadError }}，请刷新重试
           </p>
           <p
             v-else-if="loading && !hasSnapshot"

@@ -7,7 +7,7 @@ const marked = new Marked({
   gfm: true,
 })
 
-export function renderReleaseNotes(source?: string | null) {
+export function renderMarkdown(source?: string | null) {
   const value = source?.trim()
   if (!value)
     return ''

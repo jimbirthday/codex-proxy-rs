@@ -15,6 +15,23 @@ struct UnusedSettingsStore;
 
 #[async_trait]
 impl SettingsStore for UnusedSettingsStore {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        Ok(Default::default())
+    }
+    async fn sync_pricing(
+        &self,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing sync")
+    }
+    async fn update_pricing(
+        &self,
+        _: gateway_admin::model::pricing::UpdatePricing,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing update")
+    }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Err(unused())
     }
@@ -61,7 +78,7 @@ async fn settings_should_reject_zero_refresh_margin_before_store_call() {
                 request_id: "request-settings".to_owned(),
             },
             ReplaceRuntimeSettings {
-                disable_fast: None,
+                openai_client_profile: None,
                 request_location_enabled: false,
                 request_location: Default::default(),
                 model_mappings: Default::default(),

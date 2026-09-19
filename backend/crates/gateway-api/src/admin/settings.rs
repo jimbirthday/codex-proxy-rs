@@ -34,7 +34,7 @@ pub type ModelMappings = BTreeMap<String, String>;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeSettingsView {
-    pub disable_fast: bool,
+    pub openai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: ModelMappings,
@@ -66,7 +66,8 @@ pub struct RuntimeSettingsView {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateRuntimeSettingsRequest {
-    pub disable_fast: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_profile_update")]
+    pub openai_client_profile: Option<serde_json::Map<String, serde_json::Value>>,
     pub request_location_enabled: bool,
     pub request_location: gateway_core::account::RequestLocation,
     pub model_mappings: ModelMappings,
@@ -177,7 +178,9 @@ impl UpdateRuntimeSettingsRequest {
     fn into_command(self) -> Result<ReplaceRuntimeSettings, WireValidationError> {
         self.validate()?;
         Ok(ReplaceRuntimeSettings {
-            disable_fast: self.disable_fast,
+            openai_client_profile: self
+                .openai_client_profile
+                .map(gateway_core::account::OpaqueProviderData::new),
             request_location_enabled: self.request_location_enabled,
             request_location: self
                 .request_location
@@ -219,7 +222,9 @@ impl UpdateRuntimeSettingsRequest {
 impl From<RuntimeSettings> for RuntimeSettingsView {
     fn from(settings: RuntimeSettings) -> Self {
         Self {
-            disable_fast: settings.disable_fast,
+            openai_client_profile: settings
+                .openai_client_profile
+                .map(gateway_core::account::OpaqueProviderData::into_inner),
             request_location_enabled: settings.request_location_enabled,
             request_location: settings.request_location,
             model_mappings: wire_model_mappings(settings.model_mappings),
@@ -344,7 +349,25 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route("/api/admin/settings/pricing", get(pricing::<S>))
+        .route(
+            "/api/admin/settings/pricing/update",
+            post(update_pricing::<S>),
+        )
+        .route(
+            "/api/admin/settings/pricing/sync/preview",
+            post(preview_pricing_sync::<S>),
+        )
+        .route("/api/admin/settings/pricing/sync", post(sync_pricing::<S>))
         .route("/api/admin/settings", get(settings::<S>))
+        .route(
+            "/api/admin/settings/client-profiles/openai",
+            get(client_profile_options::<S>),
+        )
+        .route(
+            "/api/admin/settings/client-profiles/openai/preview",
+            post(preview_client_profile::<S>),
+        )
         .route("/api/admin/settings/update", post(update_settings::<S>))
         .route(
             "/api/admin/settings/client-downloads/codex-desktop/windows",
@@ -381,6 +404,125 @@ where
         StatusCode::OK,
         AdminEnvelope::ok(CodexDesktopWindowsDownloadsView::from(downloads)),
     )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PricingUpdateRequest {
+    provider: String,
+    models: Vec<String>,
+    change: PricingChangeRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "camelCase", deny_unknown_fields)]
+enum PricingChangeRequest {
+    Replace {
+        pricing: gateway_core::metering::ModelPriceOverride,
+    },
+    Multiplier {
+        #[serde(rename = "multiplierBps")]
+        multiplier_bps: u32,
+    },
+    Reset {},
+    Delete {},
+}
+
+async fn pricing<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let pricing = state
+        .admin_services()
+        .settings()
+        .pricing()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({
+            "defaults": pricing.defaults, "overrides": pricing.overrides,
+            "synced": pricing.synced, "syncedAt": pricing.synced_at,
+        })),
+    ))
+}
+
+async fn preview_pricing_sync<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let preview = state
+        .admin_services()
+        .settings()
+        .preview_pricing_sync()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(preview),
+    ))
+}
+
+async fn sync_pricing<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(command): AdminJson<gateway_admin::model::pricing::SyncPricing>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    state
+        .admin_services()
+        .settings()
+        .sync_pricing(&auth.context().mutation_context(), command)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({"saved": true})),
+    ))
+}
+
+async fn update_pricing<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<PricingUpdateRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    use gateway_admin::model::pricing::{PricingChange, UpdatePricing};
+    let change = match request.change {
+        PricingChangeRequest::Replace { pricing } => PricingChange::Replace(pricing),
+        PricingChangeRequest::Multiplier { multiplier_bps } => {
+            PricingChange::Multiplier(multiplier_bps)
+        }
+        PricingChangeRequest::Reset {} => PricingChange::Reset,
+        PricingChangeRequest::Delete {} => PricingChange::Delete,
+    };
+    state
+        .admin_services()
+        .settings()
+        .update_pricing(
+            &auth.context().mutation_context(),
+            UpdatePricing {
+                provider: request.provider,
+                models: request.models,
+                change,
+            },
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({"saved": true})),
+    ))
 }
 
 async fn settings<S>(
@@ -578,4 +720,59 @@ fn map_wire_error(error: WireValidationError) -> AdminError {
 
 fn map_service_error(error: gateway_admin::model::AdminError) -> AdminError {
     map_admin_service_error(error)
+}
+
+// 字段省略时保留已有配置；显式 null 不能清空唯一的通用默认。
+fn deserialize_profile_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<serde_json::Map<String, serde_json::Value>>, D::Error> {
+    serde_json::Map::<String, serde_json::Value>::deserialize(deserializer).map(Some)
+}
+
+async fn client_profile_options<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let result = state
+        .admin_services()
+        .settings()
+        .client_profile_options()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(result.into_inner()),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientProfilePreviewRequest {
+    configuration: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+async fn preview_client_profile<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<ClientProfilePreviewRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let configuration = request
+        .configuration
+        .map(gateway_core::account::OpaqueProviderData::new);
+    let result = state
+        .admin_services()
+        .settings()
+        .preview_client_profile(configuration.as_ref())
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(result.into_inner()),
+    ))
 }

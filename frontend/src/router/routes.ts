@@ -61,8 +61,23 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/settings/index.vue'),
       },
       {
+        path: 'settings/upstream',
+        name: 'settings-upstream',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
+        path: 'settings/access',
+        name: 'settings-access',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
         path: 'settings/backup',
         name: 'settings-backup',
+        component: () => import('@/views/settings/index.vue'),
+      },
+      {
+        path: 'settings/pricing',
+        name: 'settings-pricing',
         component: () => import('@/views/settings/index.vue'),
       },
     ],

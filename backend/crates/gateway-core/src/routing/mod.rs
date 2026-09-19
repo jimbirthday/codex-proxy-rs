@@ -536,7 +536,7 @@ impl ProviderCandidate {
 /// 一次请求冻结的 Provider 尝试顺序。
 #[derive(Debug, Clone)]
 pub struct RoutingPlan {
-    disable_fast: bool,
+    pricing: Arc<crate::metering::PricingOverrides>,
     request_location: Option<crate::account::RequestLocation>,
     config_revision: ConfigRevision,
     account_selection_policy: AccountSelectionPolicy,
@@ -548,8 +548,13 @@ pub struct RoutingPlan {
 
 impl RoutingPlan {
     #[must_use]
-    pub const fn disable_fast(&self) -> bool {
-        self.disable_fast
+    pub fn pricing(&self) -> Arc<crate::metering::PricingOverrides> {
+        Arc::clone(&self.pricing)
+    }
+
+    #[must_use]
+    pub fn disable_fast(&self) -> bool {
+        self.account_scope.disable_fast()
     }
 
     /// 本次请求冻结的全局位置，重试时沿用同一份配置。

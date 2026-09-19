@@ -23,7 +23,7 @@ use crate::model::{
     auth::{AdminAuditEvent, AuthSession},
     client_keys::{
         ClientKeyListQuery, ClientKeyPage, ClientKeyRecord, ClientKeySecret, DeleteClientKey,
-        NewClientKey, SetClientKeyEnabled, UpdateClientKey,
+        NewClientKey, ResetClientKeyBudget, SetClientKeyEnabled, UpdateClientKey,
     },
     observability::{
         DashboardObservation, DashboardRuntimeSlots, DiagnosticDimension, DiagnosticObservation,
@@ -227,6 +227,15 @@ pub trait AccountRuntimeStore: Send + Sync {
 pub trait AuthStore: Send + Sync {
     async fn load_password_hash(&self, admin_user_id: &str) -> AdminStoreResult<Option<String>>;
 
+    /// 密码更新与审计必须在同一事务提交；旧哈希不匹配时不写入。
+    async fn change_password(
+        &self,
+        admin_user_id: &str,
+        expected_hash: &str,
+        password_hash: &str,
+        audit: AdminAuditEvent,
+    ) -> AdminStoreResult<bool>;
+
     async fn create_password_hash_if_absent(
         &self,
         admin_user_id: &str,
@@ -297,6 +306,13 @@ pub trait ClientKeyStore: Send + Sync {
         command: DeleteClientKey,
         context: &MutationContext,
     ) -> AdminStoreResult<Revision>;
+
+    /// 仅修改运行时账本并原子记录审计，不推进配置版本。
+    async fn reset_client_key_budget(
+        &self,
+        command: ResetClientKeyBudget,
+        context: &MutationContext,
+    ) -> AdminStoreResult<()>;
 }
 
 /// Provider-neutral account group management transactions.
@@ -401,6 +417,18 @@ pub trait ObservabilityStore: Send + Sync {
 /// Runtime settings 与管理员 API Key 写入。
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
+    async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
+    async fn sync_pricing(
+        &self,
+        changes: crate::model::pricing::PricingSyncChanges,
+        context: &MutationContext,
+    ) -> AdminStoreResult<crate::model::Revision>;
+    async fn update_pricing(
+        &self,
+        command: crate::model::pricing::UpdatePricing,
+        context: &MutationContext,
+    ) -> AdminStoreResult<crate::model::Revision>;
+
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings>;
 
     async fn admin_api_key_exists(&self) -> AdminStoreResult<bool>;

@@ -7,7 +7,7 @@ import { formatDateTime } from '@/utils/date'
 const props = defineProps<{ apiKey: ApiKey }>()
 const windows = computed(() => [
   { label: '日', heading: '日用量', used: props.apiKey.dailyUsedUsd, limit: props.apiKey.dailyLimitUsd, reset: props.apiKey.dailyResetsAt },
-  { label: '周', heading: '周用量', used: props.apiKey.weeklyUsedUsd, limit: props.apiKey.weeklyLimitUsd, reset: props.apiKey.weeklyResetsAt },
+  { label: '周', heading: '7日用量', used: props.apiKey.weeklyUsedUsd, limit: props.apiKey.weeklyLimitUsd, reset: props.apiKey.weeklyResetsAt },
 ])
 function amount(value: string) {
   // 列表最多显示两位小数，不补末尾零；明细保留原始金额的全部精度。
@@ -26,7 +26,7 @@ function amount(value: string) {
         aria-haspopup="dialog"
       >
         <span v-for="window in windows" :key="window.label" class="flex min-w-0 items-center gap-2">
-          <span class="shrink-0 text-cp-text-tertiary">{{ window.label }}</span>
+          <span class="w-6 shrink-0 text-cp-text-tertiary">{{ window.label }}</span>
           <span class="truncate" :class="Number(window.limit) > 0 && Number(window.used) >= Number(window.limit) ? 'text-cp-error' : 'text-cp-text'">
             ${{ amount(window.used) }} / {{ Number(window.limit) === 0 ? '∞' : `$${amount(window.limit)}` }}
           </span>

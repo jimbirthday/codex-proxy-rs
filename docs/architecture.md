@@ -61,7 +61,7 @@ flowchart LR
 | `gateway-admin` | 管理领域、Key 用量查询、Provider/Store 端口、审计语义和备份策略 |
 | `gateway-api` | HTTP/WS/SSE 解码与交付、Admin 与 Key 用量 wire、静态 Web UI；不直接访问 Store 或具体 Provider |
 | `gateway-store` | PostgreSQL、Redis、S3/R2、`pg_dump` 适配器；不拥有业务策略 |
-| `gateway-host` | 配置加载、日志、HTTP 生命周期、Worker 监督和系统更新 |
+| `gateway-host` | 配置加载、日志、HTTP 生命周期、Worker 监督、系统更新及外部价格源适配 |
 | `providers/openai` | OpenAI OAuth、账号选择、目录、额度、Responses/Images/Search transport |
 | `providers/xai` | xAI OAuth session、账号选择、目录、额度和 Grok/Responses 转换 |
 | `frontend` | Vue 管理端与 Key 用量页，仅通过各自身份允许的控制面 API 访问状态 |
@@ -133,8 +133,8 @@ service；客户端原生对象保存在有界进程缓存中，与套餐 Redis 
 `RuntimeSnapshot → RoutingPlan → AttemptContext` 冻结传递，关闭时保留客户端原有字段；
 Provider 在选定账号后应用代理位置覆盖。请求期间不额外查询全局设置，配置发布不改变已开始请求的全局值。
 
-Fast 限制由同一快照链路冻结：全局开关与 Client Key 所有绑定分组的开关取逻辑或；
-禁用分组仍贡献限制，无分组 Key 只受全局开关影响，不按所选账号的分组重新解释。
+Fast 限制由同一快照链路冻结：Client Key 所有绑定分组的开关取逻辑或；
+禁用分组仍贡献限制，无分组 Key 不限制 Fast，不按所选账号的分组重新解释。
 OpenAI Provider 在独立编码请求上、生成上游头与观测前统一应用顶层档位覆盖，HTTP、WS 与重试共用。
 该策略不改变选号、会话亲和或共享原始请求；每个新 WS 请求重新取得当前策略。
 WS 路由提示属于握手，连接复用时不重发；档位变化不重建连接或打断 `previous_response_id` 续写，
@@ -185,6 +185,8 @@ Client Key 鉴权完成后，API adapter 从有界请求头识别 Codex Desktop/
 - Provider 的一次 `execute` 只选择一个 credential 并返回一个冷流；换号、重试和 fallback 由 Core 决定。
 - `not_sent`、`sent`、`ambiguous` 是单调的上游发送边界；结果不明确时不能假定上游未收到请求。
 - downstream commit 是不可撤回的交付承诺。commit 后禁止换号、重试和 fallback。
+- API 在最终错误编码出口投影客户端恢复信号；该投影不修改 Provider 上游事实，也不改变 Core 的
+  重试与提交边界。具体错误合同见 [数据面接口](api.md#3-openai-数据面与模型目录)。
 - Provider 可将明确容量拒绝标记为有界同账号退避，Core 在既有安全重放边界内执行，按账号维护请求内
   预算，耗尽后复用普通换号路径。该退避消耗总路由预算，与 WS 传输恢复、OAuth 刷新及账号额度冷却分开。
 - 跨 Provider 只在账号范围和能力都允许，且请求尚未到达上游或已被证明可安全重放时发生。
@@ -224,8 +226,13 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 - xAI 是翻译边界。Provider 把 Grok wire 转换为 Responses wire；上游结构化错误的 message/code/type
   可以透出，但账号指纹会先脱敏。
 - response ID 是不透明 UTF-8 bytes，不假设 UUID、固定长度或跨 Provider 可复用。
-- 请求画像以配置为启动基线。OpenAI Desktop 与 xAI CLI 的官方版本检查只更新各自负责的运行时画像，
-  不回写 `config.yaml`。
+- OpenAI 用户身份选择由 PostgreSQL 保存，Core 在 `FrozenAccountScope` 中按 Key 整体覆盖通用选择，
+  以 Provider-owned 不透明对象沿路由计划传递；执行会话复用首次解析结果，使重试不受发布更新影响。
+  OpenAI Provider 唯一负责预设、校验、版本来源及 UA 生成，Admin 提供管理和生效预览。
+  官方发布资料与用户选择分开：Redis 按 Provider、客户端、平台、架构隔离可重建版本缓存，
+  Desktop 完整制品元组原子更新，固定配置不被刷新覆盖。普通连接按已有身份键匹配，精确续写保留原连接。
+  后台账号和 Desktop 专属操作使用独立官方 Desktop 画像，不接受 Key 覆盖。
+  xAI 仍以启动配置为基线检查官方版本；两者均不回写 `config.yaml`。
 
 xAI Provider 负责 Codex custom 工具与 Grok function 工具的双向转换，保持工具类型、item ID 与
 `call_id` 配对；超限或转换失败终止流。默认 `store: false` 的续接由现有会话 owner 重放完整历史；
@@ -367,6 +374,9 @@ API 模块按 `url`、`method`、`data`（POST）或 `params: data`（GET）排�
 AuthService 每次恢复 Key 会话时重新检查 Key 是否存在且启用；Key 会话不能访问管理员页面和管理接口。
 前端只维护一份 Auth Store，不在每个 API 请求上标记身份；401 会话失效、403 权限不足和 503 依赖故障分别处理。
 成功登录替换旧会话，登出必须确认服务端撤销。
+管理员会话保存由已加盐密码哈希派生的指纹，每次恢复时与 PostgreSQL 当前密码核对；普通设置变更不影响该绑定。
+改密在 AuthService 验证当前密码和新密码策略，Store 以旧哈希条件更新密码并在同一 PostgreSQL 事务记录审计。
+事务提交后旧管理员会话的指纹失配，不依赖 Redis 批量删除完成撤销；原始密码及密码哈希不进入 Redis。
 KeyUsageService 从 AuthService 的服务端身份确定唯一查询范围，复用 ClientKeyStore 的额度账本投影和
 ObservabilityStore 的范围查询；API 只输出单页所需的字段白名单，不复用管理员的宽响应。
 前端 `/key-usage` 独立于管理布局，不挂载管理员菜单或请求管理接口。
@@ -421,6 +431,8 @@ Key 的 RPM 在成功准入时才计数，金额限制在入队前及成功准�
 
 日金额、七天金额、并发和 RPM 按 Client Key 跨账号、跨 Provider 合计，零表示不限；修改限额不重置已用金额。
 Core 负责准入与结算时序，Store 持久化费用账本，Admin 负责限额配置。
+Admin 的手动重置复用同一账本与 Key 行锁，在一个事务中清零所选周期金额、推进计费起点并写入审计，
+保留窗口到期时间与费用事件，不推进配置 revision。结算仍按完成时间判断归属，重置前完成的费用不会重新扣入已重置周期。
 
 - 日窗口按北京时间零点划分；七天窗口从首次准入当天零点开始，到期后由下一次使用重新开启，不固定为周一。
 - 金额优先使用 Provider 上报的 USD，否则按现有模型价格估算；订阅账号的估算费用不代表上游订阅账单。
@@ -441,6 +453,21 @@ Core 负责准入与结算时序，Store 持久化费用账本，Admin 负责限
 PostgreSQL 不可用时拒绝所有新的计费请求，Redis 继续管理并发/RPM 租约。
 账本独立于可丢弃的请求观测日志，日志清理不重置金额；费用事件保留至删除 Key，已有日志不会回填为账本费用。
 字段与错误合同见 [Client Key API](api.md#7-client-key)。
+
+### 模型价格与费用快照
+
+Provider 是内置价目、服务档位、模态和工具费规则的唯一 owner；Core metering 定义中立价格覆盖与
+精确金额运算。Admin 管理人工覆盖与手动同步，Host `pricing` 适配固定的 models.dev HTTPS 来源，
+由组合根注入 Admin 的 `PricingSource` 端口；Store 负责来源层、人工层与审计的事务持久化。
+同步不能覆盖人工项，更新仅修改选中的模型。HTTP 合同与价格边界见 [模型定价 API](api.md#模型定价)。
+
+编译 RuntimeSnapshot 时合并同步与人工配置，Provider 缺省项仍由其内置表解释。不可变价格集合经
+Arc 随 RoutingPlan 冻结并进入所有 attempt，不在推理请求中读取数据库、Redis 或外部价目，也不复制
+整份价目。Provider 按实际发送模型选择配置；自定义倍率只作用于本地计算费用，上游报告金额不变。
+
+本地计算费用携带当次拆分、有效单价和倍率，终态观测将其写入版本化费用快照。查询优先还原快照，
+不使用新配置解释历史；无快照的旧记录保留总额核对后补充拆分的路径。Client Key 账本使用同一费用
+结果沿既有幂等结算流程累计，不依赖请求明细写入成功。
 
 ## 7. 控制面与 revision
 
@@ -478,7 +505,7 @@ PostgreSQL 周期对账才是正确性基础。
 | 控制面统一登录会话与登录限流桶 | Redis | AuthService 唯一拥有；保存 Admin / Key 身份、绑定 ID、绝对有效期和计数，不保存原始凭据 |
 | 日志、OAuth 恢复记录、在线更新状态、备份暂存 | `.runtime/` | 部署节点本地运行文件 |
 | 重置卡库存与消费结果 | OpenAI upstream | 后端不建立本地卡库存；前端按账号在浏览器会话期间保留最近查询、未决消费幂等键与发送锁 |
-| Provider 公开模型与请求画像 | Provider/runtime cache | 由官方目录或发布源刷新，不写成第二份业务配置 |
+| Provider 公开模型与官方发布资料 | Provider/runtime cache | 由官方目录或发布源刷新，与 PostgreSQL 中的用户身份选择分别管理 |
 | Windows 安装包临时直链 | Host 进程内短缓存 | 按需解析、严格校验、到期前丢弃；不写 PostgreSQL/Redis，也不代理包字节 |
 
 账号对外状态不是独立列，而是 PostgreSQL credential/quota 事实与 Redis cooldown 的统一投影：

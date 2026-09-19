@@ -75,7 +75,7 @@ function formatFileSize(value: number | null): string {
             </span>
           </div>
           <p class="mt-1.5 mb-0 text-cp-sm leading-[1.45] font-semibold text-cp-text-secondary">
-            后端实时校验 Microsoft CDN 直链；请选择与设备一致的架构。
+            后端实时校验 Microsoft CDN 直链，请选择与设备一致的架构
           </p>
         </div>
       </div>
@@ -102,7 +102,7 @@ function formatFileSize(value: number | null): string {
       class="m-0 rounded-cp bg-cp-error-container px-3 py-2.5 text-cp-sm leading-[1.45] font-bold text-cp-error-on-container"
       role="alert"
     >
-      {{ error }}，当前仍显示上次成功结果。
+      {{ error }}，当前仍显示上次成功结果
     </p>
 
     <div v-if="loading && !downloads" class="grid gap-3 sm:grid-cols-2" aria-label="正在提取离线安装包">

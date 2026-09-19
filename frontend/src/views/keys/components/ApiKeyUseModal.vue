@@ -77,7 +77,7 @@ const visibleFiles = computed(() => [
       </div>
 
       <p class="text-cp-sm text-cp-text-secondary">
-        配置含密钥，请勿分享，覆盖前请备份。
+        配置含密钥，请勿分享，覆盖前请备份
       </p>
 
       <div class="flex flex-col gap-3">

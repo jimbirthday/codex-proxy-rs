@@ -212,7 +212,7 @@ onMounted(() => void query.execute())
         <div class="flex h-full min-h-0 flex-col">
           <BaseTable class="min-h-0 flex-1" :columns="columns" :rows="proxies" :loading="loading" :empty-text="search.trim() ? '没有找到匹配的代理，请尝试其他名称' : '暂无代理，请点击新增代理添加'">
             <template #name="{ row }">
-              <strong class="block truncate text-cp text-cp-text" :title="row.name">{{ row.name }}</strong>
+              <span class="block truncate text-cp text-cp-text" :title="row.name">{{ row.name }}</span>
             </template>
             <template #address="{ row }">
               <div class="grid min-w-0 gap-1">

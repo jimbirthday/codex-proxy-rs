@@ -40,8 +40,8 @@ const TIMEZONE_OPTIONS = [
 
 <template>
   <BaseCard
-    title="定时备份"
-    description="配置自动定时备份"
+    title="备份计划"
+    description="配置自动备份的执行时间与保留策略"
   >
     <template #actions>
       <BaseButton variant="primary" :loading="saving" :disabled="loading" @click="emit('save')">
@@ -63,7 +63,7 @@ const TIMEZONE_OPTIONS = [
           />
         </div>
 
-        <BaseFormItem label="时区" description="显式 IANA 时区">
+        <BaseFormItem label="调度时区" description="用于解释 Cron 表达式的 IANA 时区">
           <BaseSelect v-model="schedule.scheduleTimezone" :options="TIMEZONE_OPTIONS" />
         </BaseFormItem>
 
@@ -78,13 +78,13 @@ const TIMEZONE_OPTIONS = [
           </BaseInput>
         </BaseFormItem>
 
-        <BaseFormItem label="备份过期天数" description="超过此天数自动删除，0 = 永不过期">
-          <BaseInput v-model="schedule.retentionDays" aria-label="备份过期天数" type="number" min="0" />
+        <BaseFormItem label="保留天数" description="超过此天数自动删除，0 表示不按天数清理，仍受最大保留份数限制">
+          <BaseInput v-model="schedule.retentionDays" aria-label="备份保留天数" type="number" min="0" />
         </BaseFormItem>
 
         <BaseFormItem
           label="最大保留份数"
-          description="最多保留的备份数量，0 = 不限制"
+          description="最多保留的备份数量，0 表示不按份数清理，仍受保留天数限制"
         >
           <BaseInput v-model="schedule.retentionCount" aria-label="最大保留份数" type="number" min="0" />
         </BaseFormItem>

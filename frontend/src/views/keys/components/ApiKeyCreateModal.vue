@@ -11,6 +11,7 @@ import BaseForm from '@/components/base/BaseForm/index.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseModal from '@/components/base/BaseModal/index.vue'
+import ClientProfileEditor from '@/components/client-profile/ClientProfileEditor.vue'
 
 const props = defineProps<{
   groups: AccountGroup[]
@@ -27,15 +28,16 @@ const emit = defineEmits<{
 const open = defineModel<boolean>({ default: false })
 const createdOpen = defineModel<boolean>('createdOpen', { default: false })
 const form = defineModel<ApiKeyFormValue>('form', { required: true })
-const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key')
+const title = computed(() => props.editing ? '编辑密钥' : '创建 API Key')
 </script>
 
 <template>
   <BaseModal
     v-model="open"
     :title="title"
+    description="配置密钥信息、分组与使用限制"
     tone="info"
-    size="md"
+    size="lg"
     :dismissible="!saving"
   >
     <template #icon>
@@ -85,6 +87,10 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
         />
       </BaseFormItem>
 
+      <BaseFormItem label="上游身份">
+        <ClientProfileEditor v-if="open" v-model="form.openaiClientProfileOverride" allow-inherit :disabled="saving" />
+      </BaseFormItem>
+
       <div class="grid gap-6 sm:grid-cols-2">
         <BaseFormItem label="日限额">
           <BaseInput
@@ -101,13 +107,13 @@ const title = computed(() => props.editing ? '编辑 API Key' : '创建 API Key'
             </template>
           </BaseInput>
         </BaseFormItem>
-        <BaseFormItem label="周限额">
+        <BaseFormItem label="7日限额">
           <BaseInput
             v-model="form.weeklyLimitUsd"
             type="number"
             min="0"
             step="any"
-            aria-label="周限额（美元）"
+            aria-label="7日限额（美元）"
             placeholder="不限制"
             :disabled="saving"
           >

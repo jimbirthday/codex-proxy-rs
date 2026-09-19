@@ -102,10 +102,17 @@ function closeModal() {
   open.value = false
 }
 
-function focusableElements() {
-  return Array.from(panel.value?.querySelectorAll<HTMLElement>(focusableSelector) ?? []).filter(
-    element => !element.hidden,
-  )
+function focusableElements(root: ParentNode | null = panel.value): HTMLElement[] {
+  if (!root)
+    return []
+
+  const elements: HTMLElement[] = []
+  for (const element of root.children) {
+    if (element instanceof HTMLElement && element.matches(focusableSelector) && !element.hidden)
+      elements.push(element)
+    elements.push(...focusableElements(element.shadowRoot ?? element))
+  }
+  return elements
 }
 
 function handleKeydown(event: KeyboardEvent) {
@@ -125,17 +132,20 @@ function handleKeydown(event: KeyboardEvent) {
   }
   const first = focusable[0]
   const last = focusable[focusable.length - 1]
+  let activeElement = document.activeElement
+  while (activeElement?.shadowRoot?.activeElement)
+    activeElement = activeElement.shadowRoot.activeElement
   if (!panel.value?.contains(document.activeElement)) {
     event.preventDefault()
     if (event.shiftKey)
       last?.focus()
     else first?.focus()
   }
-  else if (event.shiftKey && document.activeElement === first) {
+  else if (event.shiftKey && activeElement === first) {
     event.preventDefault()
     last?.focus()
   }
-  else if (!event.shiftKey && document.activeElement === last) {
+  else if (!event.shiftKey && activeElement === last) {
     event.preventDefault()
     first?.focus()
   }
@@ -216,7 +226,7 @@ onBeforeUnmount(() => {
           :role="role"
           aria-modal="true"
           :aria-labelledby="titleId"
-          :aria-describedby="description ? descriptionId : undefined"
+          :aria-describedby="description || $slots.description ? descriptionId : undefined"
           tabindex="-1"
         >
           <header
@@ -225,7 +235,7 @@ onBeforeUnmount(() => {
               tone === 'neutral'
                 ? 'grid-cols-[minmax(0,1fr)_28px]'
                 : 'grid-cols-[auto_minmax(0,1fr)_28px]',
-              description ? 'items-start' : 'items-center',
+              description || $slots.description ? 'items-start' : 'items-center',
               draggable ? 'cp-modal-header--draggable' : undefined,
             ]"
             @pointerdown="handlePointerDown"
@@ -244,11 +254,13 @@ onBeforeUnmount(() => {
                 {{ title }}
               </h2>
               <p
-                v-if="description"
+                v-if="description || $slots.description"
                 :id="descriptionId"
                 class="mt-1 mb-0 text-cp leading-[1.45] font-semibold text-cp-text-secondary"
               >
-                {{ description }}
+                <slot name="description">
+                  {{ description }}
+                </slot>
               </p>
             </div>
             <BaseIconButton

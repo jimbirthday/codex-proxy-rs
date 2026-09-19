@@ -40,7 +40,7 @@ const additionalEntryCount = computed(() => Math.max(summaryEntries.value.length
       </span>
       <div class="grid min-w-0 gap-1.5">
         <span class="text-[10px] leading-3 font-bold text-cp-text-quaternary">{{ account.usage.windowLabelDisplay }}</span>
-        <div class="h-1 w-full rounded-full bg-cp-success" title="上游额度未提供；绿色条不表示剩余额度" aria-hidden="true" />
+        <div class="h-1 w-full rounded-full bg-cp-success" title="上游额度未提供，绿色条不表示剩余额度" aria-hidden="true" />
       </div>
     </template>
     <template v-else-if="summaryEntries.length > 0">

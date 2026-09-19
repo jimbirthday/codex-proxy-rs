@@ -178,7 +178,7 @@ fn reused_client_uses_updated_limits_for_each_execution() {
         requests_per_minute: 1,
     };
     for (revision, limits) in [(2, limited), (3, RateLimits::unlimited())] {
-        snapshots.publish(start_snapshot_with_policy(revision, true, limits));
+        snapshots.publish(start_snapshot_with_policy(revision, true, limits, false));
         let mut next = request(&service, ClientTransport::WebSocket);
         next.client = client.clone();
         let started = block_on(service.start(next)).expect("new execution");
@@ -212,6 +212,7 @@ fn reused_client_cannot_start_after_key_disable_or_snapshot_suspension() {
                 2,
                 false,
                 RateLimits::unlimited(),
+                false,
             ));
         }
         let result = block_on(service.start(next));
@@ -1893,10 +1894,15 @@ fn client_snapshot() -> RuntimeSnapshot {
 }
 
 fn start_snapshot() -> RuntimeSnapshot {
-    start_snapshot_with_policy(1, true, RateLimits::unlimited())
+    start_snapshot_with_policy(1, true, RateLimits::unlimited(), false)
 }
 
-fn start_snapshot_with_policy(revision: u64, enabled: bool, limits: RateLimits) -> RuntimeSnapshot {
+fn start_snapshot_with_policy(
+    revision: u64,
+    enabled: bool,
+    limits: RateLimits,
+    disable_fast: bool,
+) -> RuntimeSnapshot {
     let provider = ProviderKind::new("openai").expect("provider kind");
     let capabilities =
         ModelCapabilities::new(BTreeSet::from([OperationKind::Generate]), Some(16_000));
@@ -1916,7 +1922,12 @@ fn start_snapshot_with_policy(revision: u64, enabled: bool, limits: RateLimits) 
         vec![ClientPolicy::new(
             ClientApiKeyId::new("key_start_test").expect("client API key ID"),
             PlaintextClientApiKey::new("sk_start_test").expect("plaintext client API key"),
-            account_scope(&provider, "acct_start"),
+            Arc::new(
+                account_scope(&provider, "acct_start")
+                    .as_ref()
+                    .clone()
+                    .with_disable_fast(disable_fast),
+            ),
             enabled,
             limits,
         )],
@@ -2013,6 +2024,7 @@ fn account_wait_inherits_the_budget_spent_during_client_admission() {
                 max_concurrency: 1,
                 requests_per_minute: 0,
             },
+            false,
         )
         .with_client_queue_policy(gateway_core::concurrency::ConcurrencyQueuePolicy {
             max_waiting: 1,
@@ -2123,6 +2135,7 @@ fn queue_service(
             max_concurrency,
             requests_per_minute: 0,
         },
+        false,
     )
     .with_client_queue_policy(gateway_core::concurrency::ConcurrencyQueuePolicy {
         max_waiting,
@@ -2249,7 +2262,7 @@ fn cancelling_pending_admission_cleans_up_a_slot_acquired_before_the_reply() {
 }
 
 #[test]
-fn reused_websocket_client_gets_fast_policy_from_each_new_request_snapshot() {
+fn reused_websocket_client_gets_group_fast_policy_from_each_new_request_snapshot() {
     let snapshots = RuntimeSnapshotHandle::new(start_snapshot());
     let admissions = Arc::new(Admissions::default());
     let provider = Arc::new(ChargedProvider::default());
@@ -2264,10 +2277,12 @@ fn reused_websocket_client_gets_fast_policy_from_each_new_request_snapshot() {
     );
     let client = service.authenticate("sk_start_test").unwrap();
     for (revision, disable_fast) in [(2, true), (3, false)] {
-        snapshots.publish(
-            start_snapshot_with_policy(revision, true, RateLimits::unlimited())
-                .with_disable_fast(disable_fast),
-        );
+        snapshots.publish(start_snapshot_with_policy(
+            revision,
+            true,
+            RateLimits::unlimited(),
+            disable_fast,
+        ));
         let mut next = request(&service, ClientTransport::WebSocket);
         next.client = client.clone();
         let mut started = block_on(service.start(next)).unwrap();

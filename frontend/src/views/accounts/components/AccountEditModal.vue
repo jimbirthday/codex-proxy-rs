@@ -96,7 +96,7 @@ const selectedGroupIds = defineModel<string[]>('selectedGroupIds', { required: t
           v-model="notes"
           :rows="3"
           :maxlength="500"
-          placeholder="最多 500 字，留空可清除备注。"
+          placeholder="最多 500 字，留空可清除备注"
           :disabled="saving"
         />
       </BaseFormItem>

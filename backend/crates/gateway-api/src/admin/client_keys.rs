@@ -7,10 +7,11 @@ use std::fmt;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use gateway_admin::model::client_keys::{
-    ClientKeyCursor, ClientKeyCursorValue as DomainCursorValue, ClientKeyListQuery,
-    ClientKeyMutation, ClientKeyPage, ClientKeyPageSize, ClientKeyRecord, ClientKeySecret,
-    ClientKeySort as DomainSort, ClientKeySortField as DomainSortField, CreateClientKey,
-    CreatedClientKey, DeleteClientKey, SetClientKeyEnabled, SortDirection, UpdateClientKey,
+    ClientKeyBudgetPeriod, ClientKeyCursor, ClientKeyCursorValue as DomainCursorValue,
+    ClientKeyListQuery, ClientKeyMutation, ClientKeyPage, ClientKeyPageSize, ClientKeyRecord,
+    ClientKeySecret, ClientKeySort as DomainSort, ClientKeySortField as DomainSortField,
+    CreateClientKey, CreatedClientKey, DeleteClientKey, ResetClientKeyBudget, SetClientKeyEnabled,
+    SortDirection, UpdateClientKey,
 };
 use gateway_core::{
     engine::budget::ClientBudgetLimits,
@@ -146,6 +147,7 @@ impl ClientKeySort {
 #[derive(Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CreateClientKeyRequest {
+    openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
     custom_key: Option<String>,
     name: String,
     label: Option<String>,
@@ -175,6 +177,9 @@ impl CreateClientKeyRequest {
         validate_limit(self.max_concurrency, "maxConcurrency")?;
         validate_limit(self.requests_per_minute, "requestsPerMinute")?;
         Ok(CreateClientKey {
+            openai_client_profile_override: self
+                .openai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::new),
             custom_key: self
                 .custom_key
                 .filter(|key| !key.is_empty())
@@ -201,6 +206,8 @@ impl CreateClientKeyRequest {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateClientKeyRequest {
+    #[serde(default, deserialize_with = "deserialize_profile_override")]
+    openai_client_profile_override: Option<Option<serde_json::Map<String, serde_json::Value>>>,
     id: String,
     name: String,
     label: Option<String>,
@@ -221,6 +228,9 @@ impl UpdateClientKeyRequest {
         validate_limit(self.max_concurrency, "maxConcurrency")?;
         validate_limit(self.requests_per_minute, "requestsPerMinute")?;
         Ok(UpdateClientKey {
+            openai_client_profile_override: self
+                .openai_client_profile_override
+                .map(|value| value.map(gateway_core::account::OpaqueProviderData::new)),
             id: client_key_id(self.id, "clientKeyMutationNotFound")?,
             name: self.name,
             label: self.label,
@@ -230,6 +240,36 @@ impl UpdateClientKeyRequest {
             limits: RateLimits {
                 max_concurrency: self.max_concurrency,
                 requests_per_minute: self.requests_per_minute,
+            },
+        })
+    }
+}
+
+/// 重置指定周期已用金额的请求。
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResetClientKeyBudgetRequest {
+    id: String,
+    period: BudgetResetPeriod,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BudgetResetPeriod {
+    Daily,
+    Weekly,
+    All,
+}
+
+impl ResetClientKeyBudgetRequest {
+    pub fn into_command(self) -> Result<ResetClientKeyBudget, WireValidationError> {
+        validate_required_text(&self.id, "id")?;
+        Ok(ResetClientKeyBudget {
+            id: client_key_id(self.id, "clientKeyMutationNotFound")?,
+            period: match self.period {
+                BudgetResetPeriod::Daily => ClientKeyBudgetPeriod::Daily,
+                BudgetResetPeriod::Weekly => ClientKeyBudgetPeriod::Weekly,
+                BudgetResetPeriod::All => ClientKeyBudgetPeriod::All,
             },
         })
     }
@@ -276,6 +316,7 @@ impl ClientKeyMutationRequest {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientKeyView {
+    openai_client_profile_override: Option<serde_json::Map<String, serde_json::Value>>,
     id: String,
     name: String,
     label: Option<String>,
@@ -314,6 +355,9 @@ impl From<ClientKeyRecord> for ClientKeyView {
             "groups"
         };
         Self {
+            openai_client_profile_override: record
+                .openai_client_profile_override
+                .map(gateway_core::account::OpaqueProviderData::into_inner),
             id: record.id.to_string(),
             name: record.name,
             label: record.label,
@@ -691,6 +735,10 @@ where
         )
         .route("/api/admin/client-keys/reveal", get(reveal_client_key::<S>))
         .route(
+            "/api/admin/client-keys/reset-budget",
+            post(reset_client_key_budget::<S>),
+        )
+        .route(
             "/api/admin/client-keys/update",
             post(update_client_key::<S>),
         )
@@ -791,6 +839,29 @@ where
     )
 }
 
+async fn reset_client_key_budget<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(payload): AdminJson<ResetClientKeyBudgetRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = state
+        .admin_services()
+        .client_keys()
+        .reset_budget(
+            &auth.context().mutation_context(),
+            payload.into_command().map_err(map_wire_error)?,
+        )
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(MutatedClientKeyData::new(id.as_str().to_owned())),
+    ))
+}
+
 async fn disable_client_key<S>(
     auth: AdminAuth,
     State(state): State<S>,
@@ -873,4 +944,11 @@ fn map_wire_error(error: WireValidationError) -> AdminError {
 
 fn map_service_error(error: gateway_admin::model::AdminError) -> AdminError {
     map_admin_service_error(error)
+}
+
+// 省略表示不修改，null 表示恢复跟随通用设置。
+fn deserialize_profile_override<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<serde_json::Map<String, serde_json::Value>>>, D::Error> {
+    Option::<serde_json::Map<String, serde_json::Value>>::deserialize(deserializer).map(Some)
 }

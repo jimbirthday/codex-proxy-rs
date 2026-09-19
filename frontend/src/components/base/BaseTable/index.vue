@@ -26,6 +26,7 @@ const props = withDefaults(defineProps<BaseTableProps<Row>>(), {
   density: 'default',
   loading: false,
   emptyText: '暂无数据',
+  showHeaderWhenEmpty: false,
   scrollbarAlwaysVisible: false,
   sort: undefined,
 })
@@ -54,7 +55,8 @@ const tableRef = useTemplateRef<HTMLTableElement>('table')
 const horizontalScrolled = shallowRef(false)
 const horizontalCanScrollRight = shallowRef(false)
 
-function measureHorizontalScroll() {
+function updateScrollLayout() {
+  scrollbarRef.value?.update()
   const wrap = scrollbarRef.value?.wrapRef
   if (!wrap) {
     horizontalScrolled.value = false
@@ -77,12 +79,12 @@ function handleTableScroll(payload: { scrollTop: number, scrollLeft: number }) {
 
 onMounted(async () => {
   await nextTick()
-  measureHorizontalScroll()
+  updateScrollLayout()
 })
-useResizeObserver(() => [scrollbarRef.value?.wrapRef, tableRef.value].filter(Boolean), measureHorizontalScroll)
+useResizeObserver(() => [scrollbarRef.value?.wrapRef, tableRef.value].filter(Boolean), updateScrollLayout)
 watch([() => displayRows.value.length, () => props.columns], async () => {
   await nextTick()
-  measureHorizontalScroll()
+  updateScrollLayout()
 })
 
 const headerRowClass = computed(() => [
@@ -185,9 +187,9 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
 
 <template>
   <div class="@container/table isolate flex h-full min-h-0 w-full max-w-full flex-col overflow-hidden">
-    <div v-loading="loading" class="relative flex min-h-0 max-w-full flex-1 overflow-hidden">
+    <div v-loading="loading && (hasRows || !showHeaderWhenEmpty)" class="relative flex min-h-0 max-w-full flex-1 overflow-hidden">
       <BaseScrollbar
-        v-if="hasRows"
+        v-if="hasRows || showHeaderWhenEmpty"
         ref="scrollbar"
         class="min-h-0 flex-1"
         :class="
@@ -306,8 +308,15 @@ function sortButtonLabel(column: ResolvedTableColumn<Row>) {
           </tbody>
         </table>
       </BaseScrollbar>
-      <div v-else class="grid min-h-0 flex-1 place-items-center overflow-hidden px-4">
-        <BaseEmpty v-if="!loading" :title="emptyText" surface="none" class="w-full max-w-80" />
+      <div
+        v-if="!hasRows"
+        v-loading="loading && showHeaderWhenEmpty"
+        class="grid min-h-0 flex-1 place-items-center overflow-hidden px-4"
+        :class="showHeaderWhenEmpty ? ['absolute inset-x-0 bottom-0', density === 'compact' ? 'top-8' : 'top-10'] : undefined"
+      >
+        <slot v-if="!loading" name="empty">
+          <BaseEmpty :title="emptyText" surface="none" class="w-full max-w-80" />
+        </slot>
       </div>
     </div>
   </div>

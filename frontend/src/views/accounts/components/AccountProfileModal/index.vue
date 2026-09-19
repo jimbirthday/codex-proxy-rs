@@ -47,7 +47,7 @@ const { profile, subscription, loading, error, load } = useAccountPersonalInfo(a
         <BaseEmpty
           v-if="profile.hasStatsError"
           title="个人统计暂不可用"
-          description="本次未获取到统计数据，可以点击刷新信息重试。"
+          description="本次未获取到统计数据，可以点击刷新信息重试"
           :icon="TriangleAlert"
           surface="none"
         />
@@ -56,7 +56,7 @@ const { profile, subscription, loading, error, load } = useAccountPersonalInfo(a
           <AccountProfileActivityInsights :insights="profile.activityInsights" />
         </template>
         <p v-if="error" role="status" class="m-0 text-cp-sm text-cp-warning">
-          本次信息刷新未完成，保留已获取的结果。
+          本次信息刷新未完成，保留已获取的结果
         </p>
       </template>
     </div>

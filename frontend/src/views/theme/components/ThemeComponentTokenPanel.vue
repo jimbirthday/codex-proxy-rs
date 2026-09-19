@@ -173,7 +173,7 @@ function numericTokenValue(name: ThemeTokenName) {
     <section class="grid gap-2" :aria-label="`${activeComponent.label} Component Token`">
       <div class="rounded-cp-lg bg-cp-bg-container px-3 py-3 shadow-cp-tertiary">
         <p class="m-0 text-[10px] leading-normal font-emphasis text-cp-text-secondary">
-          调整 {{ activeComponent.label }} 的 Component Token；未修改的值继续由全局 Seed / Alias 算法生成。
+          调整 {{ activeComponent.label }} 的 Component Token，未修改的值继续由全局 Seed / Alias 算法生成
         </p>
       </div>
 

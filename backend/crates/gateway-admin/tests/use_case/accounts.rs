@@ -1070,9 +1070,26 @@ struct StaticSettingsStore;
 
 #[async_trait]
 impl SettingsStore for StaticSettingsStore {
+    async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
+        Ok(Default::default())
+    }
+    async fn sync_pricing(
+        &self,
+        _: gateway_admin::model::pricing::PricingSyncChanges,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing sync")
+    }
+    async fn update_pricing(
+        &self,
+        _: gateway_admin::model::pricing::UpdatePricing,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        panic!("unexpected pricing update")
+    }
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
-            disable_fast: false,
+            openai_client_profile: None,
             request_location_enabled: false,
             request_location: Default::default(),
             config_revision: revision(1),

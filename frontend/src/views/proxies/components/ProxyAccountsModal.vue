@@ -125,7 +125,7 @@ watch([open, () => props.proxy?.id], () => {
   </BaseModal>
   <BaseConfirmModal v-model="showRemove" title="移除关联账号" confirm-text="移除" :loading="removing" @confirm="confirmRemove">
     <p class="m-0 break-words">
-      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连。
+      将“{{ pendingRemove?.name }}”从“{{ proxy?.name }}”移除后，该账号将改为直连
     </p>
   </BaseConfirmModal>
 </template>

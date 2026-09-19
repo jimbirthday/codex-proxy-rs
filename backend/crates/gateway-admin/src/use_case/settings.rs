@@ -23,6 +23,31 @@ use super::{map_store_error, publish_committed};
 /// API 消费的 Runtime settings 管理服务。
 #[async_trait]
 pub trait SettingsService: Send + Sync {
+    async fn preview_pricing_sync(
+        &self,
+    ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError>;
+    async fn sync_pricing(
+        &self,
+        context: &MutationContext,
+        command: crate::model::pricing::SyncPricing,
+    ) -> Result<(), AdminError>;
+    async fn pricing(&self) -> Result<crate::model::pricing::PricingCatalog, AdminError>;
+    async fn update_pricing(
+        &self,
+        context: &MutationContext,
+        command: crate::model::pricing::UpdatePricing,
+    ) -> Result<(), AdminError>;
+    async fn client_profile_options(
+        &self,
+    ) -> Result<gateway_core::account::OpaqueProviderData, AdminError> {
+        Err(AdminError::invalid("当前 Provider 不支持客户端身份配置"))
+    }
+    async fn preview_client_profile(
+        &self,
+        _configuration: Option<&gateway_core::account::OpaqueProviderData>,
+    ) -> Result<gateway_core::account::OpaqueProviderData, AdminError> {
+        Err(AdminError::invalid("当前 Provider 不支持客户端身份配置"))
+    }
     async fn load(&self) -> Result<RuntimeSettings, AdminError>;
     async fn replace(
         &self,
@@ -41,19 +66,232 @@ pub trait SettingsService: Send + Sync {
 }
 
 pub(crate) struct DefaultSettingsService {
+    providers: crate::ports::provider::ProviderAdminRegistry,
+    pricing_source: Arc<dyn crate::ports::pricing::PricingSource>,
+    profile_provider: Arc<dyn crate::ports::provider::ProviderAdmin>,
     store: Arc<dyn SettingsStore>,
     snapshot: Arc<dyn SnapshotControl>,
 }
 
 impl DefaultSettingsService {
     #[must_use]
-    pub(crate) fn new(store: Arc<dyn SettingsStore>, snapshot: Arc<dyn SnapshotControl>) -> Self {
-        Self { store, snapshot }
+    pub(crate) fn new(
+        store: Arc<dyn SettingsStore>,
+        snapshot: Arc<dyn SnapshotControl>,
+        profile_provider: Arc<dyn crate::ports::provider::ProviderAdmin>,
+        providers: crate::ports::provider::ProviderAdminRegistry,
+        pricing_source: Arc<dyn crate::ports::pricing::PricingSource>,
+    ) -> Self {
+        Self {
+            providers,
+            pricing_source,
+            store,
+            snapshot,
+            profile_provider,
+        }
     }
 }
 
 #[async_trait]
 impl SettingsService for DefaultSettingsService {
+    async fn preview_pricing_sync(
+        &self,
+    ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError> {
+        self.pricing_source.fetch().await
+    }
+
+    async fn sync_pricing(
+        &self,
+        context: &MutationContext,
+        command: crate::model::pricing::SyncPricing,
+    ) -> Result<(), AdminError> {
+        let count = command
+            .models
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum::<usize>();
+        if count == 0
+            || count > 10_000
+            || command
+                .models
+                .values()
+                .any(std::collections::BTreeSet::is_empty)
+        {
+            return Err(AdminError::invalid("请选择 1 至 10000 个模型"));
+        }
+        let mut current = self.pricing_source.fetch().await?;
+        if current != command.preview {
+            return Err(AdminError::invalid(
+                "models.dev 价目已变化，请重新预览后确认",
+            ));
+        }
+        let stored = self
+            .store
+            .load_pricing()
+            .await
+            .map_err(|error| map_store_error(error, "model pricing"))?;
+        let mut changes = crate::model::pricing::PricingSyncChanges::new();
+        for (provider, models) in command.models {
+            let selected = changes.entry(provider.clone()).or_default();
+            for model in models {
+                let price = current
+                    .prices
+                    .get_mut(&provider)
+                    .and_then(|prices| prices.remove(&model));
+                if price.is_none()
+                    && !stored
+                        .synced
+                        .get(&provider)
+                        .is_some_and(|prices| prices.contains_key(&model))
+                {
+                    return Err(AdminError::invalid("所选模型不在来源价目中，请重新预览"));
+                }
+                selected.insert(model, price);
+            }
+        }
+        let revision = self
+            .store
+            .sync_pricing(changes, context)
+            .await
+            .map_err(|error| map_store_error(error, "model pricing sync"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await
+    }
+
+    async fn pricing(&self) -> Result<crate::model::pricing::PricingCatalog, AdminError> {
+        let stored = self
+            .store
+            .load_pricing()
+            .await
+            .map_err(|error| map_store_error(error, "model pricing"))?;
+        Ok(crate::model::pricing::PricingCatalog {
+            defaults: self.providers.pricing_catalog(),
+            overrides: stored.overrides,
+            synced: stored.synced,
+            synced_at: stored.synced_at,
+        })
+    }
+
+    async fn update_pricing(
+        &self,
+        context: &MutationContext,
+        command: crate::model::pricing::UpdatePricing,
+    ) -> Result<(), AdminError> {
+        use crate::model::pricing::PricingChange;
+        let catalog = self.pricing().await?;
+        if !catalog.defaults.contains_key(&command.provider)
+            || command.models.is_empty()
+            || command.models.len() > 500
+            || command.models.iter().any(|model| {
+                model.is_empty()
+                    || model.len() > 128
+                    || model.trim() != model
+                    || model.chars().any(char::is_whitespace)
+                    || model.chars().any(char::is_control)
+            })
+        {
+            return Err(AdminError::invalid("Provider、模型 ID 或批量数量不合法"));
+        }
+        if command.change == PricingChange::Delete
+            && command.models.iter().any(|model| {
+                catalog
+                    .defaults
+                    .get(&command.provider)
+                    .is_some_and(|models| models.contains_key(model))
+            })
+        {
+            return Err(AdminError::invalid("内置价目不能删除，仅支持人工覆盖"));
+        }
+        let defaults = gateway_core::metering::merge_pricing(catalog.defaults, &catalog.synced);
+        let defaults = defaults.get(&command.provider);
+        match &command.change {
+            PricingChange::Replace(pricing) => {
+                pricing.validate().map_err(AdminError::invalid)?;
+                if command.provider == "xai"
+                    && pricing
+                        .bands
+                        .keys()
+                        .any(|band| matches!(band.as_str(), "image" | "flex" | "long_flex"))
+                {
+                    return Err(AdminError::invalid("xAI 不支持此价格档位"));
+                }
+                if !pricing.bands.contains_key("standard")
+                    && command
+                        .models
+                        .iter()
+                        .any(|model| !defaults.is_some_and(|p| p.contains_key(model)))
+                {
+                    return Err(AdminError::invalid("未知模型必须提供标准档价格"));
+                }
+            }
+            PricingChange::Multiplier(bps) if *bps > 1_000_000 => {
+                return Err(AdminError::invalid("倍率必须在 0 至 100 倍之间"));
+            }
+            PricingChange::Multiplier(_)
+                if command.models.iter().any(|model| {
+                    !defaults.is_some_and(|p| p.contains_key(model))
+                        && !catalog
+                            .overrides
+                            .get(&command.provider)
+                            .and_then(|p| p.get(model))
+                            .is_some_and(|p| p.bands.contains_key("standard"))
+                }) =>
+            {
+                return Err(AdminError::invalid("请先为未知模型配置标准档价格"));
+            }
+            _ => {}
+        }
+        let revision = self
+            .store
+            .update_pricing(command, context)
+            .await
+            .map_err(|error| map_store_error(error, "model pricing"))?;
+        publish_committed(self.snapshot.as_ref(), revision).await
+    }
+
+    async fn client_profile_options(
+        &self,
+    ) -> Result<gateway_core::account::OpaqueProviderData, AdminError> {
+        let mut options = self
+            .profile_provider
+            .client_profile_options()
+            .map_err(|error| super::map_provider_error(error, "client profile"))?
+            .into_inner();
+        let configuration = self
+            .load()
+            .await?
+            .openai_client_profile
+            .ok_or_else(|| AdminError::internal("通用客户端身份尚未初始化"))?;
+        options.insert(
+            "globalConfiguration".to_owned(),
+            serde_json::Value::Object(configuration.into_inner()),
+        );
+        Ok(gateway_core::account::OpaqueProviderData::new(options))
+    }
+
+    async fn preview_client_profile(
+        &self,
+        configuration: Option<&gateway_core::account::OpaqueProviderData>,
+    ) -> Result<gateway_core::account::OpaqueProviderData, AdminError> {
+        let global;
+        let (configuration, source) = if let Some(configuration) = configuration {
+            (configuration, "override")
+        } else {
+            global = self
+                .load()
+                .await?
+                .openai_client_profile
+                .ok_or_else(|| AdminError::internal("通用客户端身份尚未初始化"))?;
+            (&global, "global")
+        };
+        let mut preview = self
+            .profile_provider
+            .preview_client_profile(configuration)
+            .map_err(|error| super::map_provider_error(error, "client profile"))?
+            .into_inner();
+        preview.insert("source".to_owned(), serde_json::Value::from(source));
+        Ok(gateway_core::account::OpaqueProviderData::new(preview))
+    }
+
     async fn load(&self) -> Result<RuntimeSettings, AdminError> {
         self.store
             .load_runtime_settings()
@@ -67,6 +305,11 @@ impl SettingsService for DefaultSettingsService {
         command: ReplaceRuntimeSettings,
     ) -> Result<RuntimeSettings, AdminError> {
         validate_settings(&command)?;
+        if let Some(profile) = &command.openai_client_profile {
+            self.profile_provider
+                .preview_client_profile(profile)
+                .map_err(|error| super::map_provider_error(error, "client profile"))?;
+        }
         let settings = self
             .store
             .replace_runtime_settings(command, context)
