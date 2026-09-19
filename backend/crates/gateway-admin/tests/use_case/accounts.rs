@@ -61,7 +61,37 @@ use gateway_admin::{
 };
 use serde_json::{Map, json};
 
+use std::collections::VecDeque;
+
+use gateway_admin::{
+    model::{
+        AdminErrorKind,
+        proxies::{
+            NewProxy, ProxyAccountListQuery, ProxyAccountPage, ProxyListQuery, ProxyMutation,
+            ProxyPage, ProxyRecord, ProxyTestResult, UpdateProxy,
+        },
+        turn_state::{
+            TurnStateProbeResult, TurnStateProbeSubject, TurnStateProbeTarget, TurnStateSource,
+        },
+    },
+    ports::proxy::{ProxyImportReservation, ProxyStore},
+};
+use gateway_core::{
+    account::OutboundProxy,
+    lifecycle::CancellationToken,
+    routing::UpstreamModelId,
+    task::{WorkerContribution, WorkerCycleContext, WorkerKind, WorkerRunnable},
+};
+
 pub(super) type EventLog = Arc<Mutex<Vec<&'static str>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnStateProbeCall {
+    account_id: String,
+    model: String,
+    trigger: TurnStateSource,
+    target_ids: Vec<String>,
+}
 
 pub(super) struct FakeProviderAdmin {
     kind: ProviderKind,
@@ -83,6 +113,9 @@ pub(super) struct FakeProviderAdmin {
     profile_result: Mutex<Result<ProviderProfileStatistics, ProviderAdminErrorKind>>,
     subscription_result: Mutex<Result<Option<ProviderSubscription>, ProviderAdminErrorKind>>,
     personal_info_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    turn_state_probe_calls: Mutex<Vec<TurnStateProbeCall>>,
+    due_turn_state_subjects: Mutex<VecDeque<Vec<TurnStateProbeSubject>>>,
+    due_turn_state_reads: Mutex<usize>,
 }
 
 impl FakeProviderAdmin {
@@ -107,7 +140,31 @@ impl FakeProviderAdmin {
             profile_result: Mutex::new(Ok(empty_profile_statistics())),
             subscription_result: Mutex::new(Ok(None)),
             personal_info_barrier: Mutex::new(None),
+            turn_state_probe_calls: Mutex::new(Vec::new()),
+            due_turn_state_subjects: Mutex::new(VecDeque::new()),
+            due_turn_state_reads: Mutex::new(0),
         })
+    }
+
+    fn turn_state_probe_calls(&self) -> Vec<TurnStateProbeCall> {
+        self.turn_state_probe_calls
+            .lock()
+            .expect("turn state probe calls")
+            .clone()
+    }
+
+    fn set_due_turn_state_subjects(&self, subjects: Vec<Vec<TurnStateProbeSubject>>) {
+        *self
+            .due_turn_state_subjects
+            .lock()
+            .expect("due turn state subjects") = subjects.into();
+    }
+
+    fn due_turn_state_reads(&self) -> usize {
+        *self
+            .due_turn_state_reads
+            .lock()
+            .expect("due turn state reads")
     }
 
     pub(super) fn block_imports(&self) -> Arc<tokio::sync::Semaphore> {
@@ -260,6 +317,48 @@ impl FakeProviderAdmin {
 impl ProviderAdmin for FakeProviderAdmin {
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
+    }
+
+    async fn probe_turn_state(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+        targets: Vec<TurnStateProbeTarget>,
+        trigger: TurnStateSource,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        self.turn_state_probe_calls
+            .lock()
+            .expect("turn state probe calls")
+            .push(TurnStateProbeCall {
+                account_id: account_id.as_str().to_owned(),
+                model: model.as_str().to_owned(),
+                trigger,
+                target_ids: targets.into_iter().map(|target| target.id).collect(),
+            });
+        self.require_available()?;
+        let now = Utc::now();
+        Ok(TurnStateProbeResult {
+            account_id: account_id.as_str().to_owned(),
+            model: model.as_str().to_owned(),
+            started_at: now,
+            finished_at: now,
+            trigger,
+            active_target_id: None,
+            state_expires_at: None,
+            attempts: Vec::new(),
+        })
+    }
+
+    fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        *self
+            .due_turn_state_reads
+            .lock()
+            .expect("due turn state reads") += 1;
+        self.due_turn_state_subjects
+            .lock()
+            .expect("due turn state subjects")
+            .pop_front()
+            .unwrap_or_default()
     }
 
     async fn profile_statistics(
@@ -2844,6 +2943,104 @@ impl AccountProbe for FreeModelQuotaProbe {
     }
 }
 
+struct TurnStateTestProxyStore {
+    records: Vec<ProxyRecord>,
+}
+
+impl TurnStateTestProxyStore {
+    fn new(records: Vec<ProxyRecord>) -> Arc<Self> {
+        Arc::new(Self { records })
+    }
+}
+
+#[async_trait]
+impl ProxyStore for TurnStateTestProxyStore {
+    async fn reserve_import(&self, _: &str) -> AdminStoreResult<ProxyImportReservation> {
+        Err(store_unavailable())
+    }
+
+    async fn list(&self, query: ProxyListQuery) -> AdminStoreResult<ProxyPage> {
+        let matching = self
+            .records
+            .iter()
+            .filter(|record| {
+                query.search.is_empty()
+                    || record.id.contains(&query.search)
+                    || record.name.contains(&query.search)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let page_size = usize::from(query.page_size.get());
+        let start = (query.page.saturating_sub(1) as usize).saturating_mul(page_size);
+        let items = matching
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .cloned()
+            .collect();
+        Ok(ProxyPage {
+            items,
+            total: matching.len() as u64,
+            page: query.page,
+            page_size: query.page_size.get(),
+        })
+    }
+
+    async fn list_accounts(&self, _: ProxyAccountListQuery) -> AdminStoreResult<ProxyAccountPage> {
+        Err(store_unavailable())
+    }
+
+    async fn get(&self, id: &str) -> AdminStoreResult<ProxyRecord> {
+        self.records
+            .iter()
+            .find(|record| record.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                AdminStoreError::new(
+                    AdminStoreErrorKind::NotFound,
+                    "test proxy",
+                    "proxy not found",
+                )
+            })
+    }
+
+    async fn remove_account(
+        &self,
+        _: &str,
+        _: &ProviderAccountId,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(store_unavailable())
+    }
+
+    async fn create(&self, _: NewProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
+        Err(store_unavailable())
+    }
+
+    async fn update(&self, _: UpdateProxy, _: &MutationContext) -> AdminStoreResult<ProxyMutation> {
+        Err(store_unavailable())
+    }
+
+    async fn delete(
+        &self,
+        _: &str,
+        _: Revision,
+        _: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(store_unavailable())
+    }
+
+    async fn record_test(
+        &self,
+        _: &str,
+        _: Revision,
+        _: ProxyTestResult,
+        _: &MutationContext,
+    ) -> AdminStoreResult<ProxyRecord> {
+        Err(store_unavailable())
+    }
+}
+
 fn store_unavailable() -> AdminStoreError {
     AdminStoreError::new(
         AdminStoreErrorKind::Unavailable,
@@ -2854,6 +3051,207 @@ fn store_unavailable() -> AdminStoreError {
 
 fn unsupported() -> ProviderAdminError {
     ProviderAdminError::new(ProviderAdminErrorKind::Unsupported)
+}
+
+fn turn_state_proxy(index: usize) -> ProxyRecord {
+    let now = Utc::now();
+    ProxyRecord {
+        location: None,
+        id: format!("proxy-{index:03}"),
+        name: format!("Proxy {index:03}"),
+        proxy: OutboundProxy::parse(&format!("http://127.0.0.1:{}", 20_000 + index))
+            .expect("test proxy URL"),
+        revision: revision(1),
+        account_count: 0,
+        last_test_at: None,
+        last_test: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn turn_state_subject() -> TurnStateProbeSubject {
+    TurnStateProbeSubject {
+        account_id: ProviderAccountId::new("acct_test").expect("account ID"),
+        model: UpstreamModelId::new("gpt-5.3-codex").expect("model"),
+    }
+}
+
+async fn turn_state_services(
+    provider: Arc<FakeProviderAdmin>,
+    proxies: Vec<ProxyRecord>,
+) -> AdminServices {
+    super::AdminHarness::new()
+        .accounts(FakeAccountStore::new("openai", events()))
+        .settings(Arc::new(StaticSettingsStore))
+        .provider(provider)
+        .probe(Arc::new(SuccessfulAccountProbe))
+        .proxies(TurnStateTestProxyStore::new(proxies))
+        .build()
+        .await
+}
+
+async fn turn_state_bundle(
+    provider: Arc<FakeProviderAdmin>,
+    proxies: Vec<ProxyRecord>,
+) -> gateway_admin::AdminBundle {
+    let mut account = account_record("openai");
+    account.outbound_proxy = Some(turn_state_proxy(2).proxy);
+    super::AdminHarness::new()
+        .accounts(FakeAccountStore::with_account(account, events()))
+        .settings(Arc::new(StaticSettingsStore))
+        .provider(provider)
+        .probe(Arc::new(SuccessfulAccountProbe))
+        .proxies(TurnStateTestProxyStore::new(proxies))
+        .build_bundle()
+        .await
+}
+
+async fn run_turn_state_cycle(bundle: &mut gateway_admin::AdminBundle) {
+    let contribution = bundle
+        .take_worker_contributions()
+        .into_iter()
+        .find(|contribution| contribution.kind() == WorkerKind::TurnStateRenewal)
+        .expect("turn state renewal registration");
+    let WorkerContribution::Registration(registration) = contribution else {
+        panic!("turn state renewal must be registered as a worker");
+    };
+    assert_eq!(registration.id.kind(), WorkerKind::TurnStateRenewal);
+    assert_eq!(registration.id.owner(), "openai");
+    let WorkerRunnable::Scheduled {
+        schedule,
+        lease,
+        task,
+    } = registration.runnable
+    else {
+        panic!("turn state renewal must be scheduled");
+    };
+    assert_eq!(schedule.interval(), std::time::Duration::from_secs(45));
+    assert!(lease.is_none());
+    task.run_cycle(WorkerCycleContext::new(
+        registration.id,
+        None,
+        CancellationToken::new(),
+    ))
+    .await
+    .expect("turn state renewal cycle");
+}
+
+#[tokio::test]
+async fn manual_turn_state_probe_should_forward_the_complete_proxy_directory() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    // 跨过单页边界，也确保 Admin 不按 Provider 的有限尝试数裁剪候选。
+    let proxies = (0..205).map(turn_state_proxy).collect::<Vec<_>>();
+    let target_ids = proxies
+        .iter()
+        .map(|proxy| proxy.id.clone())
+        .collect::<Vec<_>>();
+    let services = turn_state_services(provider.clone(), proxies).await;
+
+    services
+        .accounts()
+        .probe_turn_state(
+            ProviderAccountId::new("acct_test").expect("account ID"),
+            UpstreamModelId::new("gpt-5.3-codex").expect("model"),
+        )
+        .await
+        .expect("manual turn state probe");
+
+    assert_eq!(
+        provider.turn_state_probe_calls(),
+        [TurnStateProbeCall {
+            account_id: "acct_test".to_owned(),
+            model: "gpt-5.3-codex".to_owned(),
+            trigger: TurnStateSource::ManualProbe,
+            target_ids,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn manual_turn_state_probe_should_reject_an_empty_proxy_directory() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let services = turn_state_services(provider.clone(), Vec::new()).await;
+
+    let error = services
+        .accounts()
+        .probe_turn_state(
+            ProviderAccountId::new("acct_test").expect("account ID"),
+            UpstreamModelId::new("gpt-5.3-codex").expect("model"),
+        )
+        .await
+        .expect_err("empty proxy directory must fail");
+
+    assert_eq!(error.kind(), AdminErrorKind::Invalid);
+    assert!(provider.turn_state_probe_calls().is_empty());
+}
+
+#[tokio::test]
+async fn manual_turn_state_probe_should_preserve_safe_provider_errors() {
+    for (kind, admin_kind, public_message) in [
+        (
+            ProviderAdminErrorKind::Conflict,
+            AdminErrorKind::Conflict,
+            "该账号正在探测，请稍后重试",
+        ),
+        (
+            ProviderAdminErrorKind::Unavailable,
+            AdminErrorKind::Unavailable,
+            "探测处于冷却期，请稍后重试",
+        ),
+    ] {
+        let provider = FakeProviderAdmin::new("openai", events());
+        provider.fail_next_with_public_message(kind, public_message);
+        let services = turn_state_services(provider, vec![turn_state_proxy(0)]).await;
+
+        let error = services
+            .accounts()
+            .probe_turn_state(
+                ProviderAccountId::new("acct_test").expect("account ID"),
+                UpstreamModelId::new("gpt-5.3-codex").expect("model"),
+            )
+            .await
+            .expect_err("provider failure must pass through Admin");
+
+        assert_eq!(error.kind(), admin_kind);
+        assert_eq!(error.to_string(), public_message);
+        assert!(!format!("{error:?}").contains("upstream body containing a secret token"));
+    }
+}
+
+#[tokio::test]
+async fn turn_state_renewal_should_recheck_due_subject_before_probing() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    provider.set_due_turn_state_subjects(vec![vec![turn_state_subject()], Vec::new()]);
+    let mut bundle = turn_state_bundle(provider.clone(), vec![turn_state_proxy(0)]).await;
+
+    run_turn_state_cycle(&mut bundle).await;
+
+    assert_eq!(provider.due_turn_state_reads(), 2);
+    assert!(provider.turn_state_probe_calls().is_empty());
+}
+
+#[tokio::test]
+async fn turn_state_renewal_should_use_automatic_trigger_for_a_still_due_subject() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let subject = turn_state_subject();
+    provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject]]);
+    let proxies = (0..4).map(turn_state_proxy).collect::<Vec<_>>();
+    let target_ids = vec!["proxy-002".to_owned()];
+    let mut bundle = turn_state_bundle(provider.clone(), proxies).await;
+
+    run_turn_state_cycle(&mut bundle).await;
+
+    assert_eq!(provider.due_turn_state_reads(), 2);
+    assert_eq!(
+        provider.turn_state_probe_calls(),
+        [TurnStateProbeCall {
+            account_id: "acct_test".to_owned(),
+            model: "gpt-5.3-codex".to_owned(),
+            trigger: TurnStateSource::AutomaticRenewal,
+            target_ids,
+        }]
+    );
 }
 
 pub(super) fn import_settings() -> gateway_admin::model::accounts::AccountImportSettings {

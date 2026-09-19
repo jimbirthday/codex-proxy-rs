@@ -68,7 +68,7 @@ function triggerLabel(trigger: TurnStateProbe['trigger']) {
               </div>
               <p class="mt-1.5 mb-0 text-cp-sm leading-relaxed font-emphasis text-cp-text-secondary">
                 开始 {{ formatDateTime(probe.startedAt) }} · 完成 {{ formatDateTime(probe.finishedAt) }}
-                · {{ triggerLabel(probe.trigger) }} · 总耗时 {{ duration(probe) }} · {{ probe.attempts.length }} 个代理
+                · {{ triggerLabel(probe.trigger) }} · 总耗时 {{ duration(probe) }} · 本轮实际尝试 {{ probe.attempts.length }} 次
                 <template v-if="probe.stateExpiresAt">
                   · State 有效至 {{ formatDateTime(probe.stateExpiresAt) }}
                 </template>

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use futures::{StreamExt as _, TryStreamExt as _};
+use futures::TryStreamExt as _;
 use gateway_admin::model::Revision;
 use gateway_admin::model::accounts::AccountRecord;
 use gateway_admin::model::observability::{
@@ -74,12 +74,15 @@ use crate::transport::{CODEX_RESPONSES_PATH, build_account_http_client, endpoint
 use crate::transport::{
     CodexProfileAvatar, CodexProfileStatistics, OpenAiBillingUsage, openai_billing_breakdown,
 };
-use crate::turn_state::TurnStateStore;
+use crate::turn_state::{
+    TurnStateProbeAdmission, TurnStateProbeFailure, TurnStateProbeFailureKind,
+    TurnStateProbeRequestAdmission, TurnStateStore,
+};
 
 const PROVIDER_NAME: &str = "openai";
 const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
-const TURN_STATE_PROBE_CONCURRENCY: usize = 4;
 const MAX_TURN_STATE_PROBE_BODY_BYTES: usize = 64 * 1024;
+const TURN_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn single_turn_state_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
     let mut values = headers.get_all("x-codex-turn-state").iter();
@@ -90,20 +93,88 @@ fn single_turn_state_header(headers: &reqwest::header::HeaderMap) -> Option<&str
     value.to_str().ok()
 }
 
-fn probe_error_message(value: &Value) -> Option<String> {
-    let error = value.get("error").unwrap_or(value);
-    let message = error.get("message").and_then(Value::as_str)?.trim();
-    if message.is_empty() {
-        return None;
+enum TurnStateProbeIoResult {
+    Response { status: u16, state: Option<String> },
+    ConnectionFailed,
+    TimedOut,
+    ReadFailed,
+}
+
+async fn send_turn_state_probe_request(
+    client: &reqwest::Client,
+    url: &str,
+    headers: reqwest::header::HeaderMap,
+    body: Vec<u8>,
+) -> TurnStateProbeIoResult {
+    let response = match client
+        .post(url)
+        .headers(headers)
+        .header(reqwest::header::CONTENT_ENCODING, "zstd")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) if error.is_timeout() => return TurnStateProbeIoResult::TimedOut,
+        Err(_) => return TurnStateProbeIoResult::ConnectionFailed,
+    };
+    let status = response.status().as_u16();
+    // 鉴权、代理认证和账号限流响应优先于任何粘性 state，避免把拒绝误判为成功。
+    if matches!(status, 401 | 403 | 407 | 429) {
+        return TurnStateProbeIoResult::Response {
+            status,
+            state: None,
+        };
     }
-    let code = error
-        .get("code")
+    let header_state = single_turn_state_header(response.headers())
+        .filter(|value| TurnStateStore::is_valid_state(value))
+        .map(ToOwned::to_owned);
+    if header_state.is_some() {
+        return TurnStateProbeIoResult::Response {
+            status,
+            state: header_state,
+        };
+    }
+    let body = match read_capped_response_body(response, MAX_TURN_STATE_PROBE_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return TurnStateProbeIoResult::ReadFailed,
+    };
+    let json = (!body.limit_exceeded())
+        .then(|| serde_json::from_str::<Value>(&body.into_string()).ok())
+        .flatten();
+    let state = json
+        .as_ref()
+        .and_then(|value| value.get("current_turn_state"))
         .and_then(Value::as_str)
-        .filter(|code| !code.is_empty());
-    Some(match code {
-        Some(code) => format!("上游错误 [{code}]：{message}"),
-        None => format!("上游错误：{message}"),
-    })
+        .filter(|value| TurnStateStore::is_valid_state(value))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            json.as_ref()
+                .and_then(|value| value.get("error"))
+                .and_then(|value| value.get("current_turn_state"))
+                .and_then(Value::as_str)
+                .filter(|value| TurnStateStore::is_valid_state(value))
+                .map(ToOwned::to_owned)
+        });
+    TurnStateProbeIoResult::Response { status, state }
+}
+
+fn empty_turn_state_probe_result(
+    account_id: &ProviderAccountId,
+    model: &UpstreamModelId,
+    trigger: TurnStateSource,
+    started_at: DateTime<Utc>,
+) -> TurnStateProbeResult {
+    TurnStateProbeResult {
+        account_id: account_id.as_str().to_owned(),
+        model: model.as_str().to_owned(),
+        started_at,
+        finished_at: Utc::now(),
+        trigger,
+        active_target_id: None,
+        state_expires_at: None,
+        attempts: Vec::new(),
+    }
 }
 
 /// OpenAI 对终态 Admin port 的唯一实现。
@@ -208,10 +279,55 @@ impl OpenAiAdminProvider {
         targets: Vec<TurnStateProbeTarget>,
         trigger: TurnStateSource,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        let attempt_limit = match trigger {
+            TurnStateSource::AutomaticRenewal => 1,
+            TurnStateSource::ManualProbe => 3,
+            TurnStateSource::UpstreamResponse => {
+                return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
+            }
+        };
+        let started_at = Utc::now();
         let account = self.account(account_id).await?;
         if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
             return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
         }
+        let targets = targets
+            .into_iter()
+            .filter(|target| {
+                trigger != TurnStateSource::AutomaticRenewal
+                    || account.outbound_proxy() == Some(&target.proxy)
+            })
+            .collect();
+        let mut run = match self.turn_states.begin_probe(
+            account_id,
+            model,
+            account.revision(),
+            targets,
+            account.outbound_proxy(),
+            trigger,
+        ) {
+            TurnStateProbeAdmission::Ready(run) => run,
+            TurnStateProbeAdmission::Busy => {
+                if trigger == TurnStateSource::ManualProbe {
+                    return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                        .with_public_message("该账号正在探测，请稍后重试"));
+                }
+                return Ok(empty_turn_state_probe_result(
+                    account_id, model, trigger, started_at,
+                ));
+            }
+            TurnStateProbeAdmission::Deferred
+            | TurnStateProbeAdmission::NoCandidates
+            | TurnStateProbeAdmission::CapacityExhausted => {
+                if trigger == TurnStateSource::ManualProbe {
+                    return Err(provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                        .with_public_message("探测处于冷却期，请稍后重试"));
+                }
+                return Ok(empty_turn_state_probe_result(
+                    account_id, model, trigger, started_at,
+                ));
+            }
+        };
         let repository = crate::credential::CodexCredentialRepository::new(self.accounts.clone());
         let credential = repository
             .load_runtime_credential(&account)
@@ -267,154 +383,213 @@ impl OpenAiAdminProvider {
             "stream": true,
             "store": false
         });
-        let base_url = self.base_url.clone();
-        let account_id_value = account.id().as_str().to_owned();
-        let model_value = model.as_str().to_owned();
-        let started_at = Utc::now();
-        let mut outcomes =
-            futures::stream::iter(targets.into_iter().enumerate().map(|(index, target)| {
-                let headers = headers.clone();
-                let body = body.clone();
-                let base_url = base_url.clone();
-                let account_id = account_id_value.clone();
-                async move {
-                    let started = Instant::now();
-                    let result = async {
-                        let client = build_account_http_client(&account_id, Some(&target.proxy))
-                            .map_err(|_| ())?;
-                        let body = serde_json::to_vec(&body).map_err(|_| ())?;
-                        let body = zstd::stream::encode_all(std::io::Cursor::new(body), 3)
-                            .map_err(|_| ())?;
-                        let mut headers = headers;
-                        headers.insert(
-                            reqwest::header::HeaderName::from_static("x-client-request-id"),
-                            reqwest::header::HeaderValue::from_str(&Uuid::now_v7().to_string())
-                                .map_err(|_| ())?,
-                        );
-                        let response = client
-                            .post(endpoint_url(&base_url, CODEX_RESPONSES_PATH))
-                            .headers(headers)
-                            .header(reqwest::header::CONTENT_ENCODING, "zstd")
-                            .timeout(Duration::from_secs(30))
-                            .body(body)
-                            .send()
-                            .await
-                            .map_err(|_| ())?;
-                        let status = response.status().as_u16();
-                        let header_state = single_turn_state_header(response.headers())
-                            .filter(|value| TurnStateStore::is_valid_state(value))
-                            .map(ToOwned::to_owned);
-                        let (state, response_message) = if header_state.is_some() {
-                            (header_state, None)
-                        } else {
-                            let body = read_capped_response_body(
-                                response,
-                                MAX_TURN_STATE_PROBE_BODY_BYTES,
-                            )
-                            .await
-                            .map_err(|_| ())?;
-                            let json = (!body.limit_exceeded())
-                                .then(|| serde_json::from_str::<Value>(&body.into_string()).ok())
-                                .flatten();
-                            let state = json
-                                .as_ref()
-                                .and_then(|value| value.get("current_turn_state"))
-                                .and_then(Value::as_str)
-                                .filter(|value| TurnStateStore::is_valid_state(value))
-                                .map(ToOwned::to_owned)
-                                .or_else(|| {
-                                    json.as_ref()
-                                        .and_then(|value| value.get("error"))
-                                        .and_then(|value| value.get("current_turn_state"))
-                                        .and_then(Value::as_str)
-                                        .filter(|value| TurnStateStore::is_valid_state(value))
-                                        .map(ToOwned::to_owned)
-                                });
-                            let message = json.as_ref().and_then(probe_error_message);
-                            (state, message)
-                        };
-                        Ok::<_, ()>((status, state, response_message))
-                    }
-                    .await;
-                    let latency_ms =
-                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    (index, target, latency_ms, result)
-                }
-            }))
-            .buffer_unordered(TURN_STATE_PROBE_CONCURRENCY);
+        let body = serde_json::to_vec(&body)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        let body = zstd::stream::encode_all(std::io::Cursor::new(body), 3)
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        let url = endpoint_url(&self.base_url, CODEX_RESPONSES_PATH);
+        let candidates = run.candidates().to_vec();
         let mut attempts = Vec::new();
+        let mut failures = Vec::new();
+        let mut actual_sent = 0_usize;
         let mut active_target_id = None;
-        let mut state_expires_at = None;
-        while let Some((index, target, latency_ms, probe_result)) = outcomes.next().await {
-            let attempt = match probe_result {
-                Ok((status, Some(state), _)) => {
-                    if active_target_id.is_none() {
-                        state_expires_at = self.turn_states.put(account_id, model, state, trigger);
-                        if state_expires_at.is_some() {
-                            active_target_id = Some(target.id.clone());
-                        }
-                    }
-                    TurnStateProbeAttempt {
+        let mut acquired_state = None;
+        let mut internal_error = false;
+        // 候选上限包含配置失败；等待发送间隔不会额外消耗候选。
+        'candidates: for target in candidates.into_iter().take(attempt_limit) {
+            if trigger == TurnStateSource::AutomaticRenewal
+                && !self.turn_state_probe_due(account_id, model)
+            {
+                break;
+            }
+            let client = match build_account_http_client(account.id().as_str(), Some(&target.proxy))
+            {
+                Ok(client) => client,
+                Err(_) => {
+                    failures.push(TurnStateProbeFailure {
                         target_id: target.id,
+                        kind: TurnStateProbeFailureKind::ProxyConfiguration,
+                    });
+                    continue;
+                }
+            };
+            let permit = loop {
+                if trigger == TurnStateSource::AutomaticRenewal
+                    && !self.turn_state_probe_due(account_id, model)
+                {
+                    break 'candidates;
+                }
+                match self.turn_states.start_probe_request(&run, &target).await {
+                    TurnStateProbeRequestAdmission::Ready(permit) => break permit,
+                    TurnStateProbeRequestAdmission::Deferred { until } => {
+                        tokio::time::sleep_until(until).await;
+                    }
+                    TurnStateProbeRequestAdmission::Rejected => {
+                        break 'candidates;
+                    }
+                }
+            };
+            // 排队期间账号凭据或出口可能变化，旧快照不能继续发送。
+            let current = self.account(account_id).await?;
+            if current.revision() != account.revision()
+                || current.outbound_proxy() != account.outbound_proxy()
+            {
+                break;
+            }
+            actual_sent += 1;
+            let mut request_headers = headers.clone();
+            let Ok(request_id) =
+                reqwest::header::HeaderValue::from_str(&Uuid::now_v7().to_string())
+            else {
+                internal_error = true;
+                break;
+            };
+            request_headers.insert(
+                reqwest::header::HeaderName::from_static("x-client-request-id"),
+                request_id,
+            );
+            let attempt_started = Instant::now();
+            let io_result = {
+                let _permit = permit;
+                match tokio::time::timeout(
+                    TURN_STATE_PROBE_TIMEOUT,
+                    send_turn_state_probe_request(&client, &url, request_headers, body.clone()),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => TurnStateProbeIoResult::TimedOut,
+                }
+            };
+            let latency_ms =
+                u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            match io_result {
+                TurnStateProbeIoResult::Response {
+                    status,
+                    state: Some(state),
+                } => {
+                    attempts.push(TurnStateProbeAttempt {
+                        target_id: target.id.clone(),
                         target_label: target.label,
                         success: true,
                         status_code: Some(status),
                         latency_ms,
                         state_acquired: true,
                         message: "已获取 current_turn_state".to_owned(),
+                    });
+                    active_target_id = Some(target.id);
+                    acquired_state = Some(state);
+                    break;
+                }
+                TurnStateProbeIoResult::Response {
+                    status,
+                    state: None,
+                } => {
+                    let stop = matches!(status, 401 | 403 | 429);
+                    let kind = match status {
+                        401 | 403 => TurnStateProbeFailureKind::AccountAuthenticationRejected,
+                        _ if (200..300).contains(&status) => {
+                            TurnStateProbeFailureKind::MissingState
+                        }
+                        _ => TurnStateProbeFailureKind::HttpStatus(status),
+                    };
+                    failures.push(TurnStateProbeFailure {
+                        target_id: target.id.clone(),
+                        kind,
+                    });
+                    attempts.push(TurnStateProbeAttempt {
+                        target_id: target.id,
+                        target_label: target.label,
+                        success: false,
+                        status_code: Some(status),
+                        latency_ms,
+                        state_acquired: false,
+                        message: match status {
+                            312 => "上游返回 312，状态已撤销",
+                            407 => "代理认证失败",
+                            429 => "账号请求受到上游限流",
+                            401 | 403 => "账号认证被上游拒绝",
+                            _ => "响应未包含 current_turn_state",
+                        }
+                        .to_owned(),
+                    });
+                    if stop {
+                        break;
                     }
                 }
-                Ok((status, None, response_message)) => TurnStateProbeAttempt {
-                    target_id: target.id,
-                    target_label: target.label,
-                    success: false,
-                    status_code: Some(status),
-                    latency_ms,
-                    state_acquired: false,
-                    message: response_message.unwrap_or_else(|| {
-                        if status == 312 {
-                            "上游返回 312，状态已撤销".to_owned()
-                        } else {
-                            "响应未包含 current_turn_state".to_owned()
-                        }
-                    }),
-                },
-                Err(()) => TurnStateProbeAttempt {
-                    target_id: target.id,
-                    target_label: target.label,
-                    success: false,
-                    status_code: None,
-                    latency_ms,
-                    state_acquired: false,
-                    message: "请求失败或超时".to_owned(),
-                },
-            };
-            attempts.push((index, attempt));
+                TurnStateProbeIoResult::ConnectionFailed | TurnStateProbeIoResult::ReadFailed => {
+                    failures.push(TurnStateProbeFailure {
+                        target_id: target.id.clone(),
+                        kind: TurnStateProbeFailureKind::Network,
+                    });
+                    attempts.push(TurnStateProbeAttempt {
+                        target_id: target.id,
+                        target_label: target.label,
+                        success: false,
+                        status_code: None,
+                        latency_ms,
+                        state_acquired: false,
+                        message: "请求连接或响应读取失败".to_owned(),
+                    });
+                }
+                TurnStateProbeIoResult::TimedOut => {
+                    failures.push(TurnStateProbeFailure {
+                        target_id: target.id.clone(),
+                        kind: TurnStateProbeFailureKind::Timeout,
+                    });
+                    attempts.push(TurnStateProbeAttempt {
+                        target_id: target.id,
+                        target_label: target.label,
+                        success: false,
+                        status_code: None,
+                        latency_ms,
+                        state_acquired: false,
+                        message: "请求超时".to_owned(),
+                    });
+                }
+            }
         }
-        attempts.sort_unstable_by_key(|(index, _)| *index);
-        let attempts = attempts.into_iter().map(|(_, attempt)| attempt).collect();
         let result = TurnStateProbeResult {
             account_id: account_id.as_str().to_owned(),
-            model: model_value,
+            model: model.as_str().to_owned(),
             started_at,
             finished_at: Utc::now(),
             trigger,
             active_target_id,
-            state_expires_at,
+            state_expires_at: None,
             attempts,
         };
-        if result.active_target_id.is_none()
-            && result
-                .attempts
-                .iter()
-                .any(|attempt| attempt.status_code == Some(312))
-        {
-            self.turn_states
-                .invalidate(account_id, model, "probe_upstream_312");
+        let current_facts_match = self.account(account_id).await.is_ok_and(|current| {
+            current.revision() == account.revision()
+                && current.outbound_proxy() == account.outbound_proxy()
+        });
+        let result = self.turn_states.finish_probe(
+            &mut run,
+            result,
+            acquired_state,
+            &failures,
+            current_facts_match,
+        );
+        if internal_error {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Internal));
         }
-        self.turn_states
-            .record_probe(account_id, model, result.clone());
+        let proxy_configuration_failed = failures
+            .iter()
+            .any(|failure| failure.kind == TurnStateProbeFailureKind::ProxyConfiguration);
+        if actual_sent == 0 && proxy_configuration_failed && trigger == TurnStateSource::ManualProbe
+        {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Unavailable)
+                .with_public_message("本轮代理连接配置不可用，请检查代理设置"));
+        }
         Ok(result)
+    }
+
+    fn turn_state_probe_due(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+    ) -> bool {
+        self.turn_states.automatic_due(account_id, model)
     }
 }
 

@@ -52,10 +52,6 @@ use super::{
 const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 pub(crate) const TURN_STATE_RENEWAL_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(45);
-type TurnStateProbeKey = (ProviderAccountId, UpstreamModelId);
-type TurnStateProbeMutex = Arc<futures::lock::Mutex<()>>;
-type TurnStateProbeLocks =
-    Arc<futures::lock::Mutex<BTreeMap<TurnStateProbeKey, TurnStateProbeMutex>>>;
 
 /// 统一账号页消费的服务。
 #[async_trait]
@@ -183,7 +179,6 @@ pub(crate) struct DefaultAccountsService {
     proxies: Arc<dyn ProxyStore>,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
-    turn_state_probe_locks: TurnStateProbeLocks,
 }
 
 impl DefaultAccountsService {
@@ -204,7 +199,6 @@ impl DefaultAccountsService {
             probe,
             proxies,
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
-            turn_state_probe_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -216,19 +210,6 @@ impl DefaultAccountsService {
         Arc::clone(
             locks
                 .entry(account_id.clone())
-                .or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))),
-        )
-    }
-
-    async fn turn_state_probe_lock(
-        &self,
-        account_id: &ProviderAccountId,
-        model: &UpstreamModelId,
-    ) -> TurnStateProbeMutex {
-        let mut locks = self.turn_state_probe_locks.lock().await;
-        Arc::clone(
-            locks
-                .entry((account_id.clone(), model.clone()))
                 .or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))),
         )
     }
@@ -267,6 +248,14 @@ impl DefaultAccountsService {
     pub(crate) async fn renew_due_turn_states(&self) {
         futures::stream::iter(self.providers.due_turn_state_subjects())
             .for_each_concurrent(Some(2), |subject| async move {
+                // 排队期间业务响应可能已刷新 state；调用前重新核对，减少无效探测。
+                let still_due =
+                    self.providers.due_turn_state_subjects().iter().any(|due| {
+                        due.account_id == subject.account_id && due.model == subject.model
+                    });
+                if !still_due {
+                    return;
+                }
                 if let Err(error) = self
                     .probe_turn_state_with_source(
                         subject.account_id.clone(),
@@ -292,10 +281,12 @@ impl DefaultAccountsService {
         model: UpstreamModelId,
         source: TurnStateSource,
     ) -> Result<TurnStateProbeResult, AdminError> {
-        let probe_lock = self.turn_state_probe_lock(&account_id, &model).await;
-        let _guard = probe_lock.lock().await;
-        let (_, provider) = self.provider_for_account(&account_id).await?;
-        let targets = self.turn_state_probe_targets().await?;
+        let (item, provider) = self.provider_for_account(&account_id).await?;
+        let mut targets = self.turn_state_probe_targets().await?;
+        if source == TurnStateSource::AutomaticRenewal {
+            // 自动续采只走业务当前出口；直连或未保存的出口不借用其他代理预热。
+            targets.retain(|target| item.account.outbound_proxy.as_ref() == Some(&target.proxy));
+        }
         provider
             .probe_turn_state(&account_id, &model, targets, source)
             .await

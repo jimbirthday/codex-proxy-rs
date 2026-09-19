@@ -71,8 +71,8 @@ function sourceLabel(source: string | null | undefined) {
 
 function invalidationMessage(reason: string | null | undefined) {
   return reason === 'upstream_312' || reason === 'probe_upstream_312'
-    ? '上游返回 312，当前模型的 State 已失效并进入自动续采'
-    : '当前模型的 State 已失效并进入自动续采'
+    ? '上游返回 312，当前模型的 State 已失效'
+    : '当前模型的 State 已失效'
 }
 </script>
 
@@ -164,7 +164,7 @@ function invalidationMessage(reason: string | null | undefined) {
             <template #icon>
               <RotateCw class="size-4.5" />
             </template>
-            {{ probing ? '正在探测全部代理' : '通过代理探测并替换' }}
+            {{ probing ? '正在探测候选代理' : '通过代理探测并替换' }}
           </BaseButton>
         </div>
       </BaseCard>
@@ -201,7 +201,7 @@ function invalidationMessage(reason: string | null | undefined) {
           <div class="min-h-23 rounded-cp bg-cp-fill-quaternary px-3.5 py-3">
             <span class="inline-flex items-center gap-2 text-cp-xs font-heavy text-cp-text-quaternary">
               <RotateCw class="size-3.5" />
-              下次轮换
+              续采窗口
             </span>
             <p class="mt-3 mb-0 break-words font-mono text-cp-sm font-emphasis text-cp-text">
               {{ formatDateTime(snapshot?.nextRotationAt) }}

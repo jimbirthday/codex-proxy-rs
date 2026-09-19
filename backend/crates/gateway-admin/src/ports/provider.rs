@@ -133,7 +133,10 @@ pub trait ProviderAdmin: Send + Sync {
     /// 不参与已提交事务成败。没有账号派生状态的 Provider 可使用默认空实现。
     async fn account_facts_changed(&self, _account_ids: &[ProviderAccountId]) {}
 
-    /// 通过控制面指定的全部出口尝试获取 Codex turn state；结果不得包含 state 原文。
+    /// 从控制面提供的已保存代理候选集合获取 Codex turn state。
+    ///
+    /// Provider 负责有限选择、账号串行与冷却，并在成功后停止；结果中的 attempts 只包含实际请求。
+    /// 自动探测被跳过时可返回不进入历史的空结果，所有结果均不得包含 state 原文。
     async fn probe_turn_state(
         &self,
         _account_id: &ProviderAccountId,
