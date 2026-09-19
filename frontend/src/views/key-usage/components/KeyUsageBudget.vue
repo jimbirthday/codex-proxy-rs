@@ -47,10 +47,10 @@ const windows = computed(() => [
       </div>
       <div class="grid grid-cols-2 gap-3">
         <div class="flex items-center justify-between gap-2 rounded-cp bg-cp-fill-quaternary p-3 text-cp-xs text-cp-text-secondary">
-          <span class="flex items-center gap-1.5"><Network class="size-3.5" />并发上限</span><strong class="font-mono">{{ budget.maxConcurrency || '∞' }}</strong>
+          <span class="flex items-center gap-1.5 leading-none"><Network class="size-3.5 shrink-0 -translate-y-px" />并发上限</span><strong class="font-mono">{{ budget.maxConcurrency || '∞' }}</strong>
         </div>
         <div class="flex items-center justify-between gap-2 rounded-cp bg-cp-fill-quaternary p-3 text-cp-xs text-cp-text-secondary">
-          <span class="flex items-center gap-1.5"><Gauge class="size-3.5" />每分钟请求</span><strong class="font-mono">{{ budget.requestsPerMinute || '∞' }}</strong>
+          <span class="flex items-center gap-1.5 leading-none"><Gauge class="size-3.5 shrink-0 -translate-y-px" />每分钟请求</span><strong class="font-mono">{{ budget.requestsPerMinute || '∞' }}</strong>
         </div>
       </div>
     </div>
