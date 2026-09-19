@@ -44,6 +44,110 @@ async fn personal_info_requires_admin_and_a_valid_account_query() {
 }
 
 #[tokio::test]
+async fn turn_state_routes_require_admin_and_a_valid_account_id() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+
+    for (authenticated, expected) in [(false, StatusCode::UNAUTHORIZED), (true, StatusCode::OK)] {
+        let mut request = Request::builder()
+            .uri("/api/admin/accounts/turn-state/overview")
+            .header("x-request-id", "req_turn_state_overview");
+        if authenticated {
+            request = request.header(header::COOKIE, "cpr_session=valid-session");
+        }
+        let response = admin::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    for (uri, authenticated, expected) in [
+        (
+            "/api/admin/accounts/turn-state?accountId=acct_test&modelId=gpt-5.4",
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (
+            "/api/admin/accounts/turn-state",
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/admin/accounts/turn-state?accountId=bad",
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/admin/accounts/turn-state?accountId=acct_test&modelId=",
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/api/admin/accounts/turn-state?accountId=acct_test&modelId=gpt-5.4",
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .uri(uri)
+            .header("x-request-id", "req_turn_state_get");
+        if authenticated {
+            request = request.header(header::COOKIE, "cpr_session=valid-session");
+        }
+        let response = admin::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{uri}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    for (body, authenticated, expected) in [
+        (
+            r#"{"accountId":"acct_test","modelId":"gpt-5.4"}"#,
+            false,
+            StatusCode::UNAUTHORIZED,
+        ),
+        (r#"{}"#, true, StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            r#"{"accountId":"bad","modelId":"gpt-5.4"}"#,
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            r#"{"accountId":"acct_test","modelId":""}"#,
+            true,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            r#"{"accountId":"acct_test","modelId":"gpt-5.4"}"#,
+            true,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    ] {
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/api/admin/accounts/turn-state/probe")
+            .header("content-type", "application/json")
+            .header("x-request-id", "req_turn_state_probe");
+        if authenticated {
+            request = request.header(header::COOKIE, "cpr_session=valid-session");
+        }
+        let response = admin::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected, "{body}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+}
+
+#[tokio::test]
 async fn quota_forecast_requires_admin_and_valid_account_query() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");

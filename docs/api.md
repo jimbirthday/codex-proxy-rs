@@ -390,6 +390,9 @@ Token 明细、费用明细、用时/首字与状态。Token 和费用复用现�
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
+| `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
+| `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，从已保存代理中每轮手动最多处理 3 个候选（后台自动续采最多 1 个），取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -528,6 +531,62 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 - `sendState` 为 `not_sent`、`sent`、`ambiguous`，非 Provider 错误为 `null`。
 - `error`、`providerErrorCode`、`providerErrorType`、`upstreamStatus`、`upstreamContentType` 和
   `upstreamBody` 是实际捕获的原始诊断字段；缺失时为 `null`，不会由本地猜测或翻译。
+
+### Codex turn state 探测
+
+OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存态 `current_turn_state`。只有恰好一个、
+原始长度为 292 字节且可作为 HTTP HeaderValue 的 `x-codex-turn-state` 才会进入缓存；成功采集后固定保留
+1 小时，读取不会续期。后续 Responses HTTP/SSE 与 WebSocket 请求在账号和模型选择完成后，若客户端没有
+同一 turn 的 state，则通过 `x-codex-turn-state` 请求头注入精确匹配的缓存值。上游返回 312 时只清除当前
+账号与模型的状态；服务重启会清空运行态，不会把 state 写入 PostgreSQL、Redis、审计或日志。
+
+管理端从所选账号的实时模型目录取得 `modelId`，不在前后端写死探测模型。
+`GET /api/admin/accounts/turn-state/overview` 只读取当前 Provider 内存中已采集、已探测或已失效的账号/模型键，
+不触发上游请求，也不返回 state 原文。管理端将该结果与 OAuth 账号目录合并，因此从未探测的账号也会显示为“未获取”。
+
+`POST /api/admin/accounts/turn-state/probe` 从当前全部已保存代理中选择候选，不包含直连；未配置代理时拒绝请求。
+每轮手动探测最多处理 3 个不同候选，自动续采最多处理 1 个，连接配置失败也占用候选名额。
+优先选择账号当前绑定代理，再选择当前账号与模型最近成功的代理、该账号最近成功的代理，再轮换其余候选，并跳过仍在冷却中的代理。
+一旦取得有效 state 就停止本轮，不继续尝试其余代理。同一账号的手动探测与自动续采跨模型串行执行，
+相邻实际探测请求的发送间隔至少为 10 秒，每个账号滚动 5 分钟内最多实际发送 3 次；本实例 OpenAI Provider 同时发送的探测请求最多为 2 个。
+
+`attempts` 只包含已实际发起的请求，不代表完整代理目录或所有已处理候选。每项包含代理标识、名称、
+请求是否成功、HTTP 状态码、耗时、是否取得 state 和安全诊断文案；连接或读取失败、超时时状态码可为空。
+连接配置失败不产生 attempt；没有实际请求的轮次不新增探测历史。对应账号与模型保留最近 20 次包含实际请求的结果。
+`stateAcquired` 表示响应头或兼容响应正文中取得了有效 state，不表示该值一定成为当前状态；state 原文不会返回。
+`activeTargetId` 与结果中的 `stateExpiresAt` 只在本轮结果成功更新当前状态时返回。
+如果探测期间业务响应已刷新或撤销该状态，迟到的探测结果不会覆盖更新后的状态，实际请求结果仍可出现在历史中。
+
+同一账号已有探测运行时，手动请求返回 HTTP 409，提示“该账号正在探测，请稍后重试”。
+因账号滚动预算、冷却、退避或运行态容量限制无法开始时，返回 HTTP 503，提示“探测处于冷却期，请稍后重试”。
+本轮仅发生连接配置失败、没有实际请求时，手动请求返回 HTTP 503，提示“本轮代理连接配置不可用，请检查代理设置”。
+自动续采遇到账号忙碌、冷却或已无需续采时跳过，不新增空历史。
+上游 401、403 或 429 会终止本轮，其状态码记录在 attempt 中，不直接作为该管理接口的 HTTP 状态码返回。
+
+网络失败、超时、407 和连接配置失败使该账号下的对应代理冷却；312、缺少有效 state 的响应及其他上游错误
+使对应账号、模型与代理组合冷却。连续失败时，代理冷却依次为 5、10、20、30 分钟，之后保持 30 分钟。
+401、403 和 429 不计入代理故障冷却；429 另触发账号级退避。
+已实际发送请求但没有成功更新状态的轮次，仅在探测期间该账号与模型的状态未被其他请求更新时，
+才触发账号与模型级退避；业务请求已刷新或撤销状态时，旧探测不会追加该退避。
+退避从 2 分钟起指数增长，附加 0～30 秒抖动，总延迟不超过 30 分钟。
+手动探测同样遵守这些限制，重复点击不会绕过冷却或退避。
+
+`stateSource` 区分业务响应采集、管理员手动探测和后台自动轮换。`stateFirstAppliedAt` 仅在
+携带该值的业务请求实际越过上游发送边界后出现：HTTP/SSE 已取得上游响应，或 WebSocket `response.create`
+已成功写入连接；读取缓存、组装请求和仅完成 WebSocket 握手都不算应用。轮换期间迟到的旧请求不会标记新值。
+`nextRotationAt` 是进入 5 分钟续采窗口的时间，不保证届时立即发出请求；冷却、退避、账号忙碌和检查周期均可能推迟续采。
+单次实际探测请求超时为 30 秒，探测不会计入网关的普通业务用量，但仍会实际请求上游模型。
+
+没有成功更新状态时保留旧 state（若仍在 TTL 内）；若本轮收到没有有效新 state 的 312，且最终未取得可应用的新 state，
+则撤销当前账号与模型的旧值，但不撤销探测期间已被其他请求更新的状态。
+每个实例每 45 秒检查本进程具有自动续采资格的账号/模型状态；只有当前 state 已被业务应用过，或业务请求收到 312，且最近 1 小时内发生过上述业务活动的键可进入自动续采。
+探测成功不会延长活跃期，新采集的 state 需要业务应用后才能再次续采。进入 TTL 剩余 5 分钟窗口、已过期或被 312 撤销时，
+在上述限制允许后，只使用与账号当前出口匹配的已保存代理续采；无匹配代理时跳过，不更换出口。排队期间若状态已刷新且无需续采，则跳过。
+
+[OpenAI 官方 Codex](https://github.com/openai/codex/blob/7498521d288b9b3b96ffba4eedf089d8d6e06a84/codex-rs/core/src/client.rs#L270-L297)
+将 `x-codex-turn-state` 定义为同一 turn 内的 sticky-routing token，并禁止跨 turn 复用；
+这里的 1 小时 TTL、292/312 和跨 turn 注入属于基于外部运行观察的兼容能力，不是官方公开协议。
+缓存因此严格按账号与实际模型隔离，不假设 state 可跨模型复用；API Key 账号不支持该探测。
 
 ### 后台导入任务
 

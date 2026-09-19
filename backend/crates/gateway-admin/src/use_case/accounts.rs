@@ -4,12 +4,13 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, future::BoxFuture};
 use gateway_core::{
     account::ProviderAccountId,
     engine::probe::{AccountProbe, AccountProbeRequest},
     routing::{ProviderKind, UpstreamModelId},
     runtime::SnapshotControl,
+    task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
 
 use crate::{
@@ -28,11 +29,17 @@ use crate::{
             ProviderQuotaWindow, ProviderResetCreditResult, ProviderResetCredits,
             QuotaLocalUsageAttribution,
         },
+        proxies::ProxyListQuery,
         quota_forecast::{AccountQuotaForecastReport, account_quota_forecasts},
         quota_forecast_sampling::{QuotaForecastPoint, select_forecast_sample},
+        turn_state::{
+            TurnStateOverviewEntry, TurnStateProbeResult, TurnStateProbeTarget, TurnStateSnapshot,
+            TurnStateSource,
+        },
     },
     ports::{
         provider::ProviderAdminRegistry,
+        proxy::ProxyStore,
         store::{AccountRuntimeStore, AccountStore},
     },
 };
@@ -43,6 +50,8 @@ use super::{
 };
 
 const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
+pub(crate) const TURN_STATE_RENEWAL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(45);
 
 /// 统一账号页消费的服务。
 #[async_trait]
@@ -145,6 +154,20 @@ pub trait AccountsService: Send + Sync {
         account_id: ProviderAccountId,
         upstream_model: UpstreamModelId,
     ) -> Result<AccountConnectionTestEventStream, AdminError>;
+
+    async fn turn_state_snapshot(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+    ) -> Result<Option<TurnStateSnapshot>, AdminError>;
+
+    async fn turn_state_overview(&self) -> Result<Vec<TurnStateOverviewEntry>, AdminError>;
+
+    async fn probe_turn_state(
+        &self,
+        account_id: ProviderAccountId,
+        model: UpstreamModelId,
+    ) -> Result<TurnStateProbeResult, AdminError>;
 }
 
 pub(crate) struct DefaultAccountsService {
@@ -153,6 +176,7 @@ pub(crate) struct DefaultAccountsService {
     providers: ProviderAdminRegistry,
     snapshot: Arc<dyn SnapshotControl>,
     probe: Arc<dyn AccountProbe>,
+    proxies: Arc<dyn ProxyStore>,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
 }
@@ -165,6 +189,7 @@ impl DefaultAccountsService {
         providers: ProviderAdminRegistry,
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
+        proxies: Arc<dyn ProxyStore>,
     ) -> Self {
         Self {
             accounts,
@@ -172,6 +197,7 @@ impl DefaultAccountsService {
             providers,
             snapshot,
             probe,
+            proxies,
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -186,6 +212,85 @@ impl DefaultAccountsService {
                 .entry(account_id.clone())
                 .or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))),
         )
+    }
+
+    async fn turn_state_probe_targets(&self) -> Result<Vec<TurnStateProbeTarget>, AdminError> {
+        let mut targets = Vec::new();
+        let mut page = 1;
+        loop {
+            let result = self
+                .proxies
+                .list(ProxyListQuery {
+                    page,
+                    page_size: crate::model::PageSize::new(200)
+                        .map_err(|_| AdminError::invalid("代理分页大小不合法"))?,
+                    search: String::new(),
+                })
+                .await
+                .map_err(|error| map_store_error(error, "turn state proxy list"))?;
+            let count = result.items.len();
+            targets.extend(result.items.into_iter().map(|proxy| TurnStateProbeTarget {
+                id: proxy.id,
+                label: proxy.name,
+                proxy: proxy.proxy,
+            }));
+            if count < 200 {
+                return if targets.is_empty() {
+                    Err(AdminError::invalid("未配置可用于状态探测的代理"))
+                } else {
+                    Ok(targets)
+                };
+            }
+            page = page.saturating_add(1);
+        }
+    }
+
+    pub(crate) async fn renew_due_turn_states(&self) {
+        futures::stream::iter(self.providers.due_turn_state_subjects())
+            .for_each_concurrent(Some(2), |subject| async move {
+                // 排队期间业务响应可能已刷新 state；调用前重新核对，减少无效探测。
+                let still_due =
+                    self.providers.due_turn_state_subjects().iter().any(|due| {
+                        due.account_id == subject.account_id && due.model == subject.model
+                    });
+                if !still_due {
+                    return;
+                }
+                if let Err(error) = self
+                    .probe_turn_state_with_source(
+                        subject.account_id.clone(),
+                        subject.model.clone(),
+                        TurnStateSource::AutomaticRenewal,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        account_id = %subject.account_id,
+                        model = %subject.model,
+                        error = %error,
+                        "Codex turn state 自动续采失败"
+                    );
+                }
+            })
+            .await;
+    }
+
+    async fn probe_turn_state_with_source(
+        &self,
+        account_id: ProviderAccountId,
+        model: UpstreamModelId,
+        source: TurnStateSource,
+    ) -> Result<TurnStateProbeResult, AdminError> {
+        let (item, provider) = self.provider_for_account(&account_id).await?;
+        let mut targets = self.turn_state_probe_targets().await?;
+        if source == TurnStateSource::AutomaticRenewal {
+            // 自动续采只走业务当前出口；直连或未保存的出口不借用其他代理预热。
+            targets.retain(|target| item.account.outbound_proxy.as_ref() == Some(&target.proxy));
+        }
+        provider
+            .probe_turn_state(&account_id, &model, targets, source)
+            .await
+            .map_err(|error| map_provider_error(error, "Codex turn state probe"))
     }
 
     async fn load_account(
@@ -940,6 +1045,51 @@ impl AccountsService for DefaultAccountsService {
         })
         .flat_map(futures::stream::iter);
         Ok(Box::pin(futures::stream::iter(initial).chain(terminal)))
+    }
+
+    async fn turn_state_snapshot(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+    ) -> Result<Option<TurnStateSnapshot>, AdminError> {
+        let (_, provider) = self.provider_for_account(account_id).await?;
+        Ok(provider.turn_state_snapshot(account_id, model))
+    }
+
+    async fn turn_state_overview(&self) -> Result<Vec<TurnStateOverviewEntry>, AdminError> {
+        Ok(self.providers.turn_state_overview())
+    }
+
+    async fn probe_turn_state(
+        &self,
+        account_id: ProviderAccountId,
+        model: UpstreamModelId,
+    ) -> Result<TurnStateProbeResult, AdminError> {
+        self.probe_turn_state_with_source(account_id, model, TurnStateSource::ManualProbe)
+            .await
+    }
+}
+
+pub(crate) struct TurnStateRenewalTask {
+    accounts: Arc<DefaultAccountsService>,
+}
+
+impl TurnStateRenewalTask {
+    #[must_use]
+    pub(crate) fn new(accounts: Arc<DefaultAccountsService>) -> Self {
+        Self { accounts }
+    }
+}
+
+impl ScheduledTask for TurnStateRenewalTask {
+    fn run_cycle(&self, context: WorkerCycleContext) -> BoxFuture<'_, Result<(), WorkerTaskError>> {
+        Box::pin(async move {
+            tokio::select! {
+                () = context.cancellation().cancelled() => {},
+                () = self.accounts.renew_due_turn_states() => {},
+            }
+            Ok(())
+        })
     }
 }
 

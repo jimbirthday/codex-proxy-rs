@@ -21,6 +21,10 @@ use crate::model::provider_credentials::{
     ProviderProfileAvatar, ProviderProfileStatistics, ProviderQuota, ProviderQuotaRequest,
     ProviderResetCreditResult, ProviderResetCredits, ProviderSubscription, explicit_plan_type,
 };
+use crate::model::turn_state::{
+    TurnStateOverviewEntry, TurnStateProbeResult, TurnStateProbeSubject, TurnStateProbeTarget,
+    TurnStateSnapshot, TurnStateSource,
+};
 use crate::model::{
     provider_credentials::{ProviderDocument, ProviderQuotaWindow},
     quota_forecast_sampling::QuotaForecastObservation,
@@ -148,6 +152,39 @@ pub trait ProviderAdmin: Send + Sync {
     /// 该通知发生在 Store 事务成功之后、下一份 RuntimeSnapshot 编译之前；通知
     /// 不参与已提交事务成败。没有账号派生状态的 Provider 可使用默认空实现。
     async fn account_facts_changed(&self, _account_ids: &[ProviderAccountId]) {}
+
+    /// 从控制面提供的已保存代理候选集合获取 Codex turn state。
+    ///
+    /// Provider 负责有限选择、账号串行与冷却，并在成功后停止；结果中的 attempts 只包含实际请求。
+    /// 自动探测被跳过时可返回不进入历史的空结果，所有结果均不得包含 state 原文。
+    async fn probe_turn_state(
+        &self,
+        _account_id: &ProviderAccountId,
+        _model: &UpstreamModelId,
+        _targets: Vec<TurnStateProbeTarget>,
+        _trigger: TurnStateSource,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    /// 返回账号当前 turn state 的非敏感运行态投影。
+    fn turn_state_snapshot(
+        &self,
+        _account_id: &ProviderAccountId,
+        _model: &UpstreamModelId,
+    ) -> Option<TurnStateSnapshot> {
+        None
+    }
+
+    /// 返回所有已见账号/模型键的非敏感状态摘要。
+    fn turn_state_overview(&self) -> Vec<TurnStateOverviewEntry> {
+        Vec::new()
+    }
+
+    /// 返回需要自动续采 turn state 的账号与模型；默认 Provider 没有此类运行态。
+    fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        Vec::new()
+    }
 
     /// 生成一次连接测试所需的 Provider-owned operation；Core 负责实际执行与落账。
     fn connection_test_operation(
@@ -314,6 +351,20 @@ impl ProviderAdminRegistry {
             .get(provider_kind)
             .cloned()
             .ok_or_else(|| ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
+    pub(crate) fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        self.providers
+            .values()
+            .flat_map(|provider| provider.due_turn_state_subjects())
+            .collect()
+    }
+
+    pub(crate) fn turn_state_overview(&self) -> Vec<TurnStateOverviewEntry> {
+        self.providers
+            .values()
+            .flat_map(|provider| provider.turn_state_overview())
+            .collect()
     }
 
     /// 账号目录与关联列表共用套餐补全和展示规则，已知账号套餐优先于额度快照。

@@ -73,6 +73,131 @@ mod personal_info {
     }
 }
 
+mod turn_state {
+    use chrono::{TimeZone as _, Utc};
+    use gateway_admin::model::turn_state::{
+        TurnStateOverviewEntry, TurnStateProbeAttempt, TurnStateProbeResult, TurnStateSnapshot,
+        TurnStateSource,
+    };
+    use gateway_api::admin::accounts::{TurnStateOverviewEntryData, TurnStateSnapshotData};
+    use serde_json::json;
+
+    #[test]
+    fn snapshot_response_preserves_model_timestamps_and_complete_probe_history() {
+        let started_at = Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 0).unwrap();
+        let finished_at = Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 2).unwrap();
+        let expires_at = Utc.with_ymd_and_hms(2026, 9, 18, 13, 0, 1).unwrap();
+        let probe = TurnStateProbeResult {
+            account_id: "acct_turn_state".to_owned(),
+            model: "gpt-selected".to_owned(),
+            started_at,
+            finished_at,
+            trigger: TurnStateSource::ManualProbe,
+            active_target_id: Some("proxy-a".to_owned()),
+            state_expires_at: Some(expires_at),
+            attempts: vec![TurnStateProbeAttempt {
+                target_id: "proxy-a".to_owned(),
+                target_label: "出口 A".to_owned(),
+                success: true,
+                status_code: Some(200),
+                latency_ms: 2_001,
+                state_acquired: true,
+                message: "已获取 current_turn_state".to_owned(),
+            }],
+        };
+        let response = TurnStateSnapshotData::from(TurnStateSnapshot {
+            account_id: "acct_turn_state".to_owned(),
+            model: "gpt-selected".to_owned(),
+            state_captured_at: Some(finished_at),
+            state_first_applied_at: None,
+            state_expires_at: Some(expires_at),
+            next_rotation_at: Some(Utc.with_ymd_and_hms(2026, 9, 18, 12, 55, 1).unwrap()),
+            state_source: Some(TurnStateSource::ManualProbe),
+            probe_history: vec![probe],
+            invalidated_at: None,
+            invalidation_reason: None,
+        });
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize turn state snapshot"),
+            json!({
+                "accountId": "acct_turn_state",
+                "model": "gpt-selected",
+                "stateCapturedAt": "2026-09-18T12:00:02+00:00",
+                "stateFirstAppliedAt": null,
+                "stateExpiresAt": "2026-09-18T13:00:01+00:00",
+                "nextRotationAt": "2026-09-18T12:55:01+00:00",
+                "stateSource": "manual_probe",
+                "probeHistory": [{
+                    "accountId": "acct_turn_state",
+                    "model": "gpt-selected",
+                    "startedAt": "2026-09-18T12:00:00+00:00",
+                    "finishedAt": "2026-09-18T12:00:02+00:00",
+                    "trigger": "manual_probe",
+                    "activeTargetId": "proxy-a",
+                    "stateExpiresAt": "2026-09-18T13:00:01+00:00",
+                    "attempts": [{
+                        "targetId": "proxy-a",
+                        "targetLabel": "出口 A",
+                        "success": true,
+                        "statusCode": 200,
+                        "latencyMs": 2001,
+                        "stateAcquired": true,
+                        "message": "已获取 current_turn_state"
+                    }]
+                }],
+                "invalidatedAt": null,
+                "invalidationReason": null
+            })
+        );
+    }
+
+    #[test]
+    fn overview_response_is_redacted_and_preserves_probe_summary() {
+        let captured_at = Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 1).unwrap();
+        let expires_at = Utc.with_ymd_and_hms(2026, 9, 18, 13, 0, 1).unwrap();
+        let probe_at = Utc.with_ymd_and_hms(2026, 9, 18, 12, 0, 2).unwrap();
+        let response = TurnStateOverviewEntryData::from(TurnStateOverviewEntry {
+            account_id: "acct_turn_state".to_owned(),
+            model: "gpt-selected".to_owned(),
+            state_available: true,
+            state_captured_at: Some(captured_at),
+            state_first_applied_at: Some(probe_at),
+            state_expires_at: Some(expires_at),
+            next_rotation_at: Some(Utc.with_ymd_and_hms(2026, 9, 18, 12, 55, 1).unwrap()),
+            state_source: Some(TurnStateSource::AutomaticRenewal),
+            latest_probe_at: Some(probe_at),
+            latest_probe_succeeded: true,
+            latest_probe_active_target_id: Some("proxy-a".to_owned()),
+            latest_probe_active_target_label: Some("出口 A".to_owned()),
+            latest_probe_attempt_count: 3,
+            invalidated_at: None,
+            invalidation_reason: None,
+        });
+
+        assert_eq!(
+            serde_json::to_value(response).expect("serialize turn state overview"),
+            json!({
+                "accountId": "acct_turn_state",
+                "model": "gpt-selected",
+                "stateAvailable": true,
+                "stateCapturedAt": "2026-09-18T12:00:01+00:00",
+                "stateFirstAppliedAt": "2026-09-18T12:00:02+00:00",
+                "stateExpiresAt": "2026-09-18T13:00:01+00:00",
+                "nextRotationAt": "2026-09-18T12:55:01+00:00",
+                "stateSource": "automatic_renewal",
+                "latestProbeAt": "2026-09-18T12:00:02+00:00",
+                "latestProbeSucceeded": true,
+                "latestProbeActiveTargetId": "proxy-a",
+                "latestProbeActiveTargetLabel": "出口 A",
+                "latestProbeAttemptCount": 3,
+                "invalidatedAt": null,
+                "invalidationReason": null
+            })
+        );
+    }
+}
+
 mod query {
     use gateway_admin::model::accounts::{AccountSortField, AccountStatus, SortDirection};
     use gateway_api::admin::accounts::ListQuery;

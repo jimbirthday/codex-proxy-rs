@@ -94,6 +94,7 @@ use crate::transport::{
     CodexResponseMetadataUpdates, CodexTransportMetrics, CodexUpstreamDiagnostics,
     CodexWebSocketPool, endpoint_url,
 };
+use crate::turn_state::TurnStateStore;
 
 mod execution;
 mod failure;
@@ -150,6 +151,7 @@ pub struct CodexProvider {
     session_identity: Option<CodexSessionIdentity>,
     session_transport_recovery: CodexSessionTransportRecovery,
     stream_max_retries: u32,
+    turn_states: TurnStateStore,
 }
 
 impl CodexProvider {
@@ -204,7 +206,13 @@ impl CodexProvider {
             session_identity: None,
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             stream_max_retries,
+            turn_states: TurnStateStore::new(),
         })
+    }
+
+    pub(crate) fn with_turn_state_store(mut self, turn_states: TurnStateStore) -> Self {
+        self.turn_states = turn_states;
+        self
     }
 
     pub(crate) fn with_session_identity(mut self, identity: CodexSessionIdentity) -> Self {
@@ -421,6 +429,9 @@ impl Provider for CodexProvider {
                 None
             };
         }
+        // 只允许客户端或既有 continuation 明确携带的 state 进入兼容性 session；
+        // 由进程内 TurnStateStore 注入的值不得随 continuation 写入 Redis。
+        let persisted_turn_state = upstream_request.turn_state.clone();
         let session_affinity =
             derive_codex_session_affinity(&upstream_request, context.client_api_key_ref());
         let cyber_policy_session_key =
@@ -549,6 +560,14 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        if matches!(
+            lease.authentication(),
+            crate::credential::CodexRuntimeAuthentication::OAuth(_)
+        ) && upstream_request.turn_state.is_none()
+            && let Some(state) = self.turn_states.state(lease.account_id(), upstream_model)
+        {
+            upstream_request.turn_state = Some(state);
+        }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease
             .account()
@@ -609,7 +628,7 @@ impl Provider for CodexProvider {
                 )
                 .then_some(lease.account().revision().get()),
                 conversation_id: upstream_request.local_conversation_id.clone(),
-                turn_state: upstream_request.turn_state.clone(),
+                turn_state: persisted_turn_state,
                 client_turn_id: upstream_request.client_turn_id.clone(),
                 response_store,
                 continuation_scope: None,
@@ -647,6 +666,7 @@ impl Provider for CodexProvider {
             websocket_retry_count,
             stream_max_retries: self.stream_max_retries,
             session_capture,
+            turn_states: self.turn_states.clone(),
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {
