@@ -304,6 +304,8 @@ pub struct CalculatedCost {
 /// 随本地费用事件保存，以免后续改价改变历史明细。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculatedCostBreakdown {
+    // Provider 选中的价格区间事实，与服务档位和自定义倍率独立。
+    long_context_billing_applied: bool,
     image: Option<ImageCostBreakdown>,
     input_amount: Money,
     output_amount: Money,
@@ -393,6 +395,7 @@ impl CalculatedCostBreakdown {
         multiplier_percent: u32,
     ) -> Self {
         Self {
+            long_context_billing_applied: false,
             input_amount: amounts.input,
             image: None,
             output_amount: amounts.output,
@@ -408,6 +411,17 @@ impl CalculatedCostBreakdown {
             multiplier_percent,
             custom_multiplier_bps: 10_000,
         }
+    }
+
+    #[must_use]
+    pub const fn with_long_context_billing(mut self, applied: bool) -> Self {
+        self.long_context_billing_applied = applied;
+        self
+    }
+
+    #[must_use]
+    pub const fn long_context_billing_applied(&self) -> bool {
+        self.long_context_billing_applied
     }
 
     #[must_use]

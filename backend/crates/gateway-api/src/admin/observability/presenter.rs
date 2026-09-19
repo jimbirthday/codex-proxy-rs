@@ -214,6 +214,7 @@ fn capitalize_first(value: &str) -> String {
 pub(crate) fn billing_view(billing: Option<&domain::UsageBilling>) -> Option<BillingView> {
     match billing? {
         domain::UsageBilling::Total { source, total } => Some(BillingView {
+            long_context_billing_applied: false,
             image: None,
             input_amount_display: "—".to_owned(),
             output_amount_display: "—".to_owned(),
@@ -233,6 +234,7 @@ pub(crate) fn billing_view(billing: Option<&domain::UsageBilling>) -> Option<Bil
             multiplier_display: "—".to_owned(),
         }),
         domain::UsageBilling::Calculated(value) => Some(BillingView {
+            long_context_billing_applied: value.long_context_billing_applied,
             image: value
                 .image
                 .as_ref()
@@ -277,6 +279,7 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
         .clone()
         .or_else(|| record.requested_model_id.clone());
     UsageListRecordView {
+        client_api_key_name: record.client_api_key_name,
         id: record.id,
         provider: record.provider_kind,
         authentication_kind: record.provider_account_authentication_kind,
@@ -564,6 +567,7 @@ pub(crate) fn ops_error_view(error: domain::OpsError) -> OpsErrorView {
         .clone()
         .or_else(|| error.requested_model_id.clone());
     OpsErrorView {
+        client_api_key_name: error.client_api_key_name,
         id: error.event_id,
         request_id: error.request_id,
         client_api_key_id: error.client_api_key_ref,

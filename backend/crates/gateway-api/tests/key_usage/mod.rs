@@ -40,7 +40,11 @@ async fn login(app: &Router, mode: &str) -> String {
 }
 
 async fn get(app: &Router, resource: &str, suffix: &str, cookie: &str) -> Response {
-    let path = format!("/api/key-usage/{resource}?{RANGE}{suffix}");
+    let path = if resource == "config" {
+        format!("/api/key-usage/config{suffix}")
+    } else {
+        format!("/api/key-usage/{resource}?{RANGE}{suffix}")
+    };
     let response = app
         .clone()
         .oneshot(cookie_request(Method::GET, &path, cookie))
@@ -48,6 +52,72 @@ async fn get(app: &Router, resource: &str, suffix: &str, cookie: &str) -> Respon
         .unwrap();
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     response
+}
+
+#[tokio::test]
+async fn config_reveals_only_the_session_keys_name_and_plaintext() {
+    let fixture = fixtures::fixture().await;
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    let response = get(&app, "config", "", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let data = response_json(response).await["data"].clone();
+    assert_eq!(
+        data,
+        json!({
+            "name": "Development",
+            "plaintextKey": format!("sk_{}", "a".repeat(43)),
+        })
+    );
+    let overview = get(&app, "overview", "", &cookie).await;
+    assert!(
+        !response_json(overview)
+            .await
+            .to_string()
+            .contains("plaintextKey")
+    );
+}
+
+#[tokio::test]
+async fn config_rejects_caller_selected_scope() {
+    let fixture = fixtures::fixture().await;
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    for query in [
+        "?keyId=other",
+        "?id=other",
+        "?clientApiKeyRef=other",
+        "?provider=openai",
+    ] {
+        let response = get(&app, "config", query, &cookie).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(response_json(response).await["data"].is_null());
+    }
+}
+
+#[tokio::test]
+async fn config_does_not_reveal_disabled_or_other_keys() {
+    let fixture = fixtures::fixture().await;
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    {
+        let mut key = fixture.client_key.lock().unwrap();
+        key.as_mut().unwrap().enabled = false;
+    }
+    assert_eq!(
+        get(&app, "config", "", &cookie).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    {
+        let mut key = fixture.client_key.lock().unwrap();
+        let key = key.as_mut().unwrap();
+        key.enabled = true;
+        key.id = gateway_core::policy::ClientApiKeyId::new("other-key").unwrap();
+    }
+    assert_eq!(
+        get(&app, "config", "", &cookie).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 fn assert_fields(value: &Value, expected: &[&str]) {
@@ -218,7 +288,7 @@ async fn missing_admin_and_revoked_sessions_cannot_read_key_usage() {
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
     let admin = login(&app, "admin").await;
     let key = login(&app, "key").await;
-    for resource in ["overview", "records"] {
+    for resource in ["overview", "records", "config"] {
         assert_eq!(
             get(&app, resource, "", "").await.status(),
             StatusCode::UNAUTHORIZED
@@ -350,6 +420,11 @@ async fn namespace_errors_remain_json_and_uncacheable() {
         (
             Method::POST,
             "/api/key-usage/overview",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::POST,
+            "/api/key-usage/config",
             StatusCode::METHOD_NOT_ALLOWED,
         ),
     ] {

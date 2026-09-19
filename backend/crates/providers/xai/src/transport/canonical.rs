@@ -243,6 +243,7 @@ pub fn grok_billing_breakdown_with_override(
         Some(tier.to_owned()),
         multiplier_percent,
     )
+    .with_long_context_billing(long)
     .with_custom_multiplier(custom.map_or(10_000, |p| p.multiplier_bps))
 }
 

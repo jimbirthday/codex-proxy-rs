@@ -480,6 +480,7 @@ pub struct DashboardObservation {
 /// 使用记录列表所需的窄投影；完整执行、路由和客户端详情按 ID 单独读取。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageListRecord {
+    pub client_api_key_name: Option<String>,
     pub billing_snapshot_json: Option<serde_json::Value>,
     pub id: String,
     pub endpoint: String,
@@ -693,6 +694,7 @@ pub struct DiagnosticObservation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpsErrorRecord {
+    pub client_api_key_name: Option<String>,
     pub source: String,
     pub event_id: String,
     pub request_id: Option<String>,

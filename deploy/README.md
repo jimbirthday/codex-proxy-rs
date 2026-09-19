@@ -64,12 +64,14 @@ Linux 上应用容器以 `10001:10001` 运行。上述命令将应用数据和�
 配置设为 `0640`，均由当前用户持有、容器组 `10001` 访问。
 `config.yaml` 通过 Compose `configs` 只读挂载，普通 Compose 保留宿主机文件的 UID/GID 和 mode。
 
-OpenAI 上游身份在管理端「系统设置 → 上游配置 → 客户端身份」配置，Key 可选择独立身份覆盖通用值。
-首次默认 macOS Desktop 自动最新，支持范围与字段见 [客户端身份合同](../docs/api.md#openai-上游客户端身份)。
-旧 `openai.wire_profile` 在数据库尚无选择时一次性导入：默认版本采用自动更新；版本元组、平台或架构
-与默认值不同则保留为固定版本。导入后从管理端修改，重启不会用 YAML 覆盖数据库。
-`residency` 仍为部署配置；后台账号与 Desktop 专属请求保持独立官方画像。
-OpenAI 上游地址、WebSocket 池、额度刷新和 OAuth 使用 Provider 默认值；xAI 仍在 YAML 配置启动画像。
+OpenAI 与 xAI 上游身份在管理端「系统设置 → 上游配置 → 客户端身份」配置，Key 可按 Provider 选择独立身份覆盖通用值。
+OpenAI 首次默认 macOS Desktop 自动最新，支持范围与字段见 [客户端身份合同](../docs/api.md#openai-上游客户端身份)。
+客户端身份只保存于数据库；首次使用内置默认值，重启不会覆盖已有选择。
+`openai.residency` 为独立的数据驻留部署约束，省略或 `null` 时不指定；后台账号与 Desktop 专属请求使用内置官方画像。
+OpenAI 上游地址、WebSocket 池、额度刷新和 OAuth 使用 Provider 默认值。
+xAI 无需 YAML 配置，首次默认 Grok CLI 的 Linux x86_64 身份并采用自动更新。
+管理端支持固定版本与自动更新；字段及生效范围见 [xAI 客户端身份](../docs/api.md#xai-上游客户端身份)。
+xAI 的后台 OAuth、目录和额度查询使用内置官方画像。
 后台发布检查只更新可重建的版本资料，不回写用户选择或 `config.yaml`；失败继续使用同组合的有效版本。
 
 全局请求位置在管理端「系统设置 → 上游配置 → 请求位置覆盖」配置，默认关闭，保留客户端原有位置和时区。
@@ -393,19 +395,48 @@ CPR_BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
 docker compose -f deploy/compose.yaml build codex-proxy-rs
 ```
 
+### 版本命名与升级规则
+
+发行通道由当前版本确定，不提供通道切换配置。预发行编号 `N` 从 1 开始递增。
+
+| 类型 | 命名示例 | 含义 | 允许在线更新到 |
+| --- | --- | --- | --- |
+| 正式版 | `3.12.0` | 稳定发布 | 同一大版本内更新的正式版 |
+| alpha | `3.12.0-alpha.1` | 下一正式版本的早期开发阶段 | 同一目标版本的更新 alpha、beta、rc、正式版 |
+| beta | `3.12.0-beta.1` | 下一正式版本的功能测试阶段 | 同一目标版本的更新 beta、rc、正式版 |
+| rc | `3.12.0-rc.1` | 准备转正的发布候选版本 | 同一目标版本的更新 rc、正式版 |
+| exp | `3.10.0-exp.1` | 临时功能实验，可能合入正式版或结束维护 | 同一轮实验中编号更高的 exp |
+
+“同一目标版本”要求 `X.Y.Z` 相同。alpha → beta → rc → 正式版可以跳过中间阶段，不能倒退；
+转正后按正式版规则更新，不自动进入下一轮预发行。同一 `X.Y.Z-exp.N` 系列只用于同一轮实验，
+不能混用不同实验分支；变更基线即进入另一实验线，需手动迁移。exp 不自动进入正式版、alpha、beta 或 rc。
+从 exp 切换正式版时需先备份，在目标版本的独立数据库中迁移业务数据，不能直接复用或整库还原实验数据库。
+
+版本大小遵循 [SemVer](https://semver.org/)，构建元数据 `+...` 不参与比较。未知预发行标识不提供在线更新。
+更新器先过滤不允许的目标，再选择版本最高的候选；其他通道或更高大版本领先，不影响当前发行线的更新。
+只有当前官方构建满足在线更新条件且存在允许安装的新版本时，才返回“有可用更新”。否则不显示更新标记、
+其他通道的版本及发布说明，手动检查显示“当前没有可用更新”。检查失败单独报告，不能当作没有更新。
+
+alpha、beta、rc、exp 在 GitHub 标记为 Pre-release，不覆盖 GitHub Latest 或镜像 `latest`。
+允许连续升级的发行线从首次发布起遵守[迁移冻结规则](../backend/migrations/README.md#冻结规则)，
+包括预发行到正式版的晋级；发版前验证对应升级路径，不能仅凭版本号认定数据库兼容。
+
 ### 管理端在线更新
+
+官方构建按上述规则在线更新；源码等非官方构建返回不支持原因，不提供可用更新。
 
 Compose 提供以下在线更新运行参数：
 
 - `CPR_UPDATE_REPOSITORY`：只接受 `owner/repository`；默认 `zyycn/codex-proxy-rs`。
 - `CPR_GITHUB_API_BASE`：正式环境必须为 `https://api.github.com/repos`。
-- `CPR_UPDATE_CHANNEL`：`stable` 会拒绝 prerelease。
 - `CPR_UPDATE_EXE_PATH`、`CPR_WEB_DIST_DIR`：分别指向容器内二进制和前端静态目录；
   `CPR_WEB_DIST_DIR` 同时供页面服务与更新器使用，相对路径以 `deploy/config.yaml` 所在目录为基准。
 - 更新临时目录、状态文件和锁文件默认由 `host.runtime_data_dir` 派生；
   `CPR_UPDATE_TEMP_DIR`、`CPR_UPDATE_STATE_FILE`、`CPR_UPDATE_LOCK_FILE` 仅用于显式覆盖。
 - `CPR_ENABLE_SELF_RESTART=true`：更新或回滚完成后允许管理端请求重启；Docker 进程退出后由
   Compose 的 `restart: unless-stopped` 拉起新进程。
+
+旧配置中的 `CPR_UPDATE_CHANNEL` 不再参与版本选择，可移除。
 
 Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.tar.gz` 与
 `checksums.txt`。服务会在替换前再次查询远端最新版本，校验下载 host、声明大小、SHA-256 和

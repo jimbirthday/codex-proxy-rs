@@ -79,6 +79,7 @@ async fn old_weekly_quota_should_outweigh_one_in_flight_title_request() {
     let candidates = accounts
         .into_iter()
         .map(|account| AccountCandidate {
+            routing_state_ready: None,
             signals: AccountRuntimeSignals {
                 in_flight: u32::from(account.id().as_str() == "acct_74"),
                 last_started_at: None,

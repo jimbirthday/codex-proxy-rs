@@ -6,7 +6,165 @@ use gateway_core::account::{
 };
 use gateway_core::routing::ProviderKind;
 
-use super::{candidate, candidate_with_concurrency, context};
+use super::{candidate, candidate_with_concurrency, context, weighted_candidate};
+
+#[test]
+fn smart_selector_should_prioritize_ready_routing_state_before_score() {
+    let mut candidates = [
+        candidate("acct_missing", 0, Some(10_000)),
+        candidate("acct_ready", 2, Some(100)),
+    ];
+    candidates[0].routing_state_ready = Some(false);
+    candidates[1].routing_state_ready = Some(true);
+    candidates[1].signals.failure_rate_basis_points = Some(5_000);
+    candidates[1].signals.first_output_latency_ms = Some(20_000);
+    assert!(
+        smart_selection_ids(&candidates)
+            .iter()
+            .all(|id| *id == "acct_ready")
+    );
+}
+
+#[test]
+fn smart_selector_should_keep_scoring_and_rotation_within_ready_accounts() {
+    let mut candidates = [
+        candidate("acct_a", 0, None),
+        candidate("acct_b", 0, None),
+        candidate("acct_loaded", 2, None),
+        candidate("acct_missing", 0, Some(10_000)),
+    ];
+    for candidate in &mut candidates {
+        candidate.routing_state_ready = Some(candidate.account.id().as_str() != "acct_missing");
+    }
+    let ids = smart_selection_ids(&candidates);
+    assert_eq!(ids, ["acct_a", "acct_b"].repeat(10));
+}
+
+#[test]
+fn smart_selector_should_fall_back_when_ready_accounts_are_blocked() {
+    for blocker in [
+        "concurrency",
+        "interval",
+        "excluded",
+        "cooldown",
+        "disabled",
+    ] {
+        let mut candidates = [
+            candidate("acct_ready", 0, None),
+            candidate("acct_fallback", 0, None),
+        ];
+        candidates[0].routing_state_ready = Some(true);
+        candidates[1].routing_state_ready = Some(false);
+        let mut context = context(RotationStrategy::Smart);
+        match blocker {
+            "concurrency" => candidates[0].signals.in_flight = 3,
+            "interval" => {
+                candidates[0].signals.last_started_at = Some(context.now + Duration::from_secs(1))
+            }
+            "excluded" => {
+                context
+                    .excluded_accounts
+                    .insert(candidates[0].account.id().clone());
+            }
+            "cooldown" => {
+                candidates[0].signals.cooldown =
+                    Some((context.now + Duration::from_secs(60)).into())
+            }
+            "disabled" => {
+                candidates[0].account = candidates[0].account.clone().with_account_facts(
+                    false,
+                    gateway_core::account::CredentialState::Ready,
+                    gateway_core::account::QuotaState::unknown(),
+                    None,
+                    None,
+                )
+            }
+            _ => unreachable!(),
+        }
+        let selected = AccountSelector
+            .select(&candidates, &context)
+            .expect("fallback");
+        assert_eq!(
+            selected.candidate().account.id().as_str(),
+            "acct_fallback",
+            "{blocker}"
+        );
+    }
+}
+
+#[test]
+fn routing_state_should_not_override_weight_or_affinity() {
+    let mut candidates = [
+        weighted_candidate("acct_high", 100, 0),
+        weighted_candidate("acct_ready", 1, 0),
+    ];
+    candidates[0].routing_state_ready = Some(false);
+    candidates[1].routing_state_ready = Some(true);
+    let mut context = context(RotationStrategy::Smart);
+    assert_eq!(
+        AccountSelector
+            .select(&candidates, &context)
+            .expect("highest weight")
+            .candidate()
+            .account
+            .id()
+            .as_str(),
+        "acct_high"
+    );
+
+    candidates[0].account = weighted_candidate("acct_high", 1, 0).account;
+    context.preferred_account = Some(candidates[0].account.id().clone());
+    let selected = AccountSelector
+        .select(&candidates, &context)
+        .expect("affinity");
+    assert_eq!(selected.candidate().account.id().as_str(), "acct_high");
+    assert_eq!(
+        selected.preferred(),
+        gateway_core::account::PreferredAccountSelection::Hit
+    );
+}
+
+#[test]
+fn smart_selector_should_preserve_neutral_and_all_missing_routing_state_behavior() {
+    let mut candidates = [candidate("acct_a", 0, None), candidate("acct_b", 0, None)];
+    let baseline = smart_selection_ids(&candidates)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for states in [
+        [Some(false), Some(false)],
+        [Some(true), None],
+        [Some(false), None],
+    ] {
+        for (candidate, state) in candidates.iter_mut().zip(states) {
+            candidate.routing_state_ready = state;
+        }
+        assert_eq!(smart_selection_ids(&candidates), baseline, "{states:?}");
+    }
+}
+
+#[test]
+fn routing_state_should_not_change_other_rotation_strategies() {
+    for strategy in [
+        RotationStrategy::RoundRobin,
+        RotationStrategy::Sticky,
+        RotationStrategy::QuotaResetPriority,
+    ] {
+        let mut candidates = [candidate("acct_a", 0, None), candidate("acct_b", 0, None)];
+        candidates[0].routing_state_ready = Some(false);
+        candidates[1].routing_state_ready = Some(true);
+        assert_eq!(
+            AccountSelector
+                .select(&candidates, &context(strategy))
+                .expect("original order")
+                .candidate()
+                .account
+                .id()
+                .as_str(),
+            "acct_a"
+        );
+    }
+}
 
 const FAILURE_RATE_HALF_LIFE: Duration = Duration::from_secs(15 * 60);
 

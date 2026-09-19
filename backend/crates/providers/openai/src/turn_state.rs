@@ -100,6 +100,12 @@ struct Entry {
 }
 
 impl Entry {
+    fn current_state(&self, now: SystemTime) -> Option<&SecretString> {
+        self.state
+            .as_ref()
+            .filter(|_| self.expires_at.is_some_and(|expires_at| expires_at > now))
+    }
+
     fn empty(now: SystemTime, schedule_now: Instant, version: TurnStateVersion) -> Self {
         Self {
             state: None,
@@ -253,6 +259,27 @@ pub(crate) struct TurnStateProbeFailure {
 }
 
 impl TurnStateStore {
+    /// 选号只读取就绪事实，不复制 state 原文、不续期，也不更新业务活动。
+    pub(crate) fn ready_accounts(
+        &self,
+        account_ids: &[ProviderAccountId],
+        model: &UpstreamModelId,
+        now: SystemTime,
+    ) -> HashSet<ProviderAccountId> {
+        let Ok(entries) = self.entries.lock() else {
+            return HashSet::new();
+        };
+        account_ids
+            .iter()
+            .filter(|id| {
+                entries
+                    .get(&TurnStateKey::new(id, model))
+                    .is_some_and(|entry| entry.current_state(now).is_some())
+            })
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
@@ -277,12 +304,8 @@ impl TurnStateStore {
         let schedule_now = Instant::now();
         let mut entries = self.entries.lock().ok()?;
         let entry = entries.get_mut(&TurnStateKey::new(account_id, model))?;
-        if entry.expires_at.is_none_or(|expires_at| expires_at <= now) {
-            return None;
-        }
         let state = entry
-            .state
-            .as_ref()
+            .current_state(now)
             .map(|state| state.expose_secret().to_owned());
         if state.is_some() {
             entry.touched_at = now;

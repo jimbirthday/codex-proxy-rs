@@ -155,6 +155,7 @@ async fn usage_page_should_always_return_total() {
     assert_eq!(page.total, 1);
     assert_eq!(page.current_page, 1);
     assert_eq!(page.page_size, 10);
+    assert_eq!(page.items[0].client_api_key_name, None);
     database.close().await;
 }
 
@@ -383,6 +384,10 @@ async fn usage_and_error_search_match_key_names_instead_of_credentials() {
             assert_eq!(page.items.len() as u64, expected);
             if expected == 1 {
                 assert_eq!(page.items[0].id, "req_observe_success");
+                assert_eq!(
+                    page.items[0].client_api_key_name.as_deref(),
+                    Some("Production_%专用")
+                );
             }
             let errors = repository
                 .list_ops_errors(OpsErrorQuery {
@@ -398,7 +403,54 @@ async fn usage_and_error_search_match_key_names_instead_of_credentials() {
                 .unwrap();
             assert_eq!(errors.total, expected * 2, "error search: {search}");
             assert_eq!(errors.items.len() as u64, expected * 2);
+            for error in &errors.items {
+                assert_eq!(
+                    error.client_api_key_name.as_deref(),
+                    Some("Production_%专用")
+                );
+            }
         }
+    }
+    for name in [Some("Renamed Key"), None] {
+        if let Some(name) = name {
+            sqlx::query("update client_api_keys set name = $1 where id = 'key_observe'")
+                .bind(name)
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("delete from client_api_keys where id = 'key_observe'")
+                .execute(&database.pool)
+                .await
+                .unwrap();
+        }
+        let page = repository
+            .list_usage_records(UsageRecordQuery {
+                range,
+                filter: UsageRecordFilter::default(),
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(10).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].client_api_key_name.as_deref(), name);
+        let errors = repository
+            .list_ops_errors(OpsErrorQuery {
+                range,
+                filter: OpsErrorFilter::default(),
+                current_page: 1,
+                page_size: ObservabilityPageSize::new(10).unwrap(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(errors.total, 2);
+        assert!(
+            errors
+                .items
+                .iter()
+                .all(|error| error.client_api_key_name.as_deref() == name)
+        );
     }
     database.close().await;
 }

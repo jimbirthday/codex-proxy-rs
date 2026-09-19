@@ -204,7 +204,11 @@ impl GrokAccountSessionSelector {
                         .ok_or(GrokSessionSelectorError::Unavailable)?
                         .with_provider_quota(self.quota.scheduling_signals(&account))
                         .with_runtime_health(health.0, health.1);
-                    Ok(AccountCandidate { account, signals })
+                    Ok(AccountCandidate {
+                        account,
+                        signals,
+                        routing_state_ready: None,
+                    })
                 })
                 .collect::<Result<Vec<_>, GrokSessionSelectorError>>()?;
             if let Some(required) = request.required_account() {

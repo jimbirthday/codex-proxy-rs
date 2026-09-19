@@ -169,6 +169,7 @@ fn sensitive_response_views_do_not_require_debug_or_add_secret_fields() {
 #[test]
 fn billing_view_should_preserve_the_original_detail_contract() {
     let value = serde_json::to_value(BillingView {
+        long_context_billing_applied: false,
         image: None,
         input_amount_display: "$0.03".to_owned(),
         output_amount_display: "$0.00".to_owned(),
@@ -631,6 +632,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         .lock()
         .expect("ops errors")
         .push(OpsError {
+            client_api_key_name: Some("Production".to_owned()),
             source: "model_request".to_owned(),
             event_id: "err_snapshot".to_owned(),
             request_id: Some("req_err".to_owned()),
@@ -701,6 +703,7 @@ async fn ops_errors_should_keep_account_label_and_authentication_contract() {
         .await
         .expect("ops errors body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("ops errors JSON");
+    assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
     assert_eq!(
         serde_json::json!({
             "provider": value["data"]["items"][0]["provider"],
@@ -954,6 +957,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .lock()
         .expect("usage records")
         .push(UsageListRecord {
+            client_api_key_name: Some("Production".to_owned()),
             id: "request_endpoint".to_owned(),
             endpoint: "/v1/responses".to_owned(),
             client_transport: "websocket".to_owned(),
@@ -980,6 +984,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             cost_currency: None,
             billing: Some(UsageBilling::Calculated(Box::new(
                 CalculatedBillingBreakdown {
+                    long_context_billing_applied: true,
                     custom_multiplier_bps: 10_000,
                     image: None,
                     input_amount: usd("0.03"),
@@ -1051,6 +1056,15 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
         .expect("usage response body");
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
 
+    assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
+    assert_eq!(
+        value["data"]["items"][0]["billing"]["longContextBillingApplied"],
+        true
+    );
+    assert_eq!(
+        value["data"]["items"][1]["billing"]["longContextBillingApplied"],
+        false
+    );
     assert_eq!(
         value["data"]["items"][0]["billing"]["inputPriceDisplay"],
         "$10 / 1M Token"

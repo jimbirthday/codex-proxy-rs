@@ -24,7 +24,7 @@ const columns = computed(() => defineTableColumns<KeyUsageRecord>([
   { key: 'upstreamTransport', label: '上游', kind: 'status', size: 'md' },
   { key: 'clientTransport', label: '接入', kind: 'status', size: 'md' },
   { key: 'tokenDetails', label: 'TOKEN', kind: 'numeric', size: 'xl' },
-  { key: 'billing', label: '费用', kind: 'numeric', size: 'lg' },
+  { key: 'billing', label: '费用', kind: 'numeric', size: 'xl' },
   { key: 'latency', label: '延迟', kind: 'numeric', size: 'xl' },
   ...(kind.value === 'error' ? [{ key: 'statusCode', label: '状态', kind: 'status' as const }] : []),
   { key: 'createdAt', label: '时间', kind: 'datetime' },

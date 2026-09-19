@@ -788,6 +788,15 @@ pub(super) fn map_selection_error(error: CredentialSelectionError) -> ProviderEr
             ProviderErrorKind::NoEligibleAccount,
             UpstreamSendState::NotSent,
         ),
+        CredentialSelectionError::QuotaExhausted => provider_error(
+            ProviderErrorKind::QuotaExhausted,
+            UpstreamSendState::NotSent,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "All eligible accounts have exhausted their quota. Retry after quota resets or add an available account.",
+            Some("usage_limit_reached".to_owned()),
+            Some("usage_limit_reached".to_owned()),
+        )),
         CredentialSelectionError::InvalidCredential
         | CredentialSelectionError::Store
         | CredentialSelectionError::Coordinator

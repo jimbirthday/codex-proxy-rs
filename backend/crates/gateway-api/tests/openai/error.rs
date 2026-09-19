@@ -446,6 +446,27 @@ fn engine_provider_quota_exhaustion_should_use_the_retryable_capacity_contract()
     );
 }
 
+#[tokio::test]
+async fn locally_exhausted_account_pool_returns_official_usage_limit_contract() {
+    let error = EngineError::Provider(
+        ProviderError::new(
+            ProviderErrorKind::QuotaExhausted,
+            UpstreamSendState::NotSent,
+        )
+        .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+            "All eligible accounts have exhausted their quota.",
+            Some("usage_limit_reached".to_owned()),
+            Some("usage_limit_reached".to_owned()),
+        )),
+    );
+    let response = engine_error_response(&error);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"]["type"], "usage_limit_reached");
+    assert_eq!(body["error"]["code"], "usage_limit_reached");
+}
+
 #[test]
 fn engine_provider_timeout_and_cancellation_should_remain_distinct() {
     let timeout = EngineError::Provider(ProviderError::new(

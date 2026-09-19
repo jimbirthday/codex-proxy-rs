@@ -47,7 +47,7 @@ use gateway_core::routing::{
     RuntimeSnapshot, UpstreamModelId,
 };
 use gateway_core::task::{WorkerContribution, WorkerKind, WorkerRunnable};
-use provider_openai::config::{CodexWireProfileConfig, OpenAiConfig};
+use provider_openai::config::OpenAiConfig;
 use provider_openai::credential::{CodexCredentialCodec, ImportCodexOAuthCredential};
 use provider_openai::transport::profile::APPCAST_POLL_INTERVAL;
 use secrecy::SecretString;
@@ -325,9 +325,14 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
         baseline.release.as_ref().map(|release| release.status),
         Some(DesktopReleaseStatus::Unchecked)
     );
+    let selection = OpaqueProviderData::new(json!({
+        "client": "desktop", "platform": "macos", "versionMode": "fixed",
+        "codexVersion": "0.102.0", "desktopVersion": "1.2026.190", "desktopBuild": "19012345678",
+        "osVersion": "15.5.0", "arch": "arm64", "terminal": "xterm-256color"
+    }).as_object().unwrap().clone());
     let profile = admin
-        .configured_wire_profile(&config.config.initial_client_profile().unwrap())
-        .expect("imported fixed profile");
+        .configured_wire_profile(&selection)
+        .expect("managed fixed profile");
     assert_eq!(profile.version, "0.102.0");
     assert_eq!(profile.build, None);
     assert_eq!(profile.target.os_type, "Mac OS");
@@ -382,6 +387,34 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
     assert_eq!(fast_billing.multiplier_percent, 170);
     assert_eq!(fast_billing.standard_amount.amount.as_str(), "2.5");
     assert_eq!(fast_billing.total_amount.amount.as_str(), "4.25");
+}
+
+#[tokio::test]
+async fn openai_legacy_billing_should_not_infer_long_context_flag() {
+    let config = valid_config();
+    let bundle = provider_openai::initialize(config.config.clone(), provider_ports())
+        .await
+        .expect("OpenAI bundle");
+    let billing = bundle
+        .admin_provider()
+        .calculated_billing(&ProviderBillingInput {
+            upstream_model_id: "gpt-5.4".to_owned(),
+            service_tier: None,
+            input_tokens: Some(300_000),
+            output_tokens: Some(0),
+            cached_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            total: CurrencyCost {
+                currency: "USD".to_owned(),
+                amount: "1.5".parse().expect("stored total"),
+            },
+        })
+        .expect("legacy billing")
+        .expect("matching billing breakdown");
+
+    assert_eq!(billing.total_amount.amount.as_str(), "1.5");
+    assert_eq!(billing.input_price_per_million.amount.as_str(), "5");
+    assert!(!billing.long_context_billing_applied);
 }
 
 #[tokio::test]
@@ -916,6 +949,285 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
             .map(str::len),
         Some(292)
     );
+}
+
+#[tokio::test]
+async fn turn_state_smart_scheduling_prefers_exact_model_and_keeps_business_refresh() {
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let ids = ["acct_state_cold", "acct_state_ready"];
+    let (bundle, store) = turn_state_fixture(&base, &ids).await;
+    let ready = store.account(ids[1]).expect("ready account");
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(probe_response(200, Some('p')))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(4)
+        .mount(&base)
+        .await;
+    bundle
+        .admin_provider()
+        .probe_turn_state(
+            ready.id(),
+            &upstream_model("gpt-5.4"),
+            vec![probe_target("probe", &proxy)],
+            TurnStateSource::ManualProbe,
+        )
+        .await
+        .expect("probe state");
+
+    for index in 0..2 {
+        assert_eq!(
+            select_turn_state_business(
+                &bundle,
+                &ids,
+                "gpt-5.4",
+                &format!("req_state_priority_{index}"),
+                true
+            )
+            .await,
+            ids[1]
+        );
+    }
+    let mut other_model_accounts = BTreeSet::new();
+    for index in 0..2 {
+        other_model_accounts.insert(
+            select_turn_state_business(
+                &bundle,
+                &ids,
+                "gpt-other",
+                &format!("req_state_other_{index}"),
+                true,
+            )
+            .await,
+        );
+    }
+    assert_eq!(
+        other_model_accounts,
+        ids.map(str::to_owned).into_iter().collect()
+    );
+    let requests = base.received_requests().await.expect("business requests");
+    for request in &requests[..2] {
+        assert_eq!(
+            request
+                .headers
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok()),
+            Some("p".repeat(292).as_str())
+        );
+    }
+    for request in &requests[2..] {
+        assert!(!request.headers.contains_key("x-codex-turn-state"));
+    }
+    base.verify().await;
+    base.reset().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-codex-turn-state", "b".repeat(292))
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+        )
+        .expect(2)
+        .mount(&base)
+        .await;
+    for index in 0..2 {
+        assert_eq!(
+            select_turn_state_business(
+                &bundle,
+                &ids,
+                "gpt-5.4",
+                &format!("req_state_refresh_{index}"),
+                true
+            )
+            .await,
+            ids[1]
+        );
+    }
+    assert_eq!(
+        bundle
+            .admin_provider()
+            .turn_state_snapshot(ready.id(), &upstream_model("gpt-5.4"))
+            .expect("refreshed state")
+            .state_source,
+        Some(TurnStateSource::UpstreamResponse)
+    );
+    let requests = base.received_requests().await.expect("refreshed requests");
+    assert_eq!(
+        requests[1]
+            .headers
+            .get("x-codex-turn-state")
+            .and_then(|value| value.to_str().ok()),
+        Some("b".repeat(292).as_str())
+    );
+}
+
+#[tokio::test]
+async fn turn_state_smart_scheduling_falls_back_on_lease_busy_and_invalidated_state() {
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let ids = ["acct_state_cold", "acct_state_ready"];
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let (bundle, store) = turn_state_fixture_with_leases(&base, &ids, Arc::clone(&leases)).await;
+    let ready = store.account(ids[1]).expect("ready account");
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with(probe_response(200, Some('p')))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    bundle
+        .admin_provider()
+        .probe_turn_state(
+            ready.id(),
+            &upstream_model("gpt-5.4"),
+            vec![probe_target("probe", &proxy)],
+            TurnStateSource::ManualProbe,
+        )
+        .await
+        .expect("probe state");
+    let original = bundle
+        .admin_provider()
+        .turn_state_snapshot(ready.id(), &upstream_model("gpt-5.4"))
+        .expect("probe snapshot");
+    let completed = ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(COMPLETED_SESSION_SSE);
+    mount_turn_state_sequence(
+        &base,
+        Arc::new(Notify::new()),
+        vec![
+            completed.clone(),
+            probe_response(312, None),
+            completed.clone(),
+            completed,
+        ],
+    )
+    .await;
+    leases
+        .busy_accounts
+        .lock()
+        .expect("busy accounts")
+        .insert(ready.id().clone());
+    assert_eq!(
+        select_turn_state_business(&bundle, &ids, "gpt-5.4", "req_state_lease_busy", true).await,
+        ids[0]
+    );
+    let after_selection = bundle
+        .admin_provider()
+        .turn_state_snapshot(ready.id(), &upstream_model("gpt-5.4"))
+        .expect("unapplied state");
+    assert_eq!(after_selection.state_expires_at, original.state_expires_at);
+    assert!(after_selection.state_first_applied_at.is_none());
+    let attempts = leases
+        .requests
+        .lock()
+        .expect("lease attempts")
+        .iter()
+        .map(|request| request.account_id().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(attempts, [ids[1], ids[0]]);
+    leases.busy_accounts.lock().expect("busy accounts").clear();
+    assert_eq!(
+        select_turn_state_business(&bundle, &ids, "gpt-5.4", "req_state_312", false).await,
+        ids[1]
+    );
+    assert!(
+        !bundle
+            .admin_provider()
+            .turn_state_overview()
+            .iter()
+            .find(|entry| entry.account_id == ids[1])
+            .expect("invalidated state")
+            .state_available
+    );
+    let mut accounts = BTreeSet::new();
+    for index in 0..2 {
+        accounts.insert(
+            select_turn_state_business(
+                &bundle,
+                &ids,
+                "gpt-5.4",
+                &format!("req_state_invalidated_{index}"),
+                true,
+            )
+            .await,
+        );
+    }
+    assert_eq!(accounts, ids.map(str::to_owned).into_iter().collect());
+    let requests = base.received_requests().await.expect("business requests");
+    assert!(!requests[0].headers.contains_key("x-codex-turn-state"));
+    for request in &requests[2..] {
+        assert!(!request.headers.contains_key("x-codex-turn-state"));
+    }
+}
+
+async fn select_turn_state_business(
+    bundle: &provider_openai::ProviderBundle,
+    account_ids: &[&str],
+    model: &str,
+    request_id: &str,
+    expect_success: bool,
+) -> String {
+    let scope = Arc::new(FrozenAccountScope::new(
+        Arc::new(RuntimeAccountDirectory::new(
+            account_ids
+                .iter()
+                .map(|id| {
+                    (
+                        ProviderAccountId::new(*id).expect("account ID"),
+                        RuntimeAccount::new(
+                            ProviderKind::new("openai").expect("provider"),
+                            BTreeSet::new(),
+                        ),
+                    )
+                })
+                .collect(),
+        )),
+        ClientRoutingScope::all_accounts(),
+    ));
+    let payload = ProtocolPayload::json_object(
+        "openai",
+        Map::from_iter([
+            ("model".to_owned(), json!("client-model-alias")),
+            ("input".to_owned(), json!("state scheduling")),
+        ]),
+    )
+    .expect("payload")
+    .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+    let mut stream = bundle
+        .core_provider()
+        .execute(
+            initialized_provider_request_for_scope(
+                Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                Arc::clone(&scope),
+                model,
+            ),
+            initialized_attempt_context_for_scope(request_id, scope),
+        )
+        .await
+        .expect("prepare scheduled request");
+    let selected = stream.metadata().provider_account_id().to_string();
+    let mut failed = false;
+    while let Some(event) = stream.next().await {
+        if expect_success {
+            event.expect("business response");
+        } else {
+            failed |= event.is_err();
+        }
+    }
+    assert_eq!(!failed, expect_success);
+    selected
 }
 
 #[tokio::test]
@@ -3945,6 +4257,121 @@ async fn openai_admin_keeps_confirmed_exhaustion_separate_from_raw_usage_display
 }
 
 #[tokio::test]
+async fn openai_admin_preserves_expired_window_usage_and_exhaustion_attribution() {
+    for exhausted in [false, true] {
+        let store = Arc::new(MemoryAccountStore::default());
+        let account_id = "acct_admin_expired_window";
+        store
+            .seed_oauth_credential(ImportCodexOAuthCredential {
+                account_id: account_id.to_owned(),
+                name: "admin expired window".to_owned(),
+                secret: secret("admin-expired-window-access"),
+                verified_account: profile("chatgpt-admin-expired-window"),
+                next_refresh_at: Some(Utc::now() + chrono::Duration::minutes(30)),
+                enabled: true,
+            })
+            .await;
+        let account = store.account(account_id).expect("stored account");
+        let past_reset_at = Utc::now().timestamp() - 60;
+        let observed_at = SystemTime::now() - Duration::from_secs(300);
+        let weekly_used = if exhausted { 100.0 } else { 74.0 };
+        let state = if exhausted {
+            QuotaState::exhausted(
+                QuotaEvidence::ProviderDenied,
+                observed_at,
+                Some(SystemTime::UNIX_EPOCH + Duration::from_secs(past_reset_at as u64)),
+            )
+        } else {
+            QuotaState::allowed(observed_at)
+        };
+        store
+            .compare_and_swap_quota(QuotaObservation {
+                plan_type: None,
+                account_id: account.id().clone(),
+                expected_revision: account.revision(),
+                quota: OpaqueProviderData::new(
+                    json!({
+                        "rate_limit": {
+                            "allowed": !exhausted,
+                            "limit_reached": exhausted,
+                            "primary_window": {
+                                "used_percent": 15,
+                                "reset_at": past_reset_at + 18_000,
+                                "limit_window_seconds": 18_000,
+                            },
+                            "secondary_window": {
+                                "used_percent": weekly_used,
+                                "reset_at": past_reset_at,
+                                "limit_window_seconds": 604_800,
+                            }
+                        }
+                    })
+                    .as_object()
+                    .expect("quota object")
+                    .clone(),
+                ),
+                observed_at,
+                state,
+            })
+            .await
+            .expect("persist raw quota");
+
+        let config = valid_config();
+        let bundle = provider_openai::initialize(
+            config.config.clone(),
+            provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        )
+        .await
+        .expect("OpenAI bundle");
+        let mut projected = bundle
+            .admin_provider()
+            .quota(ProviderQuotaRequest {
+                account_id: account.id().clone(),
+                refresh: false,
+                rolling_usage: None,
+            })
+            .await
+            .expect("project quota");
+        assert_eq!(projected.limit_reached, exhausted);
+        // 账号接口还会归一化耗尽展示；过期周窗口不能把触顶错误转移到短期窗口。
+        projected.apply_limit_reached_display();
+        let primary = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(18_000))
+            .expect("primary");
+        let weekly = projected
+            .windows
+            .iter()
+            .find(|w| w.window_seconds == Some(604_800))
+            .expect("weekly");
+        assert_eq!(
+            (primary.used_percent, primary.limit_reached),
+            (Some(15.0), false)
+        );
+        assert_eq!(
+            (weekly.used_percent, weekly.limit_reached),
+            (Some(weekly_used), exhausted)
+        );
+        assert_eq!(
+            weekly.reset_at.map(|reset| reset.timestamp()),
+            Some(past_reset_at)
+        );
+        let raw = store
+            .get_quotas(std::slice::from_ref(account.id()))
+            .await
+            .expect("raw quota")
+            .pop()
+            .expect("observation");
+        assert_eq!(raw.observed_at, observed_at);
+        assert_eq!(
+            raw.quota.expose_to_provider()["rate_limit"]["secondary_window"]["used_percent"],
+            weekly_used
+        );
+    }
+}
+
+#[tokio::test]
 async fn openai_admin_provider_rejects_unprepared_mutations_before_store_commit() {
     let store = Arc::new(MemoryAccountStore::default());
     store
@@ -4090,6 +4517,18 @@ async fn turn_state_fixture(
     Arc<provider_openai::ProviderBundle>,
     Arc<MemoryAccountStore>,
 ) {
+    turn_state_fixture_with_leases(base, account_ids, Arc::new(TestLeaseCoordinator::default()))
+        .await
+}
+
+async fn turn_state_fixture_with_leases(
+    base: &MockServer,
+    account_ids: &[&str],
+    leases: Arc<TestLeaseCoordinator>,
+) -> (
+    Arc<provider_openai::ProviderBundle>,
+    Arc<MemoryAccountStore>,
+) {
     let store = Arc::new(MemoryAccountStore::default());
     for account_id in account_ids {
         store
@@ -4107,7 +4546,12 @@ async fn turn_state_fixture(
     config.config.api.base_url = base.uri();
     let bundle = provider_openai::initialize(
         config.config,
-        provider_ports_with(Arc::clone(&store), Arc::new(TestOAuthPending::default())),
+        provider_ports_with_catalog_and_leases(
+            Arc::clone(&store),
+            Arc::new(TestOAuthPending::default()),
+            Arc::new(TestCatalogCache::default()),
+            leases,
+        ),
     )
     .await
     .expect("turn state fixture");
@@ -4295,10 +4739,17 @@ fn initialized_provider_request_for_model(
     account_id: &str,
     model: &str,
 ) -> ProviderRequest {
+    initialized_provider_request_for_scope(operation, initialized_account_scope(account_id), model)
+}
+
+fn initialized_provider_request_for_scope(
+    operation: Operation,
+    account_scope: Arc<FrozenAccountScope>,
+    model: &str,
+) -> ProviderRequest {
     let provider = ProviderKind::new("openai").expect("provider");
     let upstream_model = UpstreamModelId::new(model).expect("upstream model");
     let public_model = PublicModelId::new(upstream_model.as_str()).expect("public model");
-    let account_scope = initialized_account_scope(account_id);
     let snapshot = RuntimeSnapshot::new(
         ConfigRevision::new(1).expect("revision"),
         account_policy(),
@@ -4325,6 +4776,13 @@ fn initialized_provider_request_for_model(
 }
 
 fn initialized_attempt_context(request_id: &str, account_id: &str) -> AttemptContext {
+    initialized_attempt_context_for_scope(request_id, initialized_account_scope(account_id))
+}
+
+fn initialized_attempt_context_for_scope(
+    request_id: &str,
+    account_scope: Arc<FrozenAccountScope>,
+) -> AttemptContext {
     AttemptContext::new(
         RequestAttemptContext::new(
             ModelRequestId::new(request_id).expect("request id"),
@@ -4333,8 +4791,7 @@ fn initialized_attempt_context(request_id: &str, account_id: &str) -> AttemptCon
         NonZeroU32::new(1).expect("attempt"),
         SystemTime::now() + Duration::from_secs(30),
         account_policy(),
-        AccountAttemptContext::new(BTreeSet::new(), None, None)
-            .with_account_scope(initialized_account_scope(account_id)),
+        AccountAttemptContext::new(BTreeSet::new(), None, None).with_account_scope(account_scope),
         None,
         CancellationToken::new(),
     )
@@ -4370,9 +4827,23 @@ fn provider_ports_with_catalog(
     pending: Arc<TestOAuthPending>,
     catalog_cache: Arc<TestCatalogCache>,
 ) -> ProviderStorePorts {
+    provider_ports_with_catalog_and_leases(
+        accounts,
+        pending,
+        catalog_cache,
+        Arc::new(TestLeaseCoordinator::default()),
+    )
+}
+
+fn provider_ports_with_catalog_and_leases(
+    accounts: Arc<MemoryAccountStore>,
+    pending: Arc<TestOAuthPending>,
+    catalog_cache: Arc<TestCatalogCache>,
+    leases: Arc<TestLeaseCoordinator>,
+) -> ProviderStorePorts {
     ProviderStorePorts::new(
         accounts,
-        Arc::new(TestLeaseCoordinator::default()),
+        leases,
         Arc::new(MemorySessionAffinity::default()),
         Arc::new(MemorySessionExclusions::default()),
         catalog_cache,
@@ -4423,21 +4894,6 @@ struct TestOpenAiConfig {
 
 fn valid_config() -> TestOpenAiConfig {
     let mut config = OpenAiConfig::default();
-    config.wire_profile = CodexWireProfileConfig {
-        originator: "Codex Desktop".to_owned(),
-        codex_version: "0.102.0".to_owned(),
-        desktop_version: "1.2026.190".to_owned(),
-        desktop_build: "19012345678".to_owned(),
-        os_type: "Mac OS".to_owned(),
-        os_version: "15.5.0".to_owned(),
-        arch: "arm64".to_owned(),
-        terminal: "xterm-256color".to_owned(),
-        residency: None,
-        verified_at: Utc
-            .with_ymd_and_hms(2026, 7, 19, 0, 0, 0)
-            .single()
-            .expect("valid test time"),
-    };
     let runtime = tempfile::tempdir().expect("test runtime directory");
     config
         .resolve_and_validate(&runtime.path().join("deploy"))

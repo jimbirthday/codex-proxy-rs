@@ -5,6 +5,28 @@ use serde_json::json;
 use super::{candidate, candidate_with_concurrency, context};
 
 #[test]
+fn selection_trace_should_explain_routing_state_preference_despite_lower_score() {
+    let mut candidates = [
+        candidate("acct_missing", 0, Some(10_000)),
+        candidate("acct_ready", 1, None),
+    ];
+    candidates[0].routing_state_ready = Some(false);
+    candidates[1].routing_state_ready = Some(true);
+    let context = context(RotationStrategy::Smart);
+    let trace = TraceContext::new("req_state_priority");
+    let selection = AccountSelector.select(&candidates, &context);
+    trace.account_selection(&candidates, &context, selection.as_ref());
+    let snapshot = trace.snapshot().expect("trace");
+    let data = &snapshot["events"][0]["data"];
+    assert_eq!(data["selectedAccountId"], "acct_ready");
+    assert_eq!(data["candidates"][0]["routingStateReady"], true);
+    assert_eq!(data["candidates"][1]["routingStateReady"], false);
+    assert!(
+        data["candidates"][0]["smartScore"].as_f64() < data["candidates"][1]["smartScore"].as_f64()
+    );
+}
+
+#[test]
 fn selection_trace_should_distinguish_load_quota_and_affinity() {
     let mut candidates = [
         candidate_with_concurrency("acct_74", 1, 10),

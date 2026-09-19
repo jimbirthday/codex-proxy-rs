@@ -1207,10 +1207,7 @@ fn native_continuation_surfaces_the_original_accounts_quota_status_to_the_coordi
         )
         .expect_err("the selector must surface the unavailable native account");
 
-    assert!(matches!(
-        error,
-        CredentialSelectionError::NoEligibleCredential
-    ));
+    assert!(matches!(error, CredentialSelectionError::QuotaExhausted));
 }
 
 #[test]
@@ -1279,10 +1276,7 @@ fn native_continuation_surfaces_the_original_accounts_quota_signal_to_the_coordi
         )
         .expect_err("the selector must surface the quota-limited native account");
 
-    assert!(matches!(
-        error,
-        CredentialSelectionError::NoEligibleCredential
-    ));
+    assert!(matches!(error, CredentialSelectionError::QuotaExhausted));
 }
 
 #[test]

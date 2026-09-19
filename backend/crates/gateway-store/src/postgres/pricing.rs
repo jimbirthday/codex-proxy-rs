@@ -15,6 +15,7 @@ pub(crate) fn encode_billing_snapshot(
 ) -> serde_json::Value {
     serde_json::json!({
         "version": 1,
+        "longContextBillingApplied": b.long_context_billing_applied(),
         "image": b.image().map(|image| serde_json::json!({
             "inputTokens": image.input_tokens, "cachedTokens": image.cached_tokens,
             "input": image.input_amount.amount().canonical(),
@@ -55,6 +56,11 @@ pub(crate) fn decode_billing_snapshot(
         })
     };
     Some(CalculatedBillingBreakdown {
+        // 旧快照未记录长上下文计费事实，不根据当前价格倒推历史标识。
+        long_context_billing_applied: value
+            .get("longContextBillingApplied")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
         image: match value.get("image").filter(|v| !v.is_null()) {
             Some(image) => {
                 let amount = |key| {

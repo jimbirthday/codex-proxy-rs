@@ -87,8 +87,72 @@ fn encoder_should_preserve_explicit_store_values() {
     }
 }
 
+#[test]
+fn encoder_should_convert_system_messages_to_developer_without_changing_content() {
+    let body = json!({
+        "model": "client-model",
+        "instructions": "Keep the existing instructions.",
+        "input": [
+            {
+                "type": "message",
+                "role": "system",
+                "content": "You are a pirate.",
+                "future_item_field": {"keep": true}
+            },
+            {
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": "Be concise.", "role": "system"}]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Say hello."}]
+            },
+            {"type": "message", "role": "developer", "content": "Existing guidance."},
+            {"role": "system", "content": "Shorthand message."},
+            {"type": "computer_screenshot", "role": "system"},
+            "opaque-item"
+        ],
+        "future_top_level_field": {"keep": true}
+    });
+    let encoded = encode_downstream_request(body);
+
+    assert_eq!(
+        Value::Object(encoded.body().clone()),
+        json!({
+            "model": "gpt-test",
+            "instructions": "Keep the existing instructions.",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": "You are a pirate.",
+                    "future_item_field": {"keep": true}
+                },
+                {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [{"type": "input_text", "text": "Be concise.", "role": "system"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Say hello."}]
+                },
+                {"type": "message", "role": "developer", "content": "Existing guidance."},
+                {"role": "system", "content": "Shorthand message."},
+                {"type": "computer_screenshot", "role": "system"},
+                "opaque-item"
+            ],
+            "store": false,
+            "future_top_level_field": {"keep": true}
+        })
+    );
+}
+
 #[tokio::test]
-async fn backend_http_should_send_default_store_for_downstream_request() {
+async fn backend_http_should_send_default_store_and_normalized_system_role() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind HTTP server");
@@ -105,7 +169,10 @@ async fn backend_http_should_send_default_store_for_downstream_request() {
         let body = zstd::stream::decode_all(&raw[head_end..]).expect("decode request body");
         serde_json::from_slice::<Value>(&body).expect("HTTP request JSON")
     });
-    let mut request = encode_downstream_request(json!({"model": "gpt-test", "input": "hello"}));
+    let mut request = encode_downstream_request(json!({
+        "model": "gpt-test",
+        "input": [{"type": "message", "role": "system", "content": "Be concise."}]
+    }));
     request.force_http_sse = true;
     let client = CodexBackendClient::new(
         reqwest::Client::builder()
@@ -127,13 +194,16 @@ async fn backend_http_should_send_default_store_for_downstream_request() {
     assert_eq!(
         server.await.expect("HTTP server task"),
         json!({
-            "model": "gpt-test", "input": "hello", "store": false, "stream": true
+            "model": "gpt-test",
+            "input": [{"type": "message", "role": "developer", "content": "Be concise."}],
+            "store": false,
+            "stream": true
         })
     );
 }
 
 #[tokio::test]
-async fn backend_websocket_should_send_default_store_for_downstream_request() {
+async fn backend_websocket_should_send_default_store_and_normalized_system_role() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind WebSocket server");
@@ -156,7 +226,10 @@ async fn backend_websocket_should_send_default_store_for_downstream_request() {
             .expect("send terminal event");
         body
     });
-    let mut request = encode_downstream_request(json!({"model": "gpt-test", "input": "hello"}));
+    let mut request = encode_downstream_request(json!({
+        "model": "gpt-test",
+        "input": [{"type": "message", "role": "system", "content": "Be concise."}]
+    }));
     request.use_websocket = true;
     let client = CodexBackendClient::new(
         reqwest::Client::builder()
@@ -178,6 +251,10 @@ async fn backend_websocket_should_send_default_store_for_downstream_request() {
 
     let body = server.await.expect("WebSocket server task");
     assert_eq!(body.get("store"), Some(&json!(false)));
+    assert_eq!(
+        body["input"],
+        json!([{"type": "message", "role": "developer", "content": "Be concise."}])
+    );
 }
 
 fn encode_downstream_request(body: Value) -> CodexResponsesRequest {

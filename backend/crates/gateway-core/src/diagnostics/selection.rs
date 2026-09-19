@@ -38,6 +38,7 @@ impl TraceContext {
                 json!({
                     "accountId": candidate.account.id().as_str(),
                     "weight": candidate.account.weight().get(),
+                    "routingStateReady": candidate.routing_state_ready,
                     "blocker": AccountSelector.scheduling_blocker(candidate, context)
                         .map(|blocker| format!("{blocker:?}")),
                     "inFlight": signals.in_flight,
