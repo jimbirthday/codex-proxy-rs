@@ -327,6 +327,7 @@ fn billing_should_price_grok_46_cache_and_priority_at_the_context_boundary() {
                 .to_owned()
         });
         assert_eq!(rates, expected);
+        assert_eq!(billing.long_context_billing_applied(), input >= 200_000);
     }
     assert!(grok_billing_breakdown_with_tier("grok-4.6", 10, 1, 0, Some("future")).is_none());
     let priority = grok_billing_breakdown_with_tier("grok-4.6", 100, 10, 20, Some("priority"))

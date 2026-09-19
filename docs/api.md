@@ -753,8 +753,10 @@ OAuth start 使用：
 - `GET /accounts/quota` 只读取最后一次落库快照；`POST /accounts/quota/refresh` 才访问上游。access token
   已过期时，额度刷新要求先走 credential 刷新或重新授权，不会拿过期 token 探测额度。
 - OpenAI 已耗尽账号每 30 分钟主动复核一次，也会在最早未恢复窗口的 `resetAt + 2 分钟` 到期后
-  提前复核。后台每 30 秒检查触发条件；同一重置边界复核后仍未恢复时回到 30 分钟重试，
-  避免旧 reset 持续触发请求。各窗口独立确认恢复，时间到期本身不会直接解除账号耗尽。
+  提前复核；周期复核不等待旧重置时间，因此也能发现官方提前重置。正常账号有非零用量或触顶窗口时，
+  在该窗口的 `resetAt + 2 分钟` 后主动复核。后台每 30 秒检查触发条件；同一重置边界复核后仍未更新时
+  回到 30 分钟重试，避免旧 reset 持续触发请求。各窗口独立确认恢复，时间到期本身不会直接解除账号
+  耗尽或将展示用量归零。
 - `POST /accounts/recover` 是管理员对本地事实的强制恢复：它清除 Redis cooldown 和已保存的额度/错误，
   把账号重新启用并恢复为可调度 credential；它不验证上游账号是否已经恢复，下一次真实请求仍可重新写入
   失败事实。
@@ -952,13 +954,14 @@ HTTP 请求头及新建 WS 的握手提示按当时的最终出站档位构造�
 | `POST` | `/api/admin/client-keys/delete` | `{ id }` | 删除 |
 
 创建字段为 `name`、可选 `label`、`groupIds`、`maxConcurrency`、`requestsPerMinute`、可选
-`dailyLimitUsd`、`weeklyLimitUsd`、`customKey` 和 `openaiClientProfileOverride`。更新请求携带 `id`，不接受 `customKey`。
+`dailyLimitUsd`、`weeklyLimitUsd`、`customKey`、`openaiClientProfileOverride` 和 `xaiClientProfileOverride`。更新请求携带 `id`，不接受 `customKey`。
 `groupIds` 必须显式提交：空数组派生 `routingScope: "all"`，非空数组派生
 `routingScope: "groups"`。响应同时返回分组引用 `groups`，以及从当前有效账号池派生、仅供展示的
 `providerKinds`。创建和 reveal 响应会返回完整明文 Key，调用方
 必须立即安全保存。
 
 `openaiClientProfileOverride` 为完整的 [OpenAI 客户端身份](#openai-上游客户端身份)对象或 `null`，列表也返回该字段。
+`xaiClientProfileOverride` 对应完整的 [xAI 客户端身份](#xai-上游客户端身份)，两者分别覆盖所属 Provider，列表同时返回。
 创建时省略或 `null` 表示跟随通用设置；更新时省略保留现值，显式 `null` 才清除覆盖。
 独立配置整体覆盖通用设置，不逐字段继承；切换全局配置不会影响独立 Key。
 
@@ -1029,6 +1032,8 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 | `GET` | `/api/admin/settings/client-downloads/codex-desktop/windows` | 提取 Codex Desktop Windows 离线安装直链；`refresh=true` 强制刷新进程内短缓存 |
 | `GET` | `/api/admin/settings/client-profiles/openai` | 读取六个预设、自动更新可用状态和 `globalConfiguration` |
 | `POST` | `/api/admin/settings/client-profiles/openai/preview` | body 为 `{ configuration }`，值为完整身份对象或 `null`（解析当前通用设置）；只预览，不保存 |
+| `GET` | `/api/admin/settings/client-profiles/xai` | 读取 Grok CLI 默认字段 `defaults` 和 `globalConfiguration` |
+| `POST` | `/api/admin/settings/client-profiles/xai/preview` | body 为 `{ configuration }`，值为完整 xAI 身份对象或 `null`（解析当前通用设置）；只预览，不保存 |
 | `GET` | `/api/admin/settings/admin-api-key` | 只返回管理 API Key 是否存在 |
 | `POST` | `/api/admin/settings/admin-api-key/delete` | 删除管理 API Key |
 | `POST` | `/api/admin/settings/admin-api-key/regenerate` | 重新生成并一次性返回完整管理 API Key |
@@ -1133,7 +1138,7 @@ models.dev 同步只导入可表示为当前文本 Token 计价的 OpenAI/xAI �
 ### OpenAI 上游客户端身份
 
 `openaiClientProfile` 保存通用选择，首次默认 `MacOS · Desktop · 自动最新`。
-设置更新省略该字段保留现值，不能提交 `null`。内置默认只用于初始化，不形成第三层运行时回退。
+设置更新省略该字段保留现值，不能提交 `null`。初始化不读取 YAML 身份字段；内置默认只用于初始化，不形成第三层运行时回退。
 该配置作用于 Client Key 的 OpenAI 模型请求与原生模型目录，适用于 HTTP/SSE、WebSocket、Images 和 Search。
 不改变 xAI、入站客户端版本门禁、账号认证或后台 Desktop 专属操作。
 
@@ -1165,6 +1170,32 @@ Windows/Linux 通过 ETag 检查更新，未变化时复用已核验版本；CLI
 
 配置在请求开始时冻结，Provider 首次解析的版本用于该请求的全部重试与换号。
 已建立 WebSocket 的精确续写沿用所属连接；新请求使用保存后的选择。
+
+### xAI 上游客户端身份
+
+`xaiClientProfile` 保存 Grok CLI 的通用身份选择；首次使用内置 `grok-shell / headless / linux / x86_64`
+并采用自动更新版本。初始化不读取 YAML 身份字段，数据库已有选择时不覆盖。
+更新设置省略该字段保留现值，不能提交 `null`。
+
+| 字段 | 取值与语义 |
+| --- | --- |
+| `versionMode` | 必填，`latest` 或 `fixed` |
+| `clientVersion` | `fixed` 必填 SemVer，最多 64 字节；`latest` 必须省略或为 `null` |
+| `clientIdentifier`、`clientMode`、`targetOs`、`targetArch` | 必填，各为 1～64 字节可见 ASCII，不含空白或控制字符 |
+
+```json
+{"versionMode":"latest","clientVersion":null,"clientIdentifier":"grok-shell","clientMode":"headless","targetOs":"linux","targetArch":"x86_64"}
+```
+
+配置作用于 Client Key 的 xAI 模型请求和压缩请求，影响 `x-grok-client-version`、`x-grok-client-identifier`、
+`x-grok-client-mode` 与 User-Agent；OAuth、后台目录和额度查询使用 Provider 内置官方画像。
+User-Agent 使用 `grok-shell/<版本> (<系统>; <架构>)`，其中 `arm64` 按官方规则展示为 `aarch64`。
+`clientIdentifier` 只控制对应请求头，不替换 User-Agent 中的 `grok-shell` 产品名。
+每个请求开始时解析并冻结身份，重试和换号沿用该身份；保存后新请求生效，密钥独立配置优先于通用设置。
+
+自动版本通过官方 npm 检查稳定版本，周期 24 小时；检查失败保留当前进程最近有效版本，重启以内置基线开始。
+固定版本不受后台更新影响。预览返回配置、来源、最终身份字段、`userAgent`、`versionSource`、`verifiedAt`、
+`checkedAt` 和 `error`；固定版本不附带官方核验时间。Dashboard 展示已保存的通用身份。
 
 ### 账号自动冻结
 
@@ -1367,9 +1398,14 @@ Provider metadata 分别保留 `requestedServiceTier` 与 `upstreamServiceTier` 
 原始 `response.service_tier` 不变。用量中的 Fast 仅表示发送档位，不能证明上游实际加速，本地费用
 估算也不能代替官方账单。档位与费用在请求记录生成时确定；查询不会回填历史档位或重算已存储费用。
 
+`/api/admin/usage/records` 与 `/api/admin/ops/errors` 的记录返回 `clientApiKeyName`，为关联 Key 的当前名称；
+Key 已删除或未关联时为 `null`，不影响记录返回，不包含密钥原文。
+
 本地计价使用[模型定价](#模型定价)的生效规则。缺少内置、同步及人工价格时不生成估价。新请求的本地
 费用明细、有效单价、服务档位与自定义倍率随终态记录持久化，后续改价和清除覆盖不重算历史明细。
-旧记录没有费用快照时仍按内置规则核对总额后补充拆分，核对失败只显示原总额。图像明细通过可选的
+旧记录没有费用快照时仍按内置规则核对总额后补充拆分，核对失败只显示原总额。
+`billing.longContextBillingApplied` 表示已应用长上下文价格区间，与服务档位、自定义倍率独立；
+旧费用快照未记录该事实或只有总额时返回 `false`，不按当前价格倒推历史标识。图像明细通过可选的
 `billing.image` 返回 `inputAmountDisplay`、`cacheReadAmountDisplay`、`inputPriceDisplay` 和
 `cacheReadPriceDisplay`；存在该字段时，普通输入与缓存字段仅表示文本输入，输出字段表示图像输出。
 

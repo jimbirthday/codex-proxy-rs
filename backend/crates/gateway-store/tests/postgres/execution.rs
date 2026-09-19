@@ -465,6 +465,7 @@ async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() 
         Some("default".to_owned()),
         100,
     )
+    .with_long_context_billing(true)
     .with_custom_multiplier(12500)
     .unwrap();
     let mut finalization = successful_core_finalization("req_billing_snapshot");
@@ -484,6 +485,7 @@ async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() 
     else {
         panic!("persisted billing breakdown must be restored without provider recalculation");
     };
+    assert!(saved.long_context_billing_applied);
     assert_eq!(saved.custom_multiplier_bps, 12500);
     assert_eq!(saved.total_amount.amount, "0.00075".parse().unwrap());
     sqlx::query("update runtime_settings set pricing_overrides_json = $1 where id = 1")
@@ -496,6 +498,18 @@ async fn billing_snapshot_survives_later_price_changes_and_usage_detail_reads() 
         .await
         .unwrap();
     assert_eq!(original.request.billing, after.request.billing);
+    sqlx::query("update model_requests set billing_snapshot_json = billing_snapshot_json - 'longContextBillingApplied' where id = 'req_billing_snapshot'")
+        .execute(&database.pool).await.unwrap();
+    let legacy = observation
+        .usage_record_detail("req_billing_snapshot")
+        .await
+        .unwrap();
+    let Some(admin_observability::UsageBilling::Calculated(legacy)) = legacy.request.billing else {
+        panic!("legacy billing snapshot must remain readable");
+    };
+    assert!(!legacy.long_context_billing_applied);
+    assert_eq!(legacy.total_amount, saved.total_amount);
+
     database.close().await;
 }
 

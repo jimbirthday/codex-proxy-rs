@@ -449,6 +449,7 @@ pub(crate) fn admin_usage_list_record(
     };
     let billing = restore_billing_snapshot(billing, record.billing_snapshot_json.as_ref());
     Ok(admin_observability::UsageListRecord {
+        client_api_key_name: record.client_api_key_name,
         id: record.id,
         endpoint: record.endpoint,
         client_transport: record.client_transport,
@@ -720,6 +721,7 @@ pub(crate) fn admin_ops_error_page(
 
 pub(crate) fn admin_ops_error(error: OpsErrorRecord) -> admin_observability::OpsError {
     admin_observability::OpsError {
+        client_api_key_name: error.client_api_key_name,
         source: error.source,
         event_id: error.event_id,
         request_id: error.request_id,
@@ -777,6 +779,7 @@ pub(crate) fn usage_list_record_from_row(
     row: &sqlx::postgres::PgRow,
 ) -> StoreResult<UsageListRecord> {
     Ok(UsageListRecord {
+        client_api_key_name: get(row, "client_api_key_name")?,
         billing_snapshot_json: get(row, "billing_snapshot_json")?,
         id: get(row, "id")?,
         endpoint: get(row, "endpoint")?,
@@ -912,6 +915,7 @@ pub(crate) fn usage_record_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<
 
 pub(crate) fn ops_error_from_row(row: &sqlx::postgres::PgRow) -> StoreResult<OpsErrorRecord> {
     Ok(OpsErrorRecord {
+        client_api_key_name: get(row, "client_api_key_name")?,
         source: get(row, "source")?,
         event_id: get(row, "event_id")?,
         request_id: get(row, "request_id")?,

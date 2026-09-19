@@ -129,6 +129,7 @@ fn billing_breakdown_should_apply_fast_and_flex_tiers_without_guessing_unknown_m
     assert_eq!(fast.total_amount().amount().scaled(), 350_000);
     assert_eq!(fast.service_tier(), Some("fast"));
     assert_eq!(fast.multiplier_percent(), 200);
+    assert!(!fast.long_context_billing_applied());
     assert_eq!(flex.total_amount().amount().scaled(), 87_500);
     assert_eq!(flex.multiplier_percent(), 50);
     assert!(openai_billing_breakdown("unknown-model", billing_usage(1, 1, 0, 0), None).is_none());
@@ -206,6 +207,14 @@ fn billing_breakdown_should_switch_only_after_the_long_context_threshold() {
         .expect("short-context boundary");
     let long = openai_billing_breakdown("gpt-5.4", billing_usage(272_001, 0, 0, 0), None)
         .expect("long-context pricing");
+
+    assert!(!boundary.long_context_billing_applied());
+    assert!(long.long_context_billing_applied());
+    assert!(
+        !openai_billing_breakdown("gpt-4o", billing_usage(272_001, 0, 0, 0), None)
+            .expect("model without long-context pricing")
+            .long_context_billing_applied()
+    );
 
     assert_eq!(
         boundary.input_price_per_million().amount().scaled(),
@@ -851,6 +860,7 @@ fn a_custom_long_priority_band_does_not_require_a_long_standard_band() {
     .unwrap();
     assert_eq!(result.total_amount().amount().canonical(), "2.4");
     assert_eq!(result.standard_amount().amount().canonical(), "0.6");
+    assert!(result.long_context_billing_applied());
 }
 
 #[test]
@@ -869,6 +879,7 @@ fn multiplier_only_preserves_builtin_tiers_and_unknown_models_remain_unknown() {
                 original.total_amount().amount().scaled() * 2
             );
             assert_eq!(adjusted.multiplier_percent(), original.multiplier_percent());
+            assert_eq!(adjusted.long_context_billing_applied(), input > 272_000);
         }
     }
     assert!(
