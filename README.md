@@ -76,6 +76,7 @@ INSTALL_DIR="$HOME/services/codex-proxy-rs" bash install.sh
 
 部署完成后，打开 `http://127.0.0.1:8080`，使用 `admin@cpr.local` 和管理员密码登录。
 API Key 持有者可在同一登录页切换登录身份，进入 `/key-usage` 查看自己的用量、趋势、请求日志、额度与健康时间线；不能访问管理员页面。
+页面右上角的「密钥配置」支持复制 Codex 配置文件和导入 CCSwitch。
 
 默认地址只能在服务器本机访问。从其他设备使用时，需要配置
 [HTTPS 反向代理](deploy/README.md#公网访问)。

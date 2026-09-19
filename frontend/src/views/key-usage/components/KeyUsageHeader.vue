@@ -1,15 +1,16 @@
 <script setup lang="ts">
-import { LogOut, Moon, RefreshCw, Sun } from '@lucide/vue'
+import { KeyRound, LogOut, Moon, RefreshCw, Sun, Terminal } from '@lucide/vue'
 import { shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import { useAuthStore } from '@/stores/modules/auth'
 import { useThemeStore } from '@/stores/modules/theme'
 
-defineProps<{ name?: string, prefix?: string, refreshing: boolean }>()
-defineEmits<{ refresh: [] }>()
+defineProps<{ name?: string, prefix?: string, refreshing: boolean, configuring: boolean }>()
+defineEmits<{ refresh: [], configure: [] }>()
 const period = defineModel<string>('period', { required: true })
 const refreshInterval = defineModel<string>('refreshInterval', { required: true })
 const auth = useAuthStore()
@@ -32,11 +33,22 @@ async function logout() {
 <template>
   <BasePageHeader title="使用统计">
     <template #description>
-      <span class="truncate leading-none">{{ name || '当前 API Key' }}</span>
-      <span v-if="prefix" class="shrink-0 font-mono text-cp-sm leading-none text-cp-text-tertiary">{{ prefix }}…</span>
+      <span class="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1.5">
+        <span class="min-w-0 truncate text-cp font-semibold text-cp-text" :title="name">
+          {{ name || '当前密钥' }}
+        </span>
+        <span v-if="prefix" class="inline-flex shrink-0 items-center gap-1.5 rounded-cp-sm bg-cp-fill-tertiary px-2 py-0.5 text-cp-text-secondary" aria-label="密钥前缀">
+          <KeyRound class="size-3" aria-hidden="true" />
+          <code class="font-mono text-cp-xs leading-4 font-normal">{{ prefix }}…</code>
+        </span>
+      </span>
     </template>
     <template #actions>
-      <div class="flex max-w-[calc(100vw-32px)] items-center justify-end gap-2">
+      <div class="flex max-w-[calc(100vw-32px)] flex-wrap items-center justify-end gap-2">
+        <BaseButton variant="secondary" :loading="configuring" @click="$emit('configure')">
+          <Terminal class="size-4" />
+          密钥配置
+        </BaseButton>
         <BaseSelect v-model="period" aria-label="统计时间范围" class="w-29" :options="[{ label: '今天', value: 'today' }, { label: '近 7 天', value: '7d' }, { label: '近 30 天', value: '30d' }]" />
         <BaseSelect v-model="refreshInterval" aria-label="自动刷新频率" class="w-30" :options="[{ label: '30 秒刷新', value: '30' }, { label: '60 秒刷新', value: '60' }, { label: '暂停刷新', value: '0' }]" />
         <BaseIconButton label="刷新用量" variant="secondary" :loading="refreshing" @click="$emit('refresh')">

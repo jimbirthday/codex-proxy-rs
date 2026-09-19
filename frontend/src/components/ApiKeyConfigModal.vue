@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { Apple, Copy, Monitor } from '@lucide/vue'
+import { Apple, Copy, Monitor, Upload } from '@lucide/vue'
 import { computed, shallowRef } from 'vue'
 
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -8,18 +8,20 @@ import BaseModal from '@/components/base/BaseModal/index.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import BaseSegmented from '@/components/base/BaseSegmented.vue'
 import BaseSwitch from '@/components/base/BaseSwitch.vue'
+import { buildCodexCcSwitchImportDeeplink } from '@/utils/ccswitchImport'
 import {
   buildCodexConfigFiles,
   CODEX_WEBSOCKET_ENABLED_BY_DEFAULT,
-} from '../utils/codexConfig'
+} from '@/utils/codexConfig'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
+  title?: string
   apiKey: {
     name?: string
     key?: string
   } | null
   apiBaseUrl: string
-}>()
+}>(), { title: '使用密钥' })
 
 const emit = defineEmits<{
   copy: [text: string]
@@ -54,12 +56,23 @@ const visibleFiles = computed(() => [
   { path: configPath.value, content: codexConfigFiles.value.configToml, scrollbarHeight: '360px' },
   { path: authPath.value, content: codexConfigFiles.value.authJson, scrollbarHeight: undefined },
 ])
+
+function importToCcs() {
+  if (!keyValue.value)
+    return
+  window.location.href = buildCodexCcSwitchImportDeeplink({
+    apiKey: keyValue.value,
+    baseUrl: props.apiBaseUrl,
+    providerName: props.apiKey?.name || 'codex-proxy-rs',
+    websocketEnabled: websocketEnabled.value,
+  })
+}
 </script>
 
 <template>
   <BaseModal
     v-model="open"
-    title="使用密钥"
+    :title="title"
     description="将下方内容保存或合并到对应文件，保存后重新启动 Codex"
     size="lg"
   >
@@ -75,10 +88,6 @@ const visibleFiles = computed(() => [
           :width="56"
         />
       </div>
-
-      <p class="text-cp-sm text-cp-text-secondary">
-        配置含密钥，请勿分享，覆盖前请备份
-      </p>
 
       <div class="flex flex-col gap-3">
         <section
@@ -117,6 +126,10 @@ const visibleFiles = computed(() => [
     </div>
 
     <template #footer>
+      <BaseButton variant="secondary" :disabled="!keyValue" @click="importToCcs">
+        <Upload class="size-4" />
+        导入 CCSwitch
+      </BaseButton>
       <BaseButton variant="primary" @click="open = false">
         关闭
       </BaseButton>

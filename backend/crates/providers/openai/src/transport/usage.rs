@@ -513,8 +513,10 @@ fn openai_billing_breakdown_with_context(
     let pricing = model_pricing(model);
     let normalized_tier = normalize_service_tier(service_tier);
     let tier = pricing_tier(normalized_tier.as_deref())?;
-    let standard_rates = effective_rates(pricing, custom, PricingTier::Standard, long_context)?;
-    let selected_rates = effective_rates(pricing, custom, tier, long_context)?;
+    let (standard_rates, _) =
+        effective_rates(pricing, custom, PricingTier::Standard, long_context)?;
+    let (selected_rates, long_context_billing_applied) =
+        effective_rates(pricing, custom, tier, long_context)?;
     let cache_write_percent = pricing.map_or(0, |pricing| pricing.cache_write_percent);
     let mut standard = token_amounts(
         standard_rates,
@@ -556,6 +558,7 @@ fn openai_billing_breakdown_with_context(
         Some(normalized_tier.unwrap_or_else(|| "default".to_owned())),
         multiplier_percent,
     )
+    .with_long_context_billing(long_context_billing_applied)
     .with_custom_multiplier(custom.map_or(10_000, |pricing| pricing.multiplier_bps))
 }
 
@@ -564,7 +567,7 @@ fn effective_rates(
     custom: Option<&gateway_core::metering::ModelPriceOverride>,
     tier: PricingTier,
     long_context: bool,
-) -> Option<TokenRates> {
+) -> Option<(TokenRates, bool)> {
     let long_band = match tier {
         PricingTier::Standard => "long_standard",
         PricingTier::Fast => "long_fast",
@@ -582,15 +585,22 @@ fn effective_rates(
         (PricingTier::Flex, true) => "long_flex",
     };
     if let Some(rates) = custom.and_then(|p| p.bands.get(band)) {
-        return Some(TokenRates {
-            input_ticks: rates.input.ticks_per_token(),
-            output_ticks: rates.output.ticks_per_token(),
-            cache_read_ticks: rates.cache_read.ticks_per_token(),
-            cache_write_ticks: Some(rates.cache_write.ticks_per_token()),
-            explicit_cache: true,
-        });
+        return Some((
+            TokenRates {
+                input_ticks: rates.input.ticks_per_token(),
+                output_ticks: rates.output.ticks_per_token(),
+                cache_read_ticks: rates.cache_read.ticks_per_token(),
+                cache_write_ticks: Some(rates.cache_write.ticks_per_token()),
+                explicit_cache: true,
+            },
+            uses_long,
+        ));
     }
-    default?.rates(tier, long_context)
+    let default = default?;
+    Some((
+        default.rates(tier, long_context)?,
+        long_context && default.long_standard.is_configured(),
+    ))
 }
 
 pub(crate) fn pricing_catalog()

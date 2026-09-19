@@ -10,7 +10,7 @@ Codex Proxy RS 是单进程、单副本运行的多 Provider AI 网关，同时�
 
 - 面向客户端的 OpenAI Responses、Images、standalone Search 和模型目录协议；
 - 面向管理员的 `/api/admin/*` 控制面和 Vue 管理端；
-- 面向 Key 持有者的 `/api/key-usage/*` 只读用量接口和独立 `/key-usage` 页面；
+- 面向 Key 持有者的 `/api/key-usage/*` 用量与客户端配置接口和独立 `/key-usage` 页面；
 - OpenAI 与 xAI 两个编译期 Provider；
 - PostgreSQL 持久化、Redis 协调状态以及 S3/R2 数据库备份。
 
@@ -226,13 +226,15 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 - xAI 是翻译边界。Provider 把 Grok wire 转换为 Responses wire；上游结构化错误的 message/code/type
   可以透出，但账号指纹会先脱敏。
 - response ID 是不透明 UTF-8 bytes，不假设 UUID、固定长度或跨 Provider 可复用。
-- OpenAI 用户身份选择由 PostgreSQL 保存，Core 在 `FrozenAccountScope` 中按 Key 整体覆盖通用选择，
+- OpenAI 与 xAI 用户身份选择由 PostgreSQL 保存，Core 在 `FrozenAccountScope` 中按 Key 整体覆盖通用选择，
   以 Provider-owned 不透明对象沿路由计划传递；执行会话复用首次解析结果，使重试不受发布更新影响。
-  OpenAI Provider 唯一负责预设、校验、版本来源及 UA 生成，Admin 提供管理和生效预览。
-  官方发布资料与用户选择分开：Redis 按 Provider、客户端、平台、架构隔离可重建版本缓存，
+  各 Provider 唯一负责默认值、校验、版本来源及 UA 生成，Admin 提供管理和生效预览。
+  首次初始化只写入内置默认选择；YAML 不定义客户端身份，也不作为数据库初始化或请求解析的来源。
+  官方发布资料与用户选择分开：OpenAI 在 Redis 按 Provider、客户端、平台、架构隔离可重建版本缓存，
   Desktop 完整制品元组原子更新，固定配置不被刷新覆盖。普通连接按已有身份键匹配，精确续写保留原连接。
   后台账号和 Desktop 专属操作使用独立官方 Desktop 画像，不接受 Key 覆盖。
-  xAI 仍以启动配置为基线检查官方版本；两者均不回写 `config.yaml`。
+  xAI 以内置画像为版本检查基线，在进程内更新 Grok CLI 发布资料；模型与压缩请求使用已保存的用户选择，
+  OAuth、后台目录和额度查询使用内置官方画像。两者均不回写 `config.yaml`。
 
 xAI Provider 负责 Codex custom 工具与 Grok function 工具的双向转换，保持工具类型、item ID 与
 `call_id` 配对；超限或转换失败终止流。默认 `store: false` 的续接由现有会话 owner 重放完整历史；
@@ -385,7 +387,9 @@ AuthService 每次恢复 Key 会话时重新检查 Key 是否存在且启用；K
 事务提交后旧管理员会话的指纹失配，不依赖 Redis 批量删除完成撤销；原始密码及密码哈希不进入 Redis。
 KeyUsageService 从 AuthService 的服务端身份确定唯一查询范围，复用 ClientKeyStore 的额度账本投影和
 ObservabilityStore 的范围查询；API 只输出单页所需的字段白名单，不复用管理员的宽响应。
-前端 `/key-usage` 独立于管理布局，不挂载管理员菜单或请求管理接口。
+客户端配置通过 ClientKeyStore 显式读取当前会话绑定 Key 的明文，不进入用量响应。
+前端 `/key-usage` 独立于管理布局，不挂载管理员菜单或请求管理接口；配置弹窗和 Codex / CCSwitch
+配置生成逻辑与管理端共用，明文仅在打开弹窗时获取，关闭后清除，不持久化到浏览器。
 
 ## 6. 路由、账号范围与 continuation
 

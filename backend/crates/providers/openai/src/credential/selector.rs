@@ -609,10 +609,25 @@ impl CodexCredentialSelector {
                         })?;
                         continue 'capacity;
                     }
+                    // 只判断本次账号范围；空池、认证失效和租约失败不能伪装成额度耗尽。
+                    // 使用最初的排除集合，避免本轮临时跳过的繁忙账号丢失其可恢复语义。
+                    let mut statuses = candidates
+                        .iter()
+                        .filter(|candidate| !base_excluded.contains(candidate.account.id()))
+                        .map(|candidate| {
+                            candidate
+                                .account
+                                .status_projection(context.now, candidate.signals.cooldown)
+                                .status
+                        });
+                    let quota_exhausted = !diagnostic
+                        && statuses.next() == Some(AccountStatus::QuotaExhausted)
+                        && statuses.all(|status| status == AccountStatus::QuotaExhausted);
                     return match shortest_retry {
                         Some(retry_after) => Err(CredentialSelectionError::CapacityUnavailable {
                             retry_after: Some(retry_after),
                         }),
+                        None if quota_exhausted => Err(CredentialSelectionError::QuotaExhausted),
                         None => Err(CredentialSelectionError::NoEligibleCredential),
                     };
                 };
@@ -1479,6 +1494,8 @@ pub enum CredentialSelectionError {
     QueueRejected(#[from] QueueRejection),
     #[error("no eligible Codex account")]
     NoEligibleCredential,
+    #[error("all eligible Codex accounts have exhausted their quota")]
+    QuotaExhausted,
     #[error("Codex account capacity is unavailable")]
     CapacityUnavailable { retry_after: Option<Duration> },
     #[error("Codex account data is invalid")]

@@ -8,13 +8,14 @@ export interface CodexCcSwitchImportInput {
   apiKey: string
   baseUrl: string
   providerName: string
+  websocketEnabled?: boolean
 }
 
 export function buildCodexCcSwitchImportDeeplink(input: CodexCcSwitchImportInput): string {
   const configFiles = buildCodexConfigFiles({
     apiKey: input.apiKey,
     baseUrl: input.baseUrl,
-    websocketEnabled: CODEX_WEBSOCKET_ENABLED_BY_DEFAULT,
+    websocketEnabled: input.websocketEnabled ?? CODEX_WEBSOCKET_ENABLED_BY_DEFAULT,
   })
   // 与界面共用原生生图配置；保留 auth 载荷和独立字段，兼容旧版 CCSwitch。
   const config = encodeBase64(JSON.stringify({

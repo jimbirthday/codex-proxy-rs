@@ -204,6 +204,7 @@ pub trait ProviderAdmin: Send + Sync {
     }
 
     /// 使用 Provider-owned 价格规则恢复持久请求的逐项费用。
+    /// 未保存的长上下文计费标记不得从当前价格反推。
     fn calculated_billing(
         &self,
         input: &ProviderBillingInput,

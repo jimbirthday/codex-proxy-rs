@@ -40,6 +40,15 @@ withDefaults(
     :loading="loading"
     :empty-text="emptyText"
   >
+    <template #clientApiKeyName="{ displayValue }">
+      <span
+        class="block max-w-full truncate font-mono text-cp-sm leading-none font-bold text-cp-text"
+        :title="String(displayValue)"
+      >
+        {{ displayValue }}
+      </span>
+    </template>
+
     <template #provider="{ row }">
       <ProviderIconGroup
         :provider="String(row.provider || '')"

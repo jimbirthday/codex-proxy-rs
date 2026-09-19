@@ -10,6 +10,7 @@ use crate::{
     model::{
         AdminError, AdminErrorKind,
         auth::SessionSubject,
+        client_keys::ClientKeySecret,
         key_usage::{
             KeyUsageOverview, KeyUsageQuery, KeyUsageRecordKind, KeyUsageRecords,
             KeyUsageRecordsQuery,
@@ -26,6 +27,9 @@ use super::{map_store_error, observability::health_timeline_at};
 
 #[async_trait]
 pub trait KeyUsageService: Send + Sync {
+    async fn config(&self, session_id: Option<&str>)
+    -> Result<Option<ClientKeySecret>, AdminError>;
+
     async fn overview(
         &self,
         session_id: Option<&str>,
@@ -85,6 +89,21 @@ fn usage_filter(id: &ClientApiKeyId, model: Option<String>) -> UsageFilter {
 
 #[async_trait]
 impl KeyUsageService for DefaultKeyUsageService {
+    async fn config(
+        &self,
+        session_id: Option<&str>,
+    ) -> Result<Option<ClientKeySecret>, AdminError> {
+        let Some(id) = self.key_id(session_id).await? else {
+            return Ok(None);
+        };
+        // 明文只按服务端会话绑定的 Key 读取，禁用或删除后不再提供配置。
+        self.keys
+            .reveal_client_key(&id)
+            .await
+            .map(|secret| secret.filter(|secret| secret.record.enabled))
+            .map_err(|error| map_store_error(error, "key usage config"))
+    }
+
     async fn overview(
         &self,
         session_id: Option<&str>,

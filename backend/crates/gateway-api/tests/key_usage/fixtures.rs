@@ -18,6 +18,7 @@ pub(super) async fn fixture() -> AdminTestFixture {
     let now = Utc::now();
     *fixture.client_key.lock().unwrap() = Some(ClientKeyRecord {
         openai_client_profile_override: None,
+        xai_client_profile_override: None,
         id: ClientApiKeyId::new("key-42").unwrap(),
         name: "Development".to_owned(),
         label: Some("private-sentinel".to_owned()),
@@ -90,6 +91,7 @@ pub(super) async fn fixture() -> AdminTestFixture {
 
 fn usage_record() -> UsageListRecord {
     UsageListRecord {
+        client_api_key_name: Some("Production".to_owned()),
         id: "req-visible".to_owned(),
         endpoint: "/v1/responses".to_owned(),
         client_transport: "http_sse".to_owned(),
@@ -146,6 +148,7 @@ fn usage_record() -> UsageListRecord {
 
 fn error_record() -> OpsError {
     OpsError {
+        client_api_key_name: Some("Production".to_owned()),
         source: "private-sentinel".to_owned(),
         event_id: "error-visible".to_owned(),
         request_id: Some("private-sentinel".to_owned()),

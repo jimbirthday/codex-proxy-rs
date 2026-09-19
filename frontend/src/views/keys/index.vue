@@ -2,6 +2,7 @@
 import type { ApiKey } from '@/api'
 import { ref, shallowRef, watch } from 'vue'
 
+import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
 import BaseConfirmModal from '@/components/base/BaseConfirmModal.vue'
@@ -20,7 +21,6 @@ import ApiKeyIdentityCell from './components/ApiKeyIdentityCell.vue'
 import ApiKeyPrefixCell from './components/ApiKeyPrefixCell.vue'
 import ApiKeyScopeCell from './components/ApiKeyScopeCell.vue'
 import ApiKeyStatusBadge from './components/ApiKeyStatusBadge.vue'
-import ApiKeyUseModal from './components/ApiKeyUseModal.vue'
 import { useApiKeyMutations } from './composables/useApiKeyMutations'
 import { useApiKeysQuery } from './composables/useApiKeysQuery'
 import { useApiKeyUse } from './composables/useApiKeyUse'
@@ -171,13 +171,13 @@ watch(
             </template>
             <template #limits="{ row }">
               <dl class="m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1 text-xs tabular-nums">
-                <dt class="text-cp-text-tertiary">
+                <dt class="text-right text-cp-text-tertiary">
                   并发
                 </dt>
                 <dd class="m-0 truncate text-cp-text" :title="String(row.maxConcurrency || '∞')">
                   {{ row.maxConcurrency || '∞' }}
                 </dd>
-                <dt class="text-cp-text-tertiary">
+                <dt class="text-right text-cp-text-tertiary">
                   RPM
                 </dt>
                 <dd class="m-0 truncate text-cp-text" :title="String(row.requestsPerMinute || '∞')">
@@ -236,7 +236,7 @@ watch(
       @reset="loadApiKeys"
     />
 
-    <ApiKeyUseModal
+    <ApiKeyConfigModal
       v-model="showUseKeyModal"
       :api-key="selectedUseKey"
       :api-base-url="openAiBaseUrl"

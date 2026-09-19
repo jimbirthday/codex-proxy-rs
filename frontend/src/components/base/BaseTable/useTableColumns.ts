@@ -2,12 +2,14 @@ import type { MaybeRefOrGetter } from 'vue'
 import type { BaseTableColumn, TableRow } from './columns'
 import { useStorage } from '@vueuse/core'
 import { computed, toValue } from 'vue'
+import { resolveColumns } from './columns'
 
 export interface TableColumnOption {
   key: string
   label: string
   visible: boolean
   disabled: boolean
+  reorderable: boolean
 }
 
 function readVisibility(value: string): Record<string, boolean> {
@@ -20,6 +22,18 @@ function readVisibility(value: string): Record<string, boolean> {
     // 损坏的本地偏好回退到列定义，不影响表格展示。
   }
   return {}
+}
+
+function readOrder(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value)
+    if (Array.isArray(parsed))
+      return [...new Set(parsed.filter((key): key is string => typeof key === 'string'))]
+  }
+  catch {
+    // 顺序偏好损坏时回退到列定义，保留独立存储的显隐偏好。
+  }
+  return []
 }
 
 export function useTableColumns<Row extends TableRow>(
@@ -37,9 +51,30 @@ export function useTableColumns<Row extends TableRow>(
       serializer: { read: readVisibility, write: JSON.stringify },
     },
   )
+  const order = useStorage<string[]>(
+    `codex-proxy:table-column-order:${tableId}`,
+    [],
+    undefined,
+    {
+      shallow: true,
+      writeDefaults: false,
+      serializer: { read: readOrder, write: JSON.stringify },
+    },
+  )
+
+  const orderedColumns = computed(() => {
+    const columns = resolveColumns(toValue(source))
+    const ranks = new Map(order.value.map((key, index) => [key, index]))
+    const movable = columns.filter(column => column.label && !column.sticky)
+      .sort((a, b) => (ranks.get(a.key) ?? Number.MAX_SAFE_INTEGER) - (ranks.get(b.key) ?? Number.MAX_SAFE_INTEGER))
+
+    // 固定列保留原位；新增列沿用定义顺序，接在用户已排序的普通列之后。
+    let index = 0
+    return columns.map(column => column.label && !column.sticky ? movable[index++]! : column)
+  })
 
   const columnStates = computed(() => {
-    const states = toValue(source).map((column) => {
+    const states = orderedColumns.value.map((column) => {
       const override = overrides.value[column.key]
       return {
         column,
@@ -59,6 +94,7 @@ export function useTableColumns<Row extends TableRow>(
       label: column.label!,
       visible,
       disabled: column.hideable === false || (visible && visibleColumns.value.length === 1),
+      reorderable: !column.sticky,
     })))
 
   function setColumnVisible(key: string, visible: boolean) {
@@ -74,9 +110,15 @@ export function useTableColumns<Row extends TableRow>(
     overrides.value = next
   }
 
-  function resetColumns() {
-    overrides.value = {}
+  function setColumnOrder(keys: string[]) {
+    const movable = new Set(columnOptions.value.filter(option => option.reorderable).map(option => option.key))
+    order.value = [...new Set(keys.filter(key => movable.has(key)))]
   }
 
-  return { visibleColumns, columnOptions, setColumnVisible, resetColumns }
+  function resetColumns() {
+    overrides.value = {}
+    order.value = []
+  }
+
+  return { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns }
 }

@@ -56,6 +56,7 @@ pub struct CostCoverageView {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BillingView {
+    pub long_context_billing_applied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image: Option<ImageBillingView>,
     pub input_amount_display: String,
@@ -85,6 +86,7 @@ pub struct ImageBillingView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageListRecordView {
+    pub client_api_key_name: Option<String>,
     pub id: String,
     pub provider: Option<String>,
     pub authentication_kind: Option<String>,
@@ -773,6 +775,7 @@ pub struct DiagnosticsView {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpsErrorView {
+    pub client_api_key_name: Option<String>,
     pub id: String,
     pub request_id: Option<String>,
     pub client_api_key_id: Option<String>,

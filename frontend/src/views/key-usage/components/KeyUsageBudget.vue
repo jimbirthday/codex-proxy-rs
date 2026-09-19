@@ -33,7 +33,7 @@ const windows = computed(() => [
           </div>
           <div>
             <div class="grid grid-cols-[repeat(20,minmax(0,1fr))] gap-0.75" :aria-label="window.limited ? `已用 ${window.percentage.toFixed(1)}%` : '不限额'">
-              <span v-for="block in 20" :key="block" class="h-5 rounded-xs" :class="block <= Math.ceil(Math.min(100, window.percentage) / 5) ? (window.percentage >= 100 ? 'bg-cp-error' : 'bg-cp-success') : 'bg-cp-fill-secondary'" />
+              <span v-for="block in 20" :key="block" class="h-7 rounded-xs" :class="block <= Math.ceil(Math.min(100, window.percentage) / 5) ? (window.percentage >= 100 ? 'bg-cp-error' : 'bg-cp-success') : 'bg-cp-fill-secondary'" />
             </div>
             <div class="mt-2 flex justify-between gap-2 font-mono text-cp-xs text-cp-text-secondary">
               <span>已用 {{ money(window.used) }}</span><span v-if="window.limited">{{ window.percentage.toFixed(1) }}%</span>

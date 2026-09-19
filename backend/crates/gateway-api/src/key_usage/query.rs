@@ -12,6 +12,10 @@ use serde::Deserialize;
 use crate::admin::AdminError;
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConfigQuery {}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(super) struct OverviewQuery {
     start_time: String,

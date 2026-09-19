@@ -33,6 +33,7 @@ export interface UsageCostCoverage {
 }
 
 export interface UsageBilling {
+  longContextBillingApplied: boolean
   image?: {
     inputAmountDisplay: string
     cacheReadAmountDisplay: string
@@ -74,6 +75,7 @@ export interface UsageRecordMetadata {
 }
 
 export interface UsageListRecord {
+  clientApiKeyName: string | null
   id: string
   provider: string | null
   authenticationKind: string | null
@@ -260,6 +262,7 @@ export interface OpsErrorMetadata {
 }
 
 export interface OpsError {
+  clientApiKeyName: string | null
   id: string
   requestId: string | null
   clientApiKeyId: string | null

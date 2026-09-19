@@ -23,7 +23,7 @@ import { useUsageTimeRange } from './composables/useUsageTimeRange'
 import { usageRecordColumns, usageTimeRangeOptions } from './constants'
 
 const recordView = shallowRef('success')
-const { visibleColumns, columnOptions, setColumnVisible, resetColumns } = useTableColumns(usageRecordColumns, 'usage-records')
+const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(usageRecordColumns, 'usage-records')
 const recordViewOptions = [
   { label: '成功记录', value: 'success' },
   { label: '错误排查', value: 'errors' },
@@ -117,6 +117,7 @@ watch(timeRange, () => {
               <BaseTableColumnSettings
                 :options="columnOptions"
                 @change="setColumnVisible"
+                @reorder="setColumnOrder"
                 @reset="resetColumns"
               />
             </template>

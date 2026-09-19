@@ -831,6 +831,8 @@ impl ProviderAdmin for OpenAiAdminProvider {
             return Ok(None);
         }
         Ok(Some(CalculatedBillingBreakdown {
+            // 历史总额只能核对费用拆分，不能证明当时保存过长上下文标记。
+            long_context_billing_applied: false,
             image: None,
             custom_multiplier_bps: breakdown.custom_multiplier_bps(),
             input_amount: currency_cost(breakdown.input_amount())?,

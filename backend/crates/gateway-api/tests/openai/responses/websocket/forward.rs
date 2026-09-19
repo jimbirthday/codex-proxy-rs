@@ -521,3 +521,20 @@ async fn initial_quota_recovery_delivers_client_projection_instead_of_upstream_s
     assert_eq!(error["headers"]["x-request-id"], "req-quota-rejected");
     assert!(error["headers"].get("retry-after").is_none());
 }
+
+#[tokio::test]
+async fn locally_exhausted_account_pool_sends_one_official_usage_limit_error() {
+    let provider = ProviderError::new(
+        ProviderErrorKind::QuotaExhausted,
+        UpstreamSendState::NotSent,
+    )
+    .with_client_visible_upstream_error(ClientVisibleUpstreamError::new(
+        "All eligible accounts have exhausted their quota.",
+        Some("usage_limit_reached".to_owned()),
+        Some("usage_limit_reached".to_owned()),
+    ));
+    let error = initial_error(EngineError::Provider(provider), Vec::new()).await;
+    assert_eq!(error["status"], 429);
+    assert_eq!(error["error"]["type"], "usage_limit_reached");
+    assert_eq!(error["error"]["code"], "usage_limit_reached");
+}

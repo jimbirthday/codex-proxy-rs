@@ -1305,6 +1305,130 @@ async fn generate_without_an_eligible_openai_account_fails_before_network_io() {
     assert_eq!(error.send_state(), UpstreamSendState::NotSent);
 }
 
+async fn exhaust_account_quota(store: &Arc<MemoryAccountStore>, account_id: &str) {
+    let account = store.account(account_id).expect("test account");
+    store
+        .apply_quota_access(QuotaAccessChange {
+            account_id: account.id().clone(),
+            expected_revision: account.revision(),
+            state: QuotaState::exhausted(QuotaEvidence::UsageLimitReached, SystemTime::now(), None),
+        })
+        .await
+        .expect("exhaust account quota");
+}
+
+#[tokio::test]
+async fn exhausted_account_pool_returns_usage_limit_before_http_or_websocket_network_io() {
+    let store = Arc::new(MemoryAccountStore::default());
+    for id in ["acct_provider_contract", "acct_scope_new"] {
+        create_account(&store, id).await;
+        exhaust_account_quota(&store, id).await;
+    }
+    // 范围外的可用账号不能掩盖当前 Client Key 的额度耗尽。
+    create_account(&store, "acct_outside_scope").await;
+    let server = MockServer::start().await;
+    let provider = provider_with_base_url(&store, server.uri());
+    for operation in [http_generate_operation(), generate_operation()] {
+        let Err(error) = provider
+            .execute(
+                planned_request("openai", operation),
+                context("req_exhausted_pool", CancellationToken::new()),
+            )
+            .await
+        else {
+            panic!("exhausted pool must fail before opening an upstream stream");
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::QuotaExhausted);
+        assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+        assert_eq!(error.upstream_status(), None);
+        let detail = error.client_visible_upstream_error().expect("quota detail");
+        assert_eq!(detail.error_type(), Some("usage_limit_reached"));
+        assert_eq!(detail.code(), Some("usage_limit_reached"));
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn exhausted_account_pool_does_not_mask_a_remaining_healthy_account() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    exhaust_account_quota(&store, "acct_provider_contract").await;
+    create_account(&store, "acct_scope_new").await;
+    let server = MockServer::start().await;
+    let stream = provider_with_base_url(&store, server.uri())
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            context("req_partial_exhaustion", CancellationToken::new()),
+        )
+        .await
+        .expect("remaining account is selected");
+    assert_eq!(
+        stream.metadata().provider_account_id().as_str(),
+        "acct_scope_new"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn exhausted_account_pool_classification_preserves_other_unavailability_causes() {
+    for enabled in [true, false] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account_with_enabled(&store, "acct_provider_contract", enabled).await;
+        exhaust_account_quota(&store, "acct_provider_contract").await;
+        if enabled {
+            create_account(&store, "acct_scope_new").await;
+            let account = store.account("acct_scope_new").expect("test account");
+            store
+                .apply_state_change(gateway_core::account::AccountStateChange {
+                    account_id: account.id().clone(),
+                    expected_revision: account.revision(),
+                    credential_state: CredentialState::Expired,
+                    observed_at: SystemTime::now(),
+                    error_reason: None,
+                    message: None,
+                })
+                .await
+                .expect("expire other account");
+        }
+        let Err(error) = provider(&store)
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context("req_mixed_unavailability", CancellationToken::new()),
+            )
+            .await
+        else {
+            panic!("unavailable accounts cannot execute");
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
+    }
+}
+
+#[tokio::test]
+async fn exhausted_pinned_account_keeps_quota_cause_for_native_continuation_recovery() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    exhaust_account_quota(&store, "acct_provider_contract").await;
+    create_account(&store, "acct_scope_new").await;
+    let Err(error) = provider(&store)
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            pinned_continuation_context(
+                "req_exhausted_pin",
+                "acct_provider_contract",
+                "client-previous",
+                "upstream-previous",
+                1,
+                ContinuationAttempt::Native,
+            ),
+        )
+        .await
+    else {
+        panic!("native continuation cannot use the other account before recovery");
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::QuotaExhausted);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+}
+
 #[tokio::test]
 async fn image_endpoints_bypass_only_the_text_catalog_and_preserve_the_current_codex_wire() {
     let store = Arc::new(MemoryAccountStore::default());

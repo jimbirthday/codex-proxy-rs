@@ -110,8 +110,8 @@ const { allSelected, indeterminate, selectedRowKeys, toggleSelection, toggleAll 
                     Fast 已关闭
                   </span>
                 </div>
-                <span class="truncate text-cp-xs font-emphasis text-cp-text-quaternary">
-                  {{ row.description || '未填写描述' }}
+                <span v-if="row.description" class="truncate text-cp-xs font-emphasis text-cp-text-quaternary">
+                  {{ row.description }}
                 </span>
               </div>
             </template>

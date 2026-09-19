@@ -773,6 +773,7 @@ impl SettingsStore for FixtureSettingsStore {
     async fn load_runtime_settings(&self) -> AdminStoreResult<RuntimeSettings> {
         Ok(RuntimeSettings {
             openai_client_profile: None,
+            xai_client_profile: None,
             request_location_enabled: false,
             request_location: Default::default(),
             config_revision: Revision::new(1).expect("revision"),
@@ -870,6 +871,7 @@ fn total_record(
     now: DateTime<Utc>,
 ) -> UsageListRecord {
     UsageListRecord {
+        client_api_key_name: Some("Production".to_owned()),
         id: id.to_owned(),
         endpoint: "/v1/responses".to_owned(),
         client_transport: "http_sse".to_owned(),
