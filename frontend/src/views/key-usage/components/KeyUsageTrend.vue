@@ -3,6 +3,7 @@ import type { EChartsOption, LineSeriesOption } from 'echarts'
 import type { KeyUsageTrendPoint } from '@/api/modules/key-usage'
 import { computed } from 'vue'
 import BaseCard from '@/components/base/BaseCard.vue'
+import BaseEmpty from '@/components/base/BaseEmpty.vue'
 import BaseChart from '@/components/charts/BaseChart.vue'
 import { chartTooltipStyle } from '@/components/charts/tooltip'
 import { useChartPalette } from '@/composables/useChartPalette'
@@ -67,8 +68,11 @@ const option = computed<EChartsOption>(() => {
 <template>
   <BaseCard title="使用趋势" description="用量随时间的变化">
     <BaseChart v-if="points.some(point => point.requests > 0)" :option="option" :height="285" />
-    <div v-else class="grid h-71 place-items-center text-cp-sm text-cp-text-tertiary">
-      所选时间内暂无请求
-    </div>
+    <BaseEmpty
+      v-else
+      title="所选时间内暂无请求"
+      surface="none"
+      class="h-71 place-content-center"
+    />
   </BaseCard>
 </template>
