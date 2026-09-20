@@ -93,7 +93,7 @@ async function handleKeydown(event: KeyboardEvent, index: number) {
 
 <template>
   <div
-    class="relative inline-grid items-center rounded-cp bg-cp-fill-tertiary p-0.75"
+    class="relative inline-grid items-center rounded-cp bg-[var(--cp-input-bg)] p-0.75"
     :class="rootClasses[size]"
     :style="gridStyle"
     role="radiogroup"

@@ -99,20 +99,22 @@ onMounted(() => props.allowInherit && void load())
 
 <template>
   <div class="grid min-w-0 gap-4">
+    <div v-if="allowInherit" class="flex flex-wrap items-center justify-between gap-3">
+      <BaseSegmented
+        v-model="source"
+        label="xAI 客户端身份来源"
+        class="shrink-0"
+        :options="[{ label: '全局配置', value: 'global' }, { label: '独立配置', value: 'independent' }]"
+        :disabled="disabled || !globalConfiguration"
+      />
+      <slot name="source-extra" />
+    </div>
     <div v-if="loadError" role="alert" class="flex items-center justify-between gap-3 text-cp text-cp-error">
       <span>全局配置加载失败：{{ loadError }}</span>
       <BaseButton size="sm" @click="load">
         重试
       </BaseButton>
     </div>
-    <BaseSegmented
-      v-if="allowInherit"
-      v-model="source"
-      label="xAI 客户端身份来源"
-      class="justify-self-start"
-      :options="[{ label: '全局配置', value: 'global' }, { label: '独立配置', value: 'independent' }]"
-      :disabled="disabled || !globalConfiguration"
-    />
     <template v-if="model">
       <div class="grid gap-4 sm:grid-cols-2">
         <BaseFormItem label="客户端类型">
