@@ -2,6 +2,7 @@
 import type { AccountRow } from '../constants'
 import { KeyRound, MoreHorizontal, Pencil, RefreshCw, RotateCcw, Trash2, Wifi } from '@lucide/vue'
 
+import BaseButton from '@/components/base/BaseButton.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BaseMenuItem from '@/components/base/BaseMenuItem.vue'
 import BasePopover from '@/components/base/BasePopover.vue'
@@ -12,6 +13,7 @@ defineProps<{
   recovering: boolean
   refreshing: boolean
   testing: boolean
+  mobile?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -25,8 +27,17 @@ const emit = defineEmits<{
 </script>
 
 <template>
-  <div class="relative flex items-center justify-start gap-1">
+  <div class="relative flex items-center justify-start" :class="mobile ? 'gap-2 [&>button]:min-h-11' : 'gap-1'">
+    <template v-if="mobile">
+      <BaseButton class="flex-1 px-2!" @click="emit('edit', account)">
+        <Pencil class="size-4" /> 编辑
+      </BaseButton>
+      <BaseButton class="flex-1 px-2!" :loading="testing" @click="emit('test', account)">
+        测试连接
+      </BaseButton>
+    </template>
     <BaseIconButton
+      v-else
       variant="ghost"
       size="sm"
       label="编辑账号"
@@ -36,6 +47,7 @@ const emit = defineEmits<{
     </BaseIconButton>
 
     <BaseIconButton
+      v-if="!mobile"
       variant="ghost"
       size="sm"
       label="删除账号"
@@ -47,14 +59,18 @@ const emit = defineEmits<{
 
     <BasePopover placement="bottom-end">
       <template #trigger="{ open }">
-        <BaseIconButton variant="ghost" size="sm" label="更多操作" :pressed="open">
+        <BaseButton v-if="mobile" class="min-h-11 px-3!" :aria-expanded="open" aria-label="更多账号操作">
+          更多 <MoreHorizontal class="size-4" />
+        </BaseButton>
+        <BaseIconButton v-else variant="ghost" size="sm" label="更多操作" :pressed="open">
           <MoreHorizontal class="size-4" />
         </BaseIconButton>
       </template>
 
       <template #default="{ close }">
-        <div class="w-40 p-1.5">
+        <div class="w-44 p-1.5" :class="mobile ? '[&>button]:min-h-11' : undefined">
           <BaseMenuItem
+            v-if="!mobile"
             :loading="testing"
             :disabled="testing"
             @click.stop="(close(), emit('test', account))"
@@ -93,6 +109,12 @@ const emit = defineEmits<{
               <RotateCcw class="size-3.5 text-cp-text-quaternary" />
             </template>
             恢复状态
+          </BaseMenuItem>
+          <BaseMenuItem v-if="mobile" :disabled="deleting" @click.stop="(close(), emit('delete', account))">
+            <template #icon>
+              <Trash2 class="size-4 text-cp-error-text" />
+            </template>
+            删除账号
           </BaseMenuItem>
         </div>
       </template>

@@ -116,7 +116,7 @@ const groupOptions = computed(() => [
         导出选中 ({{ selectedCount }})
       </BaseButton>
       <div
-        class="col-span-2 flex min-w-0 items-center justify-end gap-2"
+        class="col-span-2 flex min-w-0 flex-wrap items-center justify-end gap-2"
         :class="selectedCount > 0 ? 'w-full xl:w-auto' : 'justify-self-end'"
       >
         <BaseButton v-if="hasImportTasks" variant="secondary" class="whitespace-nowrap" @click="emit('importTasks')">

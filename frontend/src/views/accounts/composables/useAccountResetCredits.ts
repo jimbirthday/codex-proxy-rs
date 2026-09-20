@@ -1,5 +1,5 @@
 import type { Account, AccountResetCredit } from '@/api'
-import { computed, shallowReactive, shallowRef, watch } from 'vue'
+import { computed, readonly, shallowReactive, shallowRef, watch } from 'vue'
 import {
   consumeAccountResetCredit,
   getAccountResetCredits,
@@ -32,6 +32,8 @@ interface ResetCreditsSession {
   loading: boolean
   loadError: string
   loadSequence: number
+  loadPromise?: Promise<void>
+  checkedAt: number
   loadController?: AbortController
   accountUpdatedListeners: Set<(account: Account) => void>
 }
@@ -50,6 +52,7 @@ function getResetCreditsSession(accountId: string) {
       loading: false,
       loadError: '',
       loadSequence: 0,
+      checkedAt: 0,
       accountUpdatedListeners: new Set(),
     })
     sessionsByAccountId.set(accountId, session)
@@ -57,7 +60,24 @@ function getResetCreditsSession(accountId: string) {
   return session
 }
 
-async function loadSessionCredits(session: ResetCreditsSession, silent = false) {
+function loadSessionCredits(session: ResetCreditsSession, silent = false) {
+  // 列表和展开详情共享一次查询，避免互相取消或重复请求上游。
+  if (session.loading && session.loadPromise)
+    return session.loadPromise
+  session.loadPromise = fetchSessionCredits(session, silent)
+  return session.loadPromise
+}
+
+export function accountResetCreditsSummary(accountId: string) {
+  return readonly(getResetCreditsSession(accountId))
+}
+
+export function loadAccountResetCreditsSummary(accountId: string) {
+  const session = getResetCreditsSession(accountId)
+  return session.consuming ? Promise.resolve() : loadSessionCredits(session, true)
+}
+
+async function fetchSessionCredits(session: ResetCreditsSession, silent = false) {
   const sequence = ++session.loadSequence
   session.loadController?.abort()
   const controller = new AbortController()
@@ -78,8 +98,10 @@ async function loadSessionCredits(session: ResetCreditsSession, silent = false) 
       session.loadError = errorMessage(error)
   }
   finally {
-    if (sequence === session.loadSequence)
+    if (sequence === session.loadSequence) {
       session.loading = false
+      session.checkedAt = Date.now()
+    }
   }
 }
 

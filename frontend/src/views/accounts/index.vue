@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ChevronDown } from '@lucide/vue'
-import { ref } from 'vue'
+import { useMediaQuery } from '@vueuse/core'
+import { computed, ref } from 'vue'
 
 import AccountGroupMarks from '@/components/AccountGroupMarks.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
@@ -21,6 +22,8 @@ import AccountEditModal from './components/AccountEditModal.vue'
 import AccountFilters from './components/AccountFilters.vue'
 import AccountIdentityCell from './components/AccountIdentityCell.vue'
 import AccountImportTasks from './components/AccountImportTasks/index.vue'
+import AccountListDetails from './components/AccountListDetails.vue'
+import AccountMobileList from './components/AccountMobileList.vue'
 import AccountOverviewCards from './components/AccountOverviewCards.vue'
 import AccountPlanBadge from './components/AccountPlanBadge.vue'
 import AccountQuotaPanel from './components/AccountQuotaPanel/index.vue'
@@ -32,13 +35,16 @@ import { useAccountBatchEditor } from './composables/useAccountBatchEditor'
 import { useAccountConnectionTest } from './composables/useAccountConnectionTest'
 import { useAccountEditor } from './composables/useAccountEditor'
 import { useAccountImportTasks } from './composables/useAccountImportTasks'
+import { useAccountListDetails } from './composables/useAccountListDetails'
 import { useAccountMutations } from './composables/useAccountMutations'
 import { useAccountsQuery } from './composables/useAccountsQuery'
 import { useAccountsTable } from './composables/useAccountsTable'
 import { accountColumns, derivedAccountStatus } from './constants'
 
 const selectedIds = ref<Set<string>>(new Set())
+const desktop = useMediaQuery('(min-width: 1280px)')
 const { visibleColumns, columnOptions, setColumnVisible, setColumnOrder, resetColumns } = useTableColumns(accountColumns, 'accounts')
+const visibleColumnKeys = computed(() => new Set(visibleColumns.value.map(column => column.key)))
 const {
   loading,
   accounts,
@@ -56,6 +62,7 @@ const {
   handlePageSizeChange,
   handleSortChange,
 } = useAccountsQuery()
+const { details: listDetails, refresh: refreshListDetails } = useAccountListDetails(accounts)
 
 const {
   groups,
@@ -199,7 +206,7 @@ const {
     <AccountOverviewCards :summary="accountSummary" />
 
     <BaseCard
-      class="mt-4 flex flex-col xl:h-[calc(100dvh-250px)] xl:min-h-125"
+      class="mt-4 flex flex-col p-3! sm:p-5.5! xl:h-[calc(100dvh-250px)] xl:min-h-125"
     >
       <template #header>
         <AccountFilters
@@ -222,6 +229,7 @@ const {
         >
           <template #actions>
             <BaseTableColumnSettings
+              v-if="desktop"
               :options="columnOptions"
               @change="setColumnVisible"
               @reorder="setColumnOrder"
@@ -234,7 +242,8 @@ const {
       <template #body>
         <div class="flex min-h-0 flex-col xl:h-full">
           <BaseTable
-            class="h-100! min-h-100 flex-none [--cp-table-row-height:72px] xl:h-auto! xl:min-h-0 xl:flex-1"
+            v-if="desktop"
+            class="min-h-0 flex-1 [--cp-table-row-height:140px]"
             :columns="visibleColumns"
             :rows="accounts"
             :loading="loading"
@@ -276,7 +285,24 @@ const {
             </template>
 
             <template #identity="{ row }">
-              <AccountIdentityCell :account="row" show-notes />
+              <div class="grid gap-2 py-2">
+                <AccountIdentityCell :account="row" show-notes />
+                <div class="flex flex-wrap items-center gap-2 pl-12">
+                  <ProviderIconGroup v-if="!visibleColumnKeys.has('provider')" :provider="row.provider" :authentication-kind="row.authenticationKind" />
+                  <AccountPlanBadge v-if="!visibleColumnKeys.has('planType')" :authentication-kind="row.authenticationKind" :plan-type="row.planType" :plan-type-display="row.planTypeDisplay" />
+                  <AccountStatusBadge
+                    v-if="!visibleColumnKeys.has('status')"
+                    :status="row.status"
+                    :error-reason="row.errorReason"
+                    :error-message="row.errorMessage"
+                    :rate-limited-until="row.quota.rateLimitedUntil"
+                    :rate-limit-reason="row.quota.rateLimitReason"
+                    :recovery-probe-required="row.quota.recoveryProbeRequired"
+                    :next-refresh-at="row.nextRefreshAt"
+                  />
+                  <AccountGroupMarks v-if="!visibleColumnKeys.has('groups') && row.groups.length" :groups="row.groups" />
+                </div>
+              </div>
             </template>
 
             <template #provider="{ row }">
@@ -304,6 +330,10 @@ const {
 
             <template #usage="{ row }">
               <AccountQuotaSummaryCell :account="row" />
+            </template>
+
+            <template #lifecycle="{ row }">
+              <AccountListDetails :account="row" :details="listDetails.get(row.id)" @refresh="refreshListDetails(row)" />
             </template>
 
             <template #groups="{ row }">
@@ -347,6 +377,49 @@ const {
               </div>
             </template>
           </BaseTable>
+          <AccountMobileList
+            v-else
+            :accounts="accounts"
+            :loading="loading"
+            :selected-ids="selectedIds"
+            :expanded-ids="expandedAccountIds"
+            :all-selected="allSelected"
+            :indeterminate="indeterminate"
+            :sort="sort"
+            @select="toggleSelection"
+            @select-all="toggleAll"
+            @expand="toggleExpanded"
+            @sort-change="handleSortChange"
+          >
+            <template #details="{ row }">
+              <AccountListDetails :account="row" :details="listDetails.get(row.id)" @refresh="refreshListDetails(row)" />
+            </template>
+            <template #actions="{ row }">
+              <AccountTableActions
+                mobile
+                :account="row"
+                :deleting="deletingAccount"
+                :recovering="recoveringAccountIds.has(row.id)"
+                :refreshing="refreshingAccountIds.has(row.id)"
+                :testing="testingConnectionIds.has(row.id)"
+                @edit="openAccountEdit"
+                @delete="requestDeleteAccount"
+                @recover="handleRecover"
+                @refresh="handleRefresh"
+                @reauthorize="openReauthorizeAccount"
+                @test="openConnectionTest"
+              />
+            </template>
+            <template #expanded="{ row }">
+              <AccountQuotaPanel
+                :account="row"
+                :refreshing="refreshingQuotaAccountIds.has(row.id)"
+                @account-updated="void replaceAccount($event)"
+                @refresh-quota="handleRefreshQuota"
+              />
+              <AccountUsagePanel :account="row" @account-updated="void replaceAccount($event)" />
+            </template>
+          </AccountMobileList>
           <BaseTablePagination
             :pagination="accountPagination"
             :loading="loading"

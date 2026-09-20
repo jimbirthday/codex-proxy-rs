@@ -25,7 +25,7 @@ export const accountColumns = defineTableColumns<AccountRow>([
     hideable: false,
     label: '账号',
     kind: 'identity',
-    size: '3xl',
+    size: '2xl',
     sortable: 'email',
   },
   {
@@ -33,19 +33,22 @@ export const accountColumns = defineTableColumns<AccountRow>([
     label: '平台/类型',
     kind: 'meta',
     size: 'md',
+    defaultHidden: true,
     align: 'center',
     format: value => accountProviderLabel(typeof value === 'string' ? value : null),
   },
-  { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true },
-  { key: 'planType', label: '套餐', kind: 'status', sortable: true },
-  { key: 'usage', label: '用量', kind: 'custom', size: '2xl', sortable: true },
-  { key: 'groups', label: '账号分组', kind: 'status' },
+  { key: 'status', label: '状态', kind: 'status', align: 'left', sortable: true, defaultHidden: true },
+  { key: 'planType', label: '套餐', kind: 'status', sortable: true, defaultHidden: true },
+  { key: 'usage', label: '用量', kind: 'custom', size: 'xl', sortable: true },
+  { key: 'lifecycle', label: '额度与到期', kind: 'custom', size: '3xl' },
+  { key: 'groups', label: '账号分组', kind: 'status', defaultHidden: true },
   {
     key: 'lastUsedAt',
     label: '最后使用',
     kind: 'datetime',
     sortable: true,
     emptyText: '',
+    defaultHidden: true,
   },
   {
     key: 'accessTokenExpiresAtDisplay',
@@ -54,8 +57,9 @@ export const accountColumns = defineTableColumns<AccountRow>([
     sortable: 'expiresAt',
     format: value => optionalAccountCell(value),
     emptyText: '',
+    defaultHidden: true,
   },
-  { key: 'actions', label: '操作', kind: 'actions', size: 'lg', hideable: false },
+  { key: 'actions', label: '操作', kind: 'actions', size: 'md', hideable: false },
 ])
 
 export const statusLabels: Record<AccountStatus, string> = {
