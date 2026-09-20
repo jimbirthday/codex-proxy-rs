@@ -1339,12 +1339,8 @@ pub(super) fn map_upstream_failure(
         ),
         error_message: failure.client_message,
         cyber_policy_failure,
-        // 仅上游明确返回的容量/服务不可用计数；本地连接保护也会映射为
-        // Unavailable，不能用通用 ProviderErrorKind 推断容量证据。
-        upstream_capacity_failure: matches!(
-            category,
-            CodexFailureCategory::CapacityUnavailable | CodexFailureCategory::Unavailable
-        ),
+        // 普通 5xx 与未知流内错误不足以证明容量拒绝，不能用于冻结账号。
+        upstream_capacity_failure: capacity_unavailable,
         set_cookie_headers: failure.set_cookie_headers,
         rate_limit_headers: failure.rate_limit_headers,
         observation,

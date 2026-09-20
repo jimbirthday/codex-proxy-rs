@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { Github } from '@boxicons/vue'
 import { ExternalLink } from '@lucide/vue'
-import { storeToRefs } from 'pinia'
 import { computed } from 'vue'
 
 import BaseModal from '@/components/base/BaseModal/index.vue'
-import { useSystemUpdateStore } from '@/stores/modules/system-update'
+
+const props = defineProps<{
+  version: { version: string, gitSha: string } | null
+}>()
 
 const open = defineModel<boolean>({ default: false })
-
-const { version } = storeToRefs(useSystemUpdateStore())
 
 const author = 'Zyy'
 const githubUrl = 'https://github.com/zyycn/codex-proxy-rs'
@@ -25,11 +25,11 @@ function normalizeBuildValue(value: string | undefined) {
 }
 
 const versionDisplay = computed(() => {
-  const versionText = normalizeBuildValue(version.value?.version).replace(/^v/i, '')
+  const versionText = normalizeBuildValue(props.version?.version).replace(/^v/i, '')
   return versionText ? `v${versionText}` : ''
 })
 const gitShaDisplay = computed(() => {
-  const gitSha = normalizeBuildValue(version.value?.gitSha)
+  const gitSha = normalizeBuildValue(props.version?.gitSha)
   return gitSha ? gitSha.slice(0, 8) : ''
 })
 

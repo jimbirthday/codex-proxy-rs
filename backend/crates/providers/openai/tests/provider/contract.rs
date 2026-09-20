@@ -6327,14 +6327,16 @@ fn provider_with_capacity_tracking(
 }
 
 #[tokio::test]
-async fn capacity_feedback_counts_business_rejections_but_excludes_diagnostic_probes() {
+async fn capacity_feedback_only_counts_overload_rejections_and_excludes_diagnostic_probes() {
     use gateway_core::provider_ports::ProviderCooldownPort as _;
 
     for websocket in [false, true] {
-        for (status, code) in [
-            (429, "slow_down"),
-            (503, "server_is_overloaded"),
-            (500, "server_error"),
+        for (status, code, capacity) in [
+            (429, "slow_down", true),
+            (503, "server_is_overloaded", true),
+            (500, "server_error", false),
+            (502, "server_error", false),
+            (503, "service_unavailable_error", false),
         ] {
             for diagnostic in [false, true] {
                 let store = Arc::new(MemoryAccountStore::default());
@@ -6398,8 +6400,11 @@ async fn capacity_feedback_counts_business_rejections_but_excludes_diagnostic_pr
                         "unexpected upstream error: {error:?}"
                     );
                     let after = cooldowns.capacity_evidence(account.id());
-                    if diagnostic {
-                        assert_eq!(after, before, "probe must preserve capacity count and peak");
+                    if diagnostic || !capacity {
+                        assert_eq!(
+                            after, before,
+                            "only explicit overload from ordinary requests may change capacity evidence: {status}/{code}"
+                        );
                     } else {
                         assert_eq!(
                             after.map(|(count, _)| count),
@@ -6498,23 +6503,66 @@ async fn websocket_usage_limit_rejection_preserves_quota_state_for_account_rotat
 }
 
 #[tokio::test]
-async fn capacity_stream_rejection_only_retries_before_semantic_output_on_both_transports() {
-    for (use_websocket, code) in [
-        (false, "server_is_overloaded"),
-        (true, "server_is_overloaded"),
-        (false, "slow_down"),
-        (true, "slow_down"),
-    ] {
+async fn capacity_feedback_in_stream_only_counts_explicit_overload() {
+    use gateway_core::provider_ports::{ProviderCooldownKind, ProviderCooldownPort as _};
+
+    for (use_websocket, (code, message, expected_kind, scored)) in
+        [false, true].into_iter().flat_map(|websocket| {
+            [
+                (
+                    "server_is_overloaded",
+                    "Selected model is at capacity. Please try a different model.",
+                    ProviderErrorKind::UpstreamCapacityUnavailable,
+                    true,
+                ),
+                (
+                    "slow_down",
+                    "slow_down",
+                    ProviderErrorKind::UpstreamCapacityUnavailable,
+                    true,
+                ),
+                (
+                    "invalid_prompt",
+                    "Invalid prompt: we've limited access to this content for safety reasons.",
+                    ProviderErrorKind::InvalidRequest,
+                    false,
+                ),
+                (
+                    "server_error",
+                    "An internal server error occurred.",
+                    ProviderErrorKind::Unavailable,
+                    true,
+                ),
+                (
+                    "unknown_error",
+                    "Unrecognized upstream failure.",
+                    ProviderErrorKind::Unavailable,
+                    false,
+                ),
+            ]
+            .map(|case| (websocket, case))
+        })
+    {
         for semantic_output in [false, true] {
             let store = Arc::new(MemoryAccountStore::default());
             create_account(&store, "acct_provider_contract").await;
+            let account = store.account("acct_provider_contract").expect("account");
+            let cooldowns = Arc::new(MemoryCooldownPort::new());
+            // 距离冻结阈值只差一次，验证非容量错误不会把可调度账号推入冷却。
+            for _ in 0..11 {
+                cooldowns
+                    .record_capacity_failure(account.id(), Duration::from_secs(600), 20)
+                    .await
+                    .expect("seed capacity evidence");
+            }
+            let before = cooldowns.capacity_evidence(account.id());
             let mut events = vec![
                 json!({"type": "response.created", "response": {"id": "resp_capacity", "model": "gpt-5.4"}}),
             ];
             if semantic_output {
                 events.push(json!({"type": "response.output_text.delta", "output_index": 0, "content_index": 0, "delta": "hello"}));
             }
-            let original = json!({"type": "response.failed", "response": {"id": "resp_capacity", "error": {"code": code, "message": "Selected model is at capacity. Please try a different model."}}});
+            let original = json!({"type": "response.failed", "response": {"id": "resp_capacity", "error": {"code": code, "message": message}}});
             events.push(original.clone());
             let (base_url, _http_server, websocket_server) = if use_websocket {
                 let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
@@ -6557,7 +6605,9 @@ async fn capacity_stream_rejection_only_retries_before_semantic_output_on_both_t
             } else {
                 http_generate_operation()
             };
-            let mut stream = provider_with_base_url(&store, base_url)
+            let (provider, pool) =
+                provider_with_capacity_tracking(&store, base_url, Arc::clone(&cooldowns));
+            let mut stream = provider
                 .execute(
                     planned_request("openai", operation),
                     context("req_capacity_stream", CancellationToken::new()),
@@ -6573,15 +6623,48 @@ async fn capacity_stream_rejection_only_retries_before_semantic_output_on_both_t
                         }
                     }
                     Some(Err(error)) => break error,
-                    None => panic!("expected capacity failure"),
+                    None => panic!("expected upstream failure"),
                 }
             };
-            assert_eq!(error.replay_is_safe(), !semantic_output);
-            assert_eq!(error.kind(), ProviderErrorKind::UpstreamCapacityUnavailable);
-            assert_eq!(error.pre_delivery_retry().is_some(), !semantic_output);
-            assert!(provider_openai::openai_failure_affects_account_score(
-                &error
-            ));
+            let capacity = expected_kind == ProviderErrorKind::UpstreamCapacityUnavailable;
+            assert_eq!(
+                error.kind(),
+                expected_kind,
+                "unexpected error for {code}, websocket={use_websocket}, semantic_output={semantic_output}: {error:?}"
+            );
+            assert_eq!(error.replay_is_safe(), capacity && !semantic_output);
+            assert_eq!(error.upstream_status(), None);
+            assert_eq!(
+                error.pre_delivery_retry().is_some(),
+                capacity && !semantic_output
+            );
+            assert_eq!(
+                provider_openai::openai_failure_affects_account_score(&error),
+                scored
+            );
+            let cooldown = cooldowns.read(account.id()).await.expect("read cooldown");
+            if capacity {
+                assert_eq!(
+                    cooldowns
+                        .capacity_evidence(account.id())
+                        .map(|(count, _)| count),
+                    Some(12)
+                );
+                assert_eq!(
+                    cooldown.expect("capacity cooldown").kind(),
+                    ProviderCooldownKind::CapacityFreezeProbe
+                );
+            } else {
+                assert_eq!(
+                    cooldowns.capacity_evidence(account.id()),
+                    before,
+                    "non-capacity error {code} changed capacity evidence"
+                );
+                assert!(
+                    cooldown.is_none(),
+                    "non-capacity error {code} froze the account"
+                );
+            }
             assert_eq!(
                 serde_json::from_str::<Value>(
                     error.raw_upstream_error().expect("raw error").as_str()
@@ -6601,6 +6684,7 @@ async fn capacity_stream_rejection_only_retries_before_semantic_output_on_both_t
             if let Some(server) = websocket_server {
                 server.await.expect("server");
             }
+            pool.shutdown().await;
         }
     }
 }

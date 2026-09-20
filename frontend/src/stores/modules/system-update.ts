@@ -1,10 +1,12 @@
-import { until, useEventSource } from '@vueuse/core'
+import type { SystemUpdateStatus } from '@/api'
+import { until, useEventSource, useTimeoutPoll } from '@vueuse/core'
 import { delay } from 'es-toolkit'
 import { defineStore } from 'pinia'
 
 import { computed, ref, shallowRef, watch } from 'vue'
 import {
   getSystemUpdateDetail,
+  getSystemUpdateStatus,
   getSystemVersion,
   performSystemUpdate,
   restartSystem,
@@ -18,9 +20,12 @@ const updateEventReadyTimeoutMs = 3_000
 const restartReadyTimeoutMs = 60_000
 const restartProbeTimeoutMs = 2_000
 const restartReadyPollIntervalMs = 500
+const updateStatusPollIntervalMs = 1_000
+const updateStatusTimeoutMs = 5_000
 
 interface SystemUpdateEvent {
   id: string
+  operationId?: string | null
   level: string
   message: string
   at: string
@@ -58,6 +63,7 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
   const updateStreaming = shallowRef(false)
   const updateStreamError = shallowRef('')
   const restartTargetVersion = shallowRef('')
+  const updateStatus = shallowRef<SystemUpdateStatus | null>(null)
   const {
     data: updateEventMessage,
     status: updateEventStatus,
@@ -76,6 +82,12 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
 
   let loadVersionPromise: ReturnType<typeof getSystemVersion> | undefined
   let loadSystemPromise: Promise<void> | undefined
+  let statusRequest: Promise<void> | undefined
+  let statusGeneration = 0
+  let submitting = false
+  let activeOperationId: string | null = null
+  let unconfirmedPreviousId: string | null | undefined
+  const statusPoll = useTimeoutPoll(refreshUpdateStatus, updateStatusPollIntervalMs, { immediate: false })
 
   const phaseKind = computed(() => phase.value.kind)
   const loading = computed(() => phaseKind.value === 'loading')
@@ -88,6 +100,7 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
     () =>
       hasUpdate.value
       && Boolean(updateInfo.value?.updateSupported)
+      && !needRestart.value
       && !UPDATE_BUSY_PHASES.has(phaseKind.value),
   )
 
@@ -128,9 +141,11 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
       return
     try {
       const event = JSON.parse(message.raw) as SystemUpdateEvent
+      if (activeOperationId && event.operationId !== activeOperationId)
+        return
       appendUpdateLog(event)
-      if (event.terminal)
-        disconnectUpdateEvents()
+      if (event.terminal && !submitting)
+        void refreshUpdateStatus()
     }
     catch {
       updateStreamError.value = '更新日志解析失败'
@@ -167,6 +182,80 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
     closeUpdateEventSource()
   }
 
+  function applyUpdateStatus(status: SystemUpdateStatus) {
+    const operation = status.operation
+    updateStatus.value = status
+    if (unconfirmedPreviousId !== undefined && operation.operationId === unconfirmedPreviousId) {
+      unconfirmedPreviousId = undefined
+      updateError.value = '尚未确认更新任务，请检查状态后重试'
+      setPhase({ kind: 'ready' })
+      statusPoll.pause()
+      disconnectUpdateEvents()
+      return
+    }
+    unconfirmedPreviousId = undefined
+    activeOperationId = operation.operationId
+    updateError.value = ''
+    updateSuccess.value = operation.status === 'succeeded' && status.needRestart
+    needRestart.value = status.needRestart
+    restartTargetVersion.value = status.needRestart ? normalizeSystemVersion(status.currentVersion) : ''
+    if (operation.status === 'running') {
+      setPhase({ kind: 'updating' })
+      if (!statusPoll.isActive.value)
+        statusPoll.resume()
+      void connectUpdateEvents()
+      return
+    }
+    statusPoll.pause()
+    disconnectUpdateEvents()
+    if (operation.status === 'failed') {
+      updateError.value = operation.error || operation.message || '更新失败'
+      setPhase({ kind: 'failed' })
+      return
+    }
+    if (status.needRestart && updateInfo.value) {
+      updateInfo.value = { ...updateInfo.value, hasUpdate: false }
+    }
+    setPhase(status.needRestart ? { kind: 'restart_required' } : { kind: 'ready' })
+  }
+
+  async function refreshUpdateStatus() {
+    if (submitting || restarting.value)
+      return
+    if (statusRequest)
+      return statusRequest
+    const generation = statusGeneration
+    statusRequest = (async () => {
+      try {
+        const status = await getSystemUpdateStatus({ silent: true, timeout: updateStatusTimeoutMs })
+        if (generation !== statusGeneration)
+          return
+        updateStreamError.value = ''
+        applyUpdateStatus(status)
+      }
+      catch (error: unknown) {
+        if (generation !== statusGeneration)
+          return
+        if (error instanceof ApiError && (error.status === 401 || error.status === 403)) {
+          statusPoll.pause()
+          disconnectUpdateEvents()
+          updateError.value = errorMessage(error)
+          setPhase({ kind: 'failed' })
+          return
+        }
+        // 传输失败不能证明任务失败，保留忙碌态，恢复连接后重新核对持久化结果。
+        updateStreamError.value = '暂时无法确认更新状态，正在重试'
+        setPhase({ kind: 'updating' })
+        if (!statusPoll.isActive.value)
+          statusPoll.resume()
+      }
+      finally {
+        statusRequest = undefined
+      }
+    })()
+    return statusRequest
+  }
+
   async function loadSystem(refresh = false) {
     if (loadSystemPromise)
       return loadSystemPromise
@@ -175,10 +264,17 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
       setPhase({ kind: 'loading' })
     }
     loadSystemPromise = (async () => {
-      updateInfo.value = await getSystemUpdateDetail({ refresh })
-      if (!version.value)
-        version.value = await getSystemVersion()
-      loadedOnce.value = true
+      await Promise.all([
+        refreshUpdateStatus(),
+        (async () => {
+          updateInfo.value = await getSystemUpdateDetail({ refresh })
+          if (!version.value)
+            version.value = await getSystemVersion()
+          loadedOnce.value = true
+        })(),
+      ])
+      if (needRestart.value && updateInfo.value)
+        updateInfo.value = { ...updateInfo.value, hasUpdate: false }
     })()
 
     try {
@@ -207,7 +303,7 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
   }
 
   async function checkUpdates(refresh = true) {
-    if (checking.value)
+    if (checking.value || updating.value || restarting.value)
       return updateInfo.value
 
     setPhase({ kind: 'checking' })
@@ -217,6 +313,7 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
       if (!version.value)
         version.value = await getSystemVersion()
       loadedOnce.value = true
+      await refreshUpdateStatus()
       return updateInfo.value
     }
     finally {
@@ -226,39 +323,45 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
   }
 
   async function updateNow(targetVersion: string) {
-    const currentInfo = updateInfo.value
-    const confirmedTargetVersion = targetVersion.trim()
-    if (!canUpdate.value || !currentInfo || updating.value || !confirmedTargetVersion)
+    const confirmedTargetVersion = normalizeSystemVersion(targetVersion)
+    if (!canUpdate.value || !confirmedTargetVersion)
       return null
 
+    statusGeneration += 1
+    submitting = true
+    statusPoll.pause()
+    activeOperationId = null
+    unconfirmedPreviousId = undefined
+    const previousId = updateStatus.value?.operation.operationId ?? null
+    resetUpdateResult()
     clearUpdateLogs()
-    await connectUpdateEvents(true)
     setPhase({ kind: 'updating' })
-    updateError.value = ''
-    updateSuccess.value = false
     try {
-      const result = await performSystemUpdate({ targetVersion: confirmedTargetVersion })
-      updateSuccess.value = true
-      needRestart.value = result.needRestart
-      restartTargetVersion.value = result.needRestart ? normalizeSystemVersion(result.targetVersion) : ''
-      updateInfo.value = {
-        ...currentInfo,
-        latestVersion: result.targetVersion,
-        hasUpdate: false,
-      }
-      setPhase(result.needRestart ? { kind: 'restart_required' } : { kind: 'ready' })
+      await connectUpdateEvents(true)
+      const result = await performSystemUpdate({ targetVersion: confirmedTargetVersion }, { silent: true })
+      activeOperationId = result.operationId
+      updateLogs.value = updateLogs.value.filter(event => event.operationId === result.operationId)
       return result
     }
     catch (error: unknown) {
+      if (error instanceof ApiError && (error.status === 0 || error.status >= 500 || error.status === 408)) {
+        unconfirmedPreviousId = previousId
+        updateStreamError.value = '正在确认更新是否已开始'
+        return null
+      }
       updateError.value = errorMessage(error)
-      appendUpdateLog({
-        id: `update-client-error-${Date.now()}`,
-        level: 'error',
-        message: updateError.value,
-        at: new Date().toISOString(),
-      })
       setPhase({ kind: 'failed' })
+      disconnectUpdateEvents()
       throw error
+    }
+    finally {
+      submitting = false
+      if (updating.value) {
+        statusPoll.resume()
+        // 提交前的查询可能仍在返回，先丢弃旧代次结果，再读取本次任务。
+        await statusRequest
+        await refreshUpdateStatus()
+      }
     }
   }
 
@@ -299,6 +402,8 @@ export const useSystemUpdateStore = defineStore('system-update', () => {
       throw error
     }
 
+    statusGeneration += 1
+    statusPoll.pause()
     setPhase({ kind: 'restarting' })
     updateError.value = ''
     disconnectUpdateEvents()

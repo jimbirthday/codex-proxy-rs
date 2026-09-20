@@ -23,6 +23,7 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route("/api/key-usage/version", get(version::<S>))
         .route("/api/key-usage/config", get(config::<S>))
         .route("/api/key-usage/overview", get(overview::<S>))
         .route("/api/key-usage/records", get(records::<S>))
@@ -32,10 +33,31 @@ where
         .layer(middleware::map_response(no_store))
 }
 
+async fn version<S>(
+    State(state): State<S>,
+    headers: HeaderMap,
+    AdminQuery(_): AdminQuery<query::EmptyQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let version = state
+        .admin_services()
+        .key_usage()
+        .version(session_cookie::value(&headers).as_deref())
+        .await
+        .map_err(map_admin_service_error)?
+        .ok_or_else(AdminError::session_required)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(presenter::version(version)),
+    ))
+}
+
 async fn config<S>(
     State(state): State<S>,
     headers: HeaderMap,
-    AdminQuery(_): AdminQuery<query::ConfigQuery>,
+    AdminQuery(_): AdminQuery<query::EmptyQuery>,
 ) -> Result<impl IntoResponse, AdminError>
 where
     S: SessionState + Send + Sync,

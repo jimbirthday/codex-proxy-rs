@@ -60,13 +60,13 @@ impl SystemOperations for RecordingSystemOperations {
             operation_id: "operation-update".to_owned(),
             deployment_mode: "source".to_owned(),
             message: "accepted".to_owned(),
-            need_restart: true,
             target_version: target_version.unwrap_or_else(|| "latest".to_owned()),
         })
     }
 
     async fn update_status(&self) -> Result<SystemUpdateStatus, SystemOperationError> {
         Ok(SystemUpdateStatus {
+            need_restart: false,
             previous_version: None,
             current_version: Some("1.0.0".to_owned()),
             operation: SystemOperationState {

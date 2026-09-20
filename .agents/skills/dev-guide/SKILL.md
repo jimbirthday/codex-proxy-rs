@@ -16,7 +16,7 @@ description: 当前仓库开发指南。修改或排查本仓库的 Rust 网关�
 | 模块职责、调用链、状态归属 | [系统架构](../../../docs/architecture.md) |
 | Rust 开发 | 加载并使用 `$rust-best-practices`，结合 [系统架构](../../../docs/architecture.md) 与 [项目约定](../../../CONTRIBUTING.md#项目约定) |
 | HTTP 路由、请求与响应、导入导出 | [API 文档](../../../docs/api.md) |
-| 前端开发、管理端组件、主题 Token、视觉验证 | 加载并使用 `$frontend-design`，结合 [管理端主题](../../../docs/theme.md) 与 [界面验证](../../../CONTRIBUTING.md#界面验证) |
+| 前端开发、管理端组件、主题 Token、视觉验证 | 按下方「前端任务」加载设计约束，结合 [管理端主题](../../../docs/theme.md) 与 [界面验证](../../../CONTRIBUTING.md#界面验证) |
 | 常规文档更新 | [文档职责与更新条件](../../../CONTRIBUTING.md#文档职责与更新条件)：维护当前说明，在原章节就地修订，不记录变更历史 |
 | 部署、客户端配置、备份与恢复 | [部署说明](../../../deploy/README.md) |
 | 数据迁移、冻结清单与本地测试库 | [迁移说明](../../../backend/migrations/README.md) |
@@ -24,6 +24,12 @@ description: 当前仓库开发指南。修改或排查本仓库的 Rust 网关�
 | 创建或审查 PR | [github-pr](../github-pr/SKILL.md) |
 | 整理或提交 Issue | [github-issue](../github-issue/SKILL.md) |
 | 发布说明、版本规划与发版 | [release](../release/SKILL.md) |
+
+## 前端任务
+
+- 加载并使用 `$frontend-design`，先读 [界面文案与信息层级](../../../docs/theme.md#界面文案与信息层级)，将本项目的管理工具风格、现有字体与主题 Token 作为设计约束
+- 开发前按该章节的参考入口和相邻页面核对布局、文案密度与操作位置，再选择共用组件
+- 交付前按该章节检查界面文案中的句号、分号，以及过大的标题、重复说明和说明块占用的空间，结合 [界面验证](../../../CONTRIBUTING.md#界面验证) 核对实际页面
 
 ## 执行顺序
 

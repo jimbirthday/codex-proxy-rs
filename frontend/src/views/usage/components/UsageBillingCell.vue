@@ -62,16 +62,12 @@ function itemValueClass(tone?: string, accent?: boolean) {
       {{ usageBillingText(record) }}
     </span>
 
-    <span
-      v-if="billing?.longContextBillingApplied"
-      class="inline-flex shrink-0 items-center rounded-cp-sm bg-cp-orange-container px-1 py-0.5 text-cp-xs leading-none font-heavy whitespace-nowrap text-cp-orange-on-container"
-      title="已应用长上下文计费；各项单价见费用明细"
-      aria-label="已应用长上下文计费"
+    <UsageDetailPopover
+      v-if="billing"
+      :title="billing.longContextBillingApplied ? '长上下文计费明细' : '计费明细'"
+      :trigger-label="billing.longContextBillingApplied ? '查看长上下文计费明细' : '查看费用明细'"
+      :tone="billing.longContextBillingApplied ? 'warning' : 'primary'"
     >
-      长上下文
-    </span>
-
-    <UsageDetailPopover v-if="billing" title="计费明细" trigger-label="查看费用明细">
       <div class="grid gap-1.5 text-cp-text-secondary">
         <div v-for="item in amountItems" :key="item.label" class="grid grid-cols-[auto_minmax(0,1fr)] items-center gap-4">
           <span class="whitespace-nowrap">{{ item.label }}</span>

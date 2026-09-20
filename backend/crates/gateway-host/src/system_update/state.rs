@@ -3,6 +3,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -154,8 +155,101 @@ impl Drop for UpdateTempDir {
     }
 }
 
+/// 更新任务拥有持久化终态的责任，Future 在取消或 panic 时析构也必须收尾。
+pub(crate) struct UpdateOperation {
+    path: PathBuf,
+    operation_id: String,
+    target: String,
+    completed: bool,
+    _file_lock: OperationFileLock,
+}
+
+impl UpdateOperation {
+    pub(crate) fn start(
+        path: &Path,
+        operation_id: &str,
+        target: &str,
+        current_version: &str,
+        file_lock: OperationFileLock,
+    ) -> Result<Self, OperationError> {
+        set_running(
+            path,
+            operation_id,
+            SystemOperationKind::Update,
+            Some(target),
+            current_version,
+        )?;
+        Ok(Self {
+            path: path.to_owned(),
+            operation_id: operation_id.to_owned(),
+            target: target.to_owned(),
+            completed: false,
+            _file_lock: file_lock,
+        })
+    }
+
+    pub(crate) fn complete(
+        &mut self,
+        result: &Result<(), OperationError>,
+    ) -> Result<(), OperationError> {
+        finish(
+            &self.path,
+            &self.operation_id,
+            SystemOperationKind::Update,
+            result.as_ref().ok().map(|()| self.target.clone()),
+            result.as_ref().err().map(ToString::to_string),
+        )?;
+        self.completed = true;
+        Ok(())
+    }
+}
+
+impl Drop for UpdateOperation {
+    fn drop(&mut self) {
+        if !self.completed
+            && let Err(error) = finish(
+                &self.path,
+                &self.operation_id,
+                SystemOperationKind::Update,
+                None,
+                Some("更新任务已中断，请重新发起更新".to_owned()),
+            )
+        {
+            tracing::warn!(error = %error, "收敛中断的系统更新状态失败");
+        }
+    }
+}
+
+/// 只在拿到进程内锁后调用，旧版本断连遗留且已无执行者的 running 不能永久保留。
+pub(crate) fn recover_interrupted(path: &Path, lock_path: &Path) -> Result<(), OperationError> {
+    let state = read_persisted(path)?;
+    if !matches!(state.operation.status, PersistedStatus::Running) {
+        return Ok(());
+    }
+    let _lock = match OperationFileLock::acquire(lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == super::SystemOperationErrorKind::Conflict => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if let (Some(operation_id), Some(kind)) = (state.operation.operation_id, state.operation.kind) {
+        finish(
+            path,
+            &operation_id,
+            kind.into(),
+            None,
+            Some("更新任务已中断，请重新发起更新".to_owned()),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn operation_id(kind: &str) -> String {
-    format!("sysop-{kind}-{}", Utc::now().timestamp_millis())
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "sysop-{kind}-{}-{}",
+        Utc::now().timestamp_millis(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 pub(crate) fn set_running(
@@ -188,16 +282,10 @@ pub(crate) fn finish(
     kind: SystemOperationKind,
     version: Option<String>,
     error: Option<String>,
-) {
-    let mut state = match read_persisted(path) {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::warn!(error = %error, "读取系统更新状态失败");
-            return;
-        }
-    };
+) -> Result<(), OperationError> {
+    let mut state = read_persisted(path)?;
     if state.operation.operation_id.as_deref() != Some(operation_id) {
-        return;
+        return Ok(());
     }
     if let Some(error) = error {
         state.operation.status = PersistedStatus::Failed;
@@ -222,15 +310,20 @@ pub(crate) fn finish(
         state.operation.target_version = version;
     }
     state.operation.finished_at = Some(Utc::now().to_rfc3339());
-    if let Err(error) = write_persisted(path, &state) {
-        tracing::warn!(error = %error, "写入系统更新状态失败");
-    }
+    write_persisted(path, &state)
 }
 
-pub(crate) fn read_status(path: &Path) -> Result<SystemUpdateStatus, OperationError> {
+pub(crate) fn read_status(
+    path: &Path,
+    running_version: &str,
+) -> Result<SystemUpdateStatus, OperationError> {
     let state = read_persisted(path)?;
     let operation = state.operation;
     Ok(SystemUpdateStatus {
+        need_restart: matches!(operation.status, PersistedStatus::Succeeded)
+            && state.current_version.as_deref().is_some_and(|version| {
+                version.trim_start_matches('v') != running_version.trim_start_matches('v')
+            }),
         previous_version: state.previous_version,
         current_version: state.current_version,
         operation: SystemOperationState {

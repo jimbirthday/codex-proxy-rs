@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 
 use crate::{
-    AuthService,
+    AuthService, SystemService,
     model::{
         AdminError, AdminErrorKind,
         auth::SessionSubject,
@@ -18,6 +18,7 @@ use crate::{
         observability::{
             OpsErrorFilter, OpsErrorQuery, TimeRange, UsageFilter, UsageQuery, china_day_start,
         },
+        system::SystemVersion,
     },
     ports::store::{ClientKeyStore, ObservabilityStore},
 };
@@ -27,6 +28,8 @@ use super::{map_store_error, observability::health_timeline_at};
 
 #[async_trait]
 pub trait KeyUsageService: Send + Sync {
+    async fn version(&self, session_id: Option<&str>) -> Result<Option<SystemVersion>, AdminError>;
+
     async fn config(&self, session_id: Option<&str>)
     -> Result<Option<ClientKeySecret>, AdminError>;
 
@@ -47,6 +50,7 @@ pub(crate) struct DefaultKeyUsageService {
     auth: Arc<dyn AuthService>,
     keys: Arc<dyn ClientKeyStore>,
     observations: Arc<dyn ObservabilityStore>,
+    system: Arc<dyn SystemService>,
 }
 
 impl DefaultKeyUsageService {
@@ -54,11 +58,13 @@ impl DefaultKeyUsageService {
         auth: Arc<dyn AuthService>,
         keys: Arc<dyn ClientKeyStore>,
         observations: Arc<dyn ObservabilityStore>,
+        system: Arc<dyn SystemService>,
     ) -> Self {
         Self {
             auth,
             keys,
             observations,
+            system,
         }
     }
 
@@ -89,6 +95,13 @@ fn usage_filter(id: &ClientApiKeyId, model: Option<String>) -> UsageFilter {
 
 #[async_trait]
 impl KeyUsageService for DefaultKeyUsageService {
+    async fn version(&self, session_id: Option<&str>) -> Result<Option<SystemVersion>, AdminError> {
+        if self.key_id(session_id).await?.is_none() {
+            return Ok(None);
+        }
+        self.system.version().await.map(Some)
+    }
+
     async fn config(
         &self,
         session_id: Option<&str>,

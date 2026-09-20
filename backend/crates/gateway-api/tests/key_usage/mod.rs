@@ -40,8 +40,8 @@ async fn login(app: &Router, mode: &str) -> String {
 }
 
 async fn get(app: &Router, resource: &str, suffix: &str, cookie: &str) -> Response {
-    let path = if resource == "config" {
-        format!("/api/key-usage/config{suffix}")
+    let path = if matches!(resource, "config" | "version") {
+        format!("/api/key-usage/{resource}{suffix}")
     } else {
         format!("/api/key-usage/{resource}?{RANGE}{suffix}")
     };
@@ -52,6 +52,33 @@ async fn get(app: &Router, resource: &str, suffix: &str, cookie: &str) -> Respon
         .unwrap();
     assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     response
+}
+
+#[tokio::test]
+async fn version_exposes_only_build_identifiers_for_key_sessions() {
+    let fixture = fixtures::fixture().await;
+    let app = crate::openai::api_router_with_admin(fixture.services.clone());
+    let cookie = login(&app, "key").await;
+    let response = get(&app, "version", "", &cookie).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response_json(response).await["data"],
+        json!({"version": "3.7.0", "gitSha": "internal-revision"})
+    );
+    assert_eq!(
+        get(&app, "version", "?keyId=other", &cookie).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    let response = app
+        .clone()
+        .oneshot(cookie_request(
+            Method::GET,
+            "/api/admin/system/version",
+            &cookie,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -288,7 +315,7 @@ async fn missing_admin_and_revoked_sessions_cannot_read_key_usage() {
     let app = crate::openai::api_router_with_admin(fixture.services.clone());
     let admin = login(&app, "admin").await;
     let key = login(&app, "key").await;
-    for resource in ["overview", "records", "config"] {
+    for resource in ["overview", "records", "config", "version"] {
         assert_eq!(
             get(&app, resource, "", "").await.status(),
             StatusCode::UNAUTHORIZED
@@ -425,6 +452,11 @@ async fn namespace_errors_remain_json_and_uncacheable() {
         (
             Method::POST,
             "/api/key-usage/config",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+        (
+            Method::POST,
+            "/api/key-usage/version",
             StatusCode::METHOD_NOT_ALLOWED,
         ),
     ] {

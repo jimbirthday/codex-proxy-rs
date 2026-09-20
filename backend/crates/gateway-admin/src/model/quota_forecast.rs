@@ -108,7 +108,7 @@ impl AccountQuotaForecast {
         let percent = window
             .used_percent
             .filter(|p| p.is_finite() && (0.0..=100.0).contains(p));
-        let usage = sample.map(|sample| &sample.usage);
+        let usage = sample.map(|sample| &sample.cycle_usage);
         let usd = usage
             .filter(|usage| usage.known_cost_count > 0)
             .map(|usage| usage.usd)
@@ -175,14 +175,21 @@ impl AccountQuotaForecast {
             || (method == QuotaForecastMethod::Incremental && sample.block_count < 2);
         // 漏记和个别缺失只影响精度，仍按已记录数值估算，不按请求数补齐未知消耗。
         // 预测是近似展示值；不复用为账单金额，也不把月折算当成自然月或额外余额。
-        let capacity_factor = 100.0 / sample.sampled_percent;
-        let factor = capacity_factor * self.target_seconds as f64 / seconds as f64;
-        let tokens = Some(usage.tokens).filter(|tokens| *tokens > 0);
-        self.estimated_tokens = tokens.and_then(|value| estimate_tokens(value, factor));
-        self.estimated_usd = usd.and_then(|value| estimate(value, factor));
+        // 已发生的用量保持本周期累计，只把近期消耗比例用于尚未使用的额度。
+        let factor = self.target_seconds as f64 / seconds as f64;
         let remaining_factor = (100.0 - percent) / sample.sampled_percent;
-        self.remaining_tokens = tokens.and_then(|value| estimate_tokens(value, remaining_factor));
-        self.remaining_usd = usd.and_then(|value| estimate(value, remaining_factor));
+        let remaining_tokens = Some(sample.usage.tokens)
+            .filter(|tokens| *tokens > 0)
+            .and_then(|value| estimate(value as f64, remaining_factor));
+        self.remaining_tokens = remaining_tokens.and_then(|value| estimate_tokens(value, 1.0));
+        self.estimated_tokens = remaining_tokens
+            .and_then(|remaining| estimate_tokens(usage.tokens as f64 + remaining, factor));
+        self.remaining_usd = Some(&sample.usage)
+            .filter(|usage| usage.known_cost_count > 0 && usage.usd.is_finite() && usage.usd >= 0.0)
+            .and_then(|usage| estimate(usage.usd, remaining_factor));
+        self.estimated_usd = usd
+            .zip(self.remaining_usd)
+            .and_then(|(used, remaining)| estimate(used + remaining, factor));
         self.unavailable_reason = if self.estimated_tokens.is_none() && self.estimated_usd.is_none()
         {
             Some("本周期暂无可用于估算的 Token 或费用数据，请积累用量后重试。")
@@ -197,8 +204,8 @@ fn estimate(value: f64, factor: f64) -> Option<f64> {
     (estimate.is_finite() && estimate >= 0.0).then_some(estimate)
 }
 
-fn estimate_tokens(value: u64, factor: f64) -> Option<u64> {
-    estimate(value as f64, factor)
+fn estimate_tokens(value: f64, factor: f64) -> Option<u64> {
+    estimate(value, factor)
         .filter(|value| value.round() < u64::MAX as f64)
         .map(|value| value.round() as u64)
 }

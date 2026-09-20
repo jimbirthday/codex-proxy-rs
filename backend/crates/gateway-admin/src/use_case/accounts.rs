@@ -653,19 +653,39 @@ impl AccountsService for DefaultAccountsService {
         context: &MutationContext,
         account_id: ProviderAccountId,
     ) -> Result<AccountRefreshResult, AdminError> {
-        let (_, provider) = self.provider_for_account(&account_id).await?;
-        let result = self
-            .accounts
-            .recover_account(&account_id, context)
-            .await
-            .map_err(|error| map_store_error(error, "provider account recovery"))?;
+        let (stored, provider) = self.provider_for_account(&account_id).await?;
+        let config_revision = if stored.account.enabled {
+            self.accounts
+                .recover_account(&account_id, context)
+                .await
+                .map_err(|error| map_store_error(error, "provider account recovery"))?
+                .config_revision
+        } else {
+            // 停用只表示不参与调度，重新启用不能抹除已观测的额度、凭据或冷却事实。
+            self.accounts
+                .batch_update_accounts(
+                    BatchUpdateAccounts {
+                        account_ids: vec![account_id.to_string()],
+                        enabled: Some(true),
+                        concurrency_limit: None,
+                        weight: None,
+                        model_access: None,
+                        group_ids: None,
+                        outbound_proxy: None,
+                    },
+                    context,
+                )
+                .await
+                .map_err(|error| map_store_error(error, "enable provider account"))?
+                .config_revision
+        };
         provider
             .account_facts_changed(std::slice::from_ref(&account_id))
             .await;
-        publish_committed(self.snapshot.as_ref(), result.config_revision).await?;
+        publish_committed(self.snapshot.as_ref(), config_revision).await?;
         let account = self.load_directory_item(&account_id, false).await?;
         Ok(AccountRefreshResult {
-            config_revision: result.config_revision,
+            config_revision,
             account,
         })
     }
@@ -845,7 +865,7 @@ impl AccountsService for DefaultAccountsService {
                     usage: point.usage,
                 });
             }
-            let mut sample = select_forecast_sample(
+            let sample = select_forecast_sample(
                 window.key.clone(),
                 query.range.start,
                 QuotaForecastPoint {
@@ -855,13 +875,8 @@ impl AccountsService for DefaultAccountsService {
                 },
                 points,
                 history.pending_request_count,
+                interrupted,
             );
-            if interrupted
-                && sample.method
-                    == crate::model::quota_forecast_sampling::QuotaForecastMethod::Cumulative
-            {
-                sample.discontinuous = true;
-            }
             samples.push(sample);
         }
         Ok(AccountQuotaForecastReport {

@@ -13,7 +13,7 @@ use crate::admin::AdminError;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ConfigQuery {}
+pub(super) struct EmptyQuery {}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

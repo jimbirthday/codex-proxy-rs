@@ -71,6 +71,7 @@ pub struct SystemOperationState {
 pub struct SystemUpdateStatus {
     pub previous_version: Option<String>,
     pub current_version: Option<String>,
+    pub need_restart: bool,
     pub operation: SystemOperationState,
 }
 
@@ -103,7 +104,6 @@ pub enum SystemOperationAccepted {
         operation_id: String,
         deployment_mode: String,
         message: String,
-        need_restart: bool,
         target_version: String,
     },
     Rollback {

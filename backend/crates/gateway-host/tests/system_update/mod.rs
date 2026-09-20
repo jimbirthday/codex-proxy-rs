@@ -7,7 +7,8 @@ use filetime::FileTime;
 use flate2::{Compression, write::GzEncoder};
 use futures::StreamExt as _;
 use gateway_admin::model::system::{
-    SystemOperationKind, SystemOperationStatus, SystemUpdateEventLevel,
+    SystemOperationAccepted, SystemOperationKind, SystemOperationStatus, SystemUpdateEventLevel,
+    SystemUpdateStatus,
 };
 use gateway_admin::ports::system::{SystemOperationErrorKind, SystemOperations};
 use gateway_core::lifecycle::CancellationToken;
@@ -90,7 +91,7 @@ async fn restart_should_conflict_while_another_system_operation_is_running() {
         .expect("release listener");
     let api_base = format!("http://{}/repos", listener.local_addr().expect("addr"));
     let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
-    tokio::spawn(async move {
+    let upstream = tokio::spawn(async move {
         let connection = listener.accept().await;
         let _ = connected_tx.send(());
         tokio::time::sleep(Duration::from_secs(30)).await;
@@ -118,8 +119,13 @@ async fn restart_should_conflict_while_another_system_operation_is_running() {
     assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
     assert!(!shutdown.is_cancelled());
 
-    update.abort();
-    let _ = update.await;
+    update.await.expect("request").expect("accepted");
+    assert!(fixture.lock().exists());
+    upstream.abort();
+    assert_eq!(
+        wait_for_update(&service).await.operation.status,
+        SystemOperationStatus::Failed
+    );
     service.restart().await.expect("restart after lock release");
 }
 
@@ -136,10 +142,13 @@ async fn rollback_should_restore_binary_web_and_version_state() {
         )
         .await;
     let service = fixture.service(&server);
-    service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
-        .await
-        .expect("update");
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
     service.rollback().await.expect("rollback");
 
     assert_eq!(
@@ -353,10 +362,13 @@ async fn experimental_update_should_install_same_channel_release() {
     config.build_type = "experimental".to_owned();
     let service = ProcessSystemOperations::new(CancellationToken::new(), config);
 
-    service
-        .perform_update(Some("3.10.0-exp.3".to_owned()))
-        .await
-        .expect("same-channel update");
+    assert_eq!(
+        complete_update(&service, "3.10.0-exp.3")
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
         b"new-binary"
@@ -469,13 +481,170 @@ async fn update_checks_should_follow_stage_promotion_and_experimental_isolation(
 }
 
 #[tokio::test]
+async fn update_detail_should_keep_current_release_notes_without_allowing_reinstallation() {
+    for current in [
+        "3.12.1",
+        "3.12.1-alpha.1",
+        "3.12.1-beta.1",
+        "3.12.1-rc.1",
+        "3.12.1-exp.1",
+        "3.12.1+build.1",
+    ] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        let release_url = format!("https://github.com/owner/repository/releases/tag/v{current}");
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repository/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "tag_name": format!("v{current}"),
+                    "prerelease": !semver::Version::parse(current).expect("version").pre.is_empty(),
+                    "body": "## 当前版本\n\n- 修复更新状态",
+                    "html_url": release_url,
+                }
+            ])))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut config = fixture.config(&format!("{}/repos", server.uri()));
+        config.version = current.to_owned();
+        if current.contains("-exp.") {
+            config.build_type = "experimental".to_owned();
+        }
+        let service = ProcessSystemOperations::new(CancellationToken::new(), config);
+
+        let detail = service.update_detail(true).await.expect("current release");
+        assert_eq!(detail.latest_version, current);
+        assert!(!detail.has_update);
+        assert!(detail.update_supported);
+        assert_eq!(
+            detail.notes.as_deref(),
+            Some("## 当前版本\n\n- 修复更新状态")
+        );
+        assert_eq!(detail.release_url.as_deref(), Some(release_url.as_str()));
+        let cached = service.update_detail(false).await.expect("cached release");
+        assert!(cached.cached);
+        assert_eq!(cached.notes, detail.notes);
+        assert_eq!(cached.release_url, detail.release_url);
+        assert!(!service.version().await.expect("version").has_update);
+
+        let error = service
+            .perform_update(Some(current.to_owned()))
+            .await
+            .expect_err("current release must not be installed again");
+        assert_eq!(error.kind(), SystemOperationErrorKind::Conflict);
+        assert!(!fixture.state().exists());
+        assert_eq!(
+            fs::read(fixture.executable()).expect("binary"),
+            b"old-binary"
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_detail_should_prefer_available_update_notes_over_current_release() {
+    for current_first in [true, false] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        let mut releases = vec![
+            serde_json::json!({
+                "tag_name": "v1.0.0", "prerelease": false, "body": "current notes"
+            }),
+            serde_json::json!({
+                "tag_name": "v1.9.9", "prerelease": false, "body": "update notes",
+                "html_url": "https://github.com/owner/repository/releases/tag/v1.9.9"
+            }),
+        ];
+        if !current_first {
+            releases.reverse();
+        }
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repository/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(releases))
+            .mount(&server)
+            .await;
+
+        let detail = fixture
+            .service(&server)
+            .update_detail(true)
+            .await
+            .expect("detail");
+        assert!(detail.has_update);
+        assert_eq!(detail.latest_version, TARGET_VERSION);
+        assert_eq!(detail.notes.as_deref(), Some("update notes"));
+        assert_eq!(
+            detail.release_url.as_deref(),
+            Some("https://github.com/owner/repository/releases/tag/v1.9.9")
+        );
+    }
+}
+
+#[tokio::test]
+async fn update_detail_should_find_current_release_notes_across_pages() {
+    let server = MockServer::start().await;
+    let fixture = Fixture::new();
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repository/releases"))
+        .and(query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(vec![
+            serde_json::json!({ "tag_name": "v2.0.0", "prerelease": false });
+            100
+        ]))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repository/releases"))
+        .and(query_param("page", "2"))
+        .respond_with(release_response("1.0.0", Vec::new()))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let detail = fixture
+        .service(&server)
+        .update_detail(true)
+        .await
+        .expect("detail");
+    assert!(!detail.has_update);
+    assert_eq!(detail.latest_version, "1.0.0");
+    assert_eq!(detail.notes.as_deref(), Some("notes"));
+    assert!(detail.release_url.is_some());
+}
+
+#[tokio::test]
+async fn update_detail_should_not_use_draft_or_mislabeled_current_release_notes() {
+    for (current, prerelease) in [("1.0.0", false), ("1.0.0-beta.1", true)] {
+        let server = MockServer::start().await;
+        let fixture = Fixture::new();
+        Mock::given(method("GET"))
+            .and(path("/repos/owner/repository/releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                { "tag_name": format!("v{current}"), "prerelease": prerelease, "draft": true, "body": "draft notes" },
+                { "tag_name": format!("v{current}"), "prerelease": !prerelease, "body": "mislabeled notes" },
+                { "tag_name": "v0.9.0", "prerelease": false, "body": "older notes" },
+            ])))
+            .mount(&server)
+            .await;
+        let mut config = fixture.config(&format!("{}/repos", server.uri()));
+        config.version = current.to_owned();
+        let service = ProcessSystemOperations::new(CancellationToken::new(), config);
+
+        let detail = service.update_detail(true).await.expect("detail");
+        assert!(!detail.has_update);
+        assert_eq!(detail.latest_version, current);
+        assert!(detail.notes.is_none());
+        assert!(detail.release_url.is_none());
+    }
+}
+
+#[tokio::test]
 async fn update_checks_should_ignore_other_cycles_downgrades_and_build_metadata() {
     for (current, target) in [
         ("3.12.0-alpha.1", "3.13.0-alpha.2"),
         ("3.12.0-beta.1", "3.12.1-rc.1"),
         ("3.12.0-rc.1", "3.13.0"),
         ("3.12.0-beta.2", "3.12.0-beta.1"),
-        ("3.12.0-exp.2", "3.12.0-exp.2"),
         ("3.12.0", "3.12.0+new-build"),
         ("3.12.0-beta.1+aaa", "3.12.0-beta.1+zzz"),
         ("3.12.0", "3.11.0"),
@@ -576,10 +745,10 @@ async fn prerelease_updates_should_install_later_stages_and_stable_release() {
                 .expect("detail")
                 .has_update
         );
-        service
-            .perform_update(Some(target.to_owned()))
-            .await
-            .expect("promoted update");
+        assert_eq!(
+            complete_update(&service, target).await.operation.status,
+            SystemOperationStatus::Succeeded
+        );
         assert_eq!(
             fs::read(fixture.executable()).expect("binary"),
             b"new-binary"
@@ -694,10 +863,13 @@ async fn update_events_should_preserve_complete_release_stage_sequence() {
         .await;
     let service = fixture.service(&server);
     let events = service.update_events();
-    service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
-        .await
-        .expect("update");
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
     let steps = events
         .map(|event| event.step.expect("release update step"))
         .collect::<Vec<_>>()
@@ -726,10 +898,13 @@ async fn update_events_should_report_download_bytes_and_percent() {
         .await;
     let service = fixture.service(&server);
     let events = service.update_events();
-    service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
-        .await
-        .expect("update");
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
     let progress = events
         .filter_map(
             |event| async move { event.progress_percent.map(|value| (value, event.message)) },
@@ -755,12 +930,12 @@ async fn update_should_fail_when_release_checksum_is_missing() {
         )
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -777,12 +952,12 @@ async fn update_should_fail_when_release_checksum_mismatches() {
         )
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -794,12 +969,12 @@ async fn update_should_reject_insecure_release_archive() {
         .mount_custom_release(&server, "http://github.com/archive", None)
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -811,12 +986,12 @@ async fn update_should_reject_release_archive_from_untrusted_host() {
         .mount_custom_release(&server, "https://evil.example/archive", None)
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -844,12 +1019,12 @@ async fn update_should_reject_release_archive_with_unsafe_path() {
         )
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -876,12 +1051,12 @@ async fn update_should_reject_when_confirmed_target_differs_from_remote_latest()
         .mount_release(&server, "1.9.8", ArchiveKind::Safe, ChecksumKind::Valid)
         .await;
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
 }
 
@@ -900,12 +1075,12 @@ async fn update_should_remove_stale_file_lock_and_continue() {
     fs::write(fixture.lock(), "stale").expect("lock");
     filetime::set_file_mtime(fixture.lock(), FileTime::from_unix_time(1, 0)).expect("old mtime");
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_ok()
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded,
     );
 }
 
@@ -935,10 +1110,13 @@ async fn update_and_rollback_should_use_the_default_api_asset_directory() {
     host.resolve_and_validate(&fixture.root.path().join("deploy"), &fixture.web())
         .expect("inherit API asset directory");
     let service = ProcessSystemOperations::new(CancellationToken::new(), host.system_update);
-    service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
-        .await
-        .expect("update");
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
 
     assert_eq!(
         fs::read(fixture.executable()).expect("binary"),
@@ -981,10 +1159,13 @@ async fn update_should_replace_web_assets_across_filesystems() {
     fs::create_dir_all(&web_dist).expect("web dir");
     fs::write(web_dist.join("index.html"), "old-web").expect("web");
     let service = ProcessSystemOperations::new(CancellationToken::new(), config);
-    service
-        .perform_update(Some(TARGET_VERSION.to_owned()))
-        .await
-        .expect("update");
+    assert_eq!(
+        complete_update(&service, TARGET_VERSION)
+            .await
+            .operation
+            .status,
+        SystemOperationStatus::Succeeded
+    );
 
     assert_eq!(
         fs::read(web_dist.join("index.html")).expect("web"),
@@ -1006,12 +1187,12 @@ async fn update_should_restore_web_assets_when_binary_backup_fails() {
         .await;
     fs::create_dir(fixture.executable().with_extension("backup")).expect("blocking backup dir");
 
-    assert!(
-        fixture
-            .service(&server)
-            .perform_update(Some(TARGET_VERSION.to_owned()))
+    assert_eq!(
+        complete_update(&fixture.service(&server), TARGET_VERSION)
             .await
-            .is_err()
+            .operation
+            .status,
+        SystemOperationStatus::Failed,
     );
     assert_eq!(
         fs::read(fixture.web().join("index.html")).expect("web"),
@@ -1057,6 +1238,262 @@ async fn version_should_return_backend_build_metadata() {
         (version.version.as_str(), version.git_sha.as_str()),
         ("2.3.4", "abc123")
     );
+}
+
+#[tokio::test]
+async fn accepted_update_should_survive_a_lost_http_response() {
+    let upstream = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &upstream,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/archive"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(release_archive(ArchiveKind::Safe))
+                .set_delay(Duration::from_secs(2)),
+        )
+        .with_priority(1)
+        .mount(&upstream)
+        .await;
+    let service = Arc::new(fixture.service(&upstream));
+    let handler_service = Arc::clone(&service);
+    let accepted = Arc::new(tokio::sync::Notify::new());
+    let handler_accepted = Arc::clone(&accepted);
+    let router = axum::Router::new().route(
+        "/update",
+        axum::routing::post(move || {
+            let service = Arc::clone(&handler_service);
+            let accepted = Arc::clone(&handler_accepted);
+            async move {
+                service
+                    .perform_update(Some(TARGET_VERSION.to_owned()))
+                    .await
+                    .expect("accepted");
+                accepted.notify_one();
+                // 模拟受理响应丢失，客户端断开会取消此 HTTP handler。
+                std::future::pending::<String>().await
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("listener");
+    let address = listener.local_addr().expect("address");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.expect("serve");
+    });
+    let client = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(format!("http://{address}/update"))
+            .send()
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+        .await
+        .expect("accepted before slow download finishes");
+    client.abort();
+    let _ = client.await;
+    assert_eq!(
+        service
+            .update_status()
+            .await
+            .expect("running status")
+            .operation
+            .status,
+        SystemOperationStatus::Running
+    );
+    assert_eq!(
+        service
+            .perform_update(Some(TARGET_VERSION.to_owned()))
+            .await
+            .expect_err("duplicate update")
+            .kind(),
+        SystemOperationErrorKind::Conflict
+    );
+    assert_eq!(
+        service
+            .rollback()
+            .await
+            .expect_err("rollback during update")
+            .kind(),
+        SystemOperationErrorKind::Conflict
+    );
+    let status = wait_for_update(&service).await;
+    assert_eq!(status.operation.status, SystemOperationStatus::Succeeded);
+    assert!(status.need_restart);
+    assert_eq!(
+        fs::read(fixture.executable()).expect("binary"),
+        b"new-binary"
+    );
+    assert!(!fixture.lock().exists());
+    assert_eq!(
+        service
+            .perform_update(Some(TARGET_VERSION.to_owned()))
+            .await
+            .expect_err("restart required")
+            .kind(),
+        SystemOperationErrorKind::Conflict
+    );
+    let mut restarted_config = fixture.config(&format!("{}/repos", upstream.uri()));
+    restarted_config.version = TARGET_VERSION.to_owned();
+    let restarted = ProcessSystemOperations::new(CancellationToken::new(), restarted_config);
+    assert!(
+        !restarted
+            .update_status()
+            .await
+            .expect("restarted status")
+            .need_restart
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn host_shutdown_should_finish_an_accepted_update_and_release_its_lock() {
+    let upstream = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &upstream,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Valid,
+        )
+        .await;
+    let cancellation = CancellationToken::new();
+    let service = ProcessSystemOperations::new(
+        cancellation.clone(),
+        fixture.config(&format!("{}/repos", upstream.uri())),
+    );
+    // 在后台任务第一次 poll 之前触发关闭，覆盖受理后的生命周期交接。
+    service
+        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .await
+        .expect("accepted");
+    cancellation.cancel();
+    let status = wait_for_update(&service).await;
+    assert_eq!(status.operation.status, SystemOperationStatus::Failed);
+    assert!(status.operation.error.expect("reason").contains("中断"));
+    assert!(!fixture.lock().exists());
+    assert_eq!(
+        fs::read(fixture.executable()).expect("binary"),
+        b"old-binary"
+    );
+}
+
+#[test]
+fn dropped_update_task_should_persist_failure_even_before_its_first_poll() {
+    let fixture = Fixture::new();
+    let service = fixture.service_for_url("http://127.0.0.1:1/repos");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    runtime
+        .block_on(service.perform_update(Some(TARGET_VERSION.to_owned())))
+        .expect("accepted");
+    drop(runtime);
+    let status: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.state()).expect("state")).expect("JSON");
+    assert_eq!(status["operation"]["status"], "failed");
+    assert!(status["operation"]["finishedAt"].is_string());
+    assert!(!fixture.lock().exists());
+}
+
+#[tokio::test]
+async fn status_should_recover_abandoned_running_state_without_stealing_a_live_lock() {
+    let fixture = Fixture::new();
+    fs::write(fixture.state(), r#"{"currentVersion":"1.0.0","operation":{"operationId":"abandoned","kind":"update","status":"running","targetVersion":"1.9.9"}}"#).expect("state");
+    fs::write(fixture.lock(), "another process").expect("live lock");
+    let service = fixture.service_for_url("http://127.0.0.1:1/repos");
+    assert_eq!(
+        service
+            .update_status()
+            .await
+            .expect("locked status")
+            .operation
+            .status,
+        SystemOperationStatus::Running
+    );
+    fs::remove_file(fixture.lock()).expect("release abandoned lock");
+    let status = service.update_status().await.expect("recovered status");
+    assert_eq!(status.operation.status, SystemOperationStatus::Failed);
+    assert!(status.operation.finished_at.is_some());
+    assert_eq!(status.operation.operation_id.as_deref(), Some("abandoned"));
+}
+
+#[tokio::test]
+async fn terminal_event_should_only_be_visible_after_status_is_persisted() {
+    let upstream = MockServer::start().await;
+    let fixture = Fixture::new();
+    fixture
+        .mount_release(
+            &upstream,
+            TARGET_VERSION,
+            ArchiveKind::Safe,
+            ChecksumKind::Mismatch,
+        )
+        .await;
+    let service = fixture.service(&upstream);
+    let mut events = service.update_events();
+    let SystemOperationAccepted::Update { operation_id, .. } = service
+        .perform_update(Some(TARGET_VERSION.to_owned()))
+        .await
+        .expect("accepted")
+    else {
+        panic!("update")
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(event) = events.next().await {
+            assert_eq!(event.operation_id.as_deref(), Some(operation_id.as_str()));
+            if event.terminal {
+                let status = service.update_status().await.expect("terminal status");
+                assert_eq!(status.operation.status, SystemOperationStatus::Failed);
+                assert!(status.operation.finished_at.is_some());
+                return;
+            }
+        }
+        panic!("missing terminal event");
+    })
+    .await
+    .expect("terminal event");
+}
+
+async fn wait_for_update(service: &ProcessSystemOperations) -> SystemUpdateStatus {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = service.update_status().await.expect("update status");
+            if status.operation.status != SystemOperationStatus::Running {
+                assert!(status.operation.finished_at.is_some(), "terminal timestamp");
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("update reaches terminal state")
+}
+
+async fn complete_update(service: &ProcessSystemOperations, target: &str) -> SystemUpdateStatus {
+    let SystemOperationAccepted::Update { operation_id, .. } = service
+        .perform_update(Some(target.to_owned()))
+        .await
+        .expect("update accepted")
+    else {
+        panic!("expected update operation")
+    };
+    let status = wait_for_update(service).await;
+    assert_eq!(
+        status.operation.operation_id.as_deref(),
+        Some(operation_id.as_str())
+    );
+    status
 }
 
 struct Fixture {
@@ -1118,10 +1555,11 @@ impl Fixture {
     }
 
     fn service(&self, server: &MockServer) -> ProcessSystemOperations {
-        ProcessSystemOperations::new(
-            CancellationToken::new(),
-            self.config(&format!("{}/repos", server.uri())),
-        )
+        self.service_for_url(&format!("{}/repos", server.uri()))
+    }
+
+    fn service_for_url(&self, api_base: &str) -> ProcessSystemOperations {
+        ProcessSystemOperations::new(CancellationToken::new(), self.config(api_base))
     }
 
     async fn mount_release(

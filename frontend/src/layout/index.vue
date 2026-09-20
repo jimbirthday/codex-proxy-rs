@@ -3,11 +3,11 @@ import { storeToRefs } from 'pinia'
 import { nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { RouterView, useRoute } from 'vue-router'
 
+import AppAboutModal from '@/components/AppAboutModal.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import { useSystemUpdateStore } from '@/stores/modules/system-update'
 import { useUiStore } from '@/stores/modules/ui'
 
-import AppAboutModal from './components/AppAboutModal.vue'
 import AppSidebar from './components/AppSidebar.vue'
 import FloatingSidebarToggle from './components/FloatingSidebarToggle.vue'
 import SystemUpdateModal from './components/SystemUpdateModal/index.vue'
@@ -15,7 +15,7 @@ import SystemUpdateModal from './components/SystemUpdateModal/index.vue'
 const uiStore = useUiStore()
 const systemUpdateStore = useSystemUpdateStore()
 const { sidebarCollapsed } = storeToRefs(uiStore)
-const { loadedOnce } = storeToRefs(systemUpdateStore)
+const { loadedOnce, version } = storeToRefs(systemUpdateStore)
 const { toggleSidebar } = uiStore
 const route = useRoute()
 const pageScrollbarRef = ref<InstanceType<typeof BaseScrollbar> | null>(null)
@@ -110,7 +110,7 @@ watch(
       </Transition>
     </Teleport>
 
-    <AppAboutModal v-model="aboutOpen" />
+    <AppAboutModal v-model="aboutOpen" :version="version" />
     <SystemUpdateModal v-model="systemUpdateOpen" />
   </div>
 </template>

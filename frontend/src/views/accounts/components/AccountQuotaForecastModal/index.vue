@@ -28,10 +28,13 @@ const { report, loading, refreshing, error, load, refresh } = useAccountQuotaFor
   account => emit('accountUpdated', account),
 )
 const { now, pause, resume } = useNow({ interval: 30_000, controls: true })
-const options = [
-  { label: '7日额度', value: 'weekly' },
+const options = computed(() => report.value?.forecasts.map(item => ({
+  label: item.extrapolated ? `${item.targetDays}天折算` : item.source?.label ?? (item.period === 'weekly' ? '周额度' : '月额度'),
+  value: item.period,
+})) ?? [
+  { label: '周额度', value: 'weekly' },
   { label: '月额度', value: 'monthly' },
-]
+])
 const forecast = computed(() => report.value?.forecasts.find(item => item.period === period.value))
 const unavailableReason = computed(() => {
   if (forecast.value?.source && new Date(forecast.value.source.resetAt) <= now.value)
@@ -64,7 +67,7 @@ function handleExplanationKeydown(event: KeyboardEvent) {
   <BaseModal
     v-model="open"
     title="额度预测"
-    description="按当前用量结构，估算完整周期的容量"
+    description="按本周期估算，重置后重新累计"
     size="md"
     tone="info"
   >
@@ -72,9 +75,9 @@ function handleExplanationKeydown(event: KeyboardEvent) {
       <ChartNoAxesCombined class="size-5 text-cp-primary-text" :stroke-width="1.75" />
     </template>
 
-    <div class="grid gap-4">
+    <div class="grid grid-cols-1 gap-4">
       <div class="flex flex-wrap items-center justify-between gap-4">
-        <AccountIdentityCell :account="account" show-plan title-mode="email">
+        <AccountIdentityCell :account="account" show-plan title-mode="email" class="max-w-full">
           <template #meta>
             <ProviderIconGroup :provider="account.provider" size="sm" />
           </template>
@@ -122,7 +125,10 @@ function handleExplanationKeydown(event: KeyboardEvent) {
               仅供参考
             </h4>
             <p class="m-0">
-              按已记录数据估算，缺失的用量或费用可能使结果偏低，结果会随使用的模型和方式变化，并非官方承诺额度
+              本周期预计总量为已记录用量加预计剩余，剩余量按本周期内近期用量估算
+            </p>
+            <p class="m-0">
+              缺失的用量或费用可能使结果偏低，结果会随使用的模型和方式变化，并非官方承诺额度
             </p>
             <p v-if="forecast?.lowSample" class="m-0">
               目前数据还较少，结果可能有较大波动

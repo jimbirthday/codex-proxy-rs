@@ -1,6 +1,10 @@
 <script setup lang="ts">
+import type { KeyUsageVersion } from '@/api/modules/key-usage'
 import { Search } from '@lucide/vue'
+import { shallowRef } from 'vue'
+import { getKeyUsageVersion } from '@/api/modules/key-usage'
 import ApiKeyConfigModal from '@/components/ApiKeyConfigModal.vue'
+import AppAboutModal from '@/components/AppAboutModal.vue'
 import BaseInput from '@/components/base/BaseInput.vue'
 import BaseScrollbar from '@/components/base/BaseScrollbar.vue'
 import RequestHealthTimelineCard from '@/views/dashboard/components/RequestHealthTimelineCard.vue'
@@ -17,6 +21,26 @@ import { keyUsageTime } from './utils/format'
 const { period, model, kind, refreshInterval, overview, overviewLoading, overviewError, refreshing, recordsStale, records, refresh, changePageSize, changePage } = useKeyUsage()
 const { items, currentPage, pageSize, total, loading: recordsLoading, error: recordsError } = records
 const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig } = useKeyConfig()
+const aboutOpen = shallowRef(false)
+const version = shallowRef<KeyUsageVersion | null>(null)
+const versionLoading = shallowRef(false)
+
+async function openAbout() {
+  aboutOpen.value = true
+  if (version.value || versionLoading.value)
+    return
+
+  versionLoading.value = true
+  try {
+    version.value = await getKeyUsageVersion({ silent: true })
+  }
+  catch {
+    // 版本不可用不影响查看项目信息，下次打开时重试。
+  }
+  finally {
+    versionLoading.value = false
+  }
+}
 </script>
 
 <template>
@@ -24,7 +48,7 @@ const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig }
     <BaseScrollbar>
       <div class="mx-auto flex min-h-full w-full max-w-480 flex-col gap-5 p-4 min-[961px]:p-6">
         <div class="flex flex-col gap-2">
-          <KeyUsageHeader v-model:period="period" v-model:refresh-interval="refreshInterval" :name="overview?.key.name" :prefix="overview?.key.prefix" :refreshing="refreshing || overviewLoading" :configuring="configuring" @refresh="refresh" @configure="openConfig" />
+          <KeyUsageHeader v-model:period="period" v-model:refresh-interval="refreshInterval" :name="overview?.key.name" :prefix="overview?.key.prefix" :refreshing="refreshing || overviewLoading" :configuring="configuring" @refresh="refresh" @configure="openConfig" @open-about="openAbout" />
           <div class="flex flex-wrap items-center justify-between gap-3">
             <span v-if="overview" class="text-cp-sm text-cp-text-tertiary">更新于 {{ keyUsageTime(overview.asOf).slice(11) }}</span>
             <BaseInput v-model="model" class="ml-auto w-60 max-w-full" placeholder="输入完整模型名称" aria-label="筛选统计和日志的模型" :maxlength="128">
@@ -50,5 +74,6 @@ const { showConfig, configKey, configuring, apiBaseUrl, openConfig, copyConfig }
       </div>
     </BaseScrollbar>
     <ApiKeyConfigModal v-model="showConfig" title="密钥配置" :api-key="configKey" :api-base-url="apiBaseUrl" @copy="copyConfig" />
+    <AppAboutModal v-model="aboutOpen" :version="version" />
   </main>
 </template>

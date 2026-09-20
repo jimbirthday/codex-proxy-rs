@@ -8,6 +8,11 @@ export interface KeyUsageConfig {
   plaintextKey: string
 }
 
+export interface KeyUsageVersion {
+  version: string
+  gitSha: string
+}
+
 export interface KeyUsageMetrics {
   requests: number
   inputTokens: number
@@ -87,6 +92,14 @@ export function getKeyUsageOverview(params: KeyUsageQuery, options: RequestOptio
     url: '/api/key-usage/overview',
     method: 'GET',
     params,
+    ...options,
+  })
+}
+
+export function getKeyUsageVersion(options: RequestOptions = {}) {
+  return request<KeyUsageVersion>({
+    url: '/api/key-usage/version',
+    method: 'GET',
     ...options,
   })
 }

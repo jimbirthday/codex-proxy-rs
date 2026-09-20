@@ -115,6 +115,7 @@ impl ReleaseCache {
     }
 }
 
+/// 优先返回可升级的最高版本，没有候选时保留当前版本的发布信息。
 pub(crate) async fn fetch_latest(
     api_base: &str,
     repository: &str,
@@ -166,7 +167,7 @@ fn eligible_release_version(
     let version = semver::Version::parse(&normalize_version(&release.tag_name)).ok()?;
     (!release.draft
         && release.prerelease != version.pre.is_empty()
-        && update_target_allowed(current, &version))
+        && (version == *current || update_target_allowed(current, &version)))
     .then_some(version)
 }
 
@@ -198,15 +199,17 @@ pub(crate) fn detail_from_release(
     release: &GitHubRelease,
 ) -> SystemUpdateDetail {
     let unsupported_reason = config.update_support_error();
+    let latest_version = normalize_version(&release.tag_name);
+    let has_update = validate_update_target(&config.version, &latest_version).is_ok();
     if unsupported_reason.is_some()
-        || validate_update_target(&config.version, &release.tag_name).is_err()
+        || (!has_update && latest_version != normalize_version(&config.version))
     {
         return super::base_update_detail(config, unsupported_reason, None);
     }
     SystemUpdateDetail {
         current_version: config.version.clone(),
-        latest_version: normalize_version(&release.tag_name),
-        has_update: true,
+        latest_version,
+        has_update,
         deployment_mode: config.deployment_mode.clone(),
         build_type: config.build_type.clone(),
         release_url: release.html_url.clone(),

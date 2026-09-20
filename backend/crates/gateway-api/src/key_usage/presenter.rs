@@ -7,6 +7,7 @@ use gateway_admin::model::{
     observability::{
         CostCoverage, CurrencyCost, Granularity, OpsError, RequestMetrics, UsageListRecord,
     },
+    system::SystemVersion,
 };
 use serde::Serialize;
 
@@ -14,6 +15,21 @@ use crate::admin::observability::{
     BillingView, HealthTimelineView, PageData, TokenDetailsView, billing_view,
     health_timeline_view, usage_list_token_details,
 };
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct VersionView {
+    version: String,
+    git_sha: String,
+}
+
+pub(super) fn version(version: SystemVersion) -> VersionView {
+    // 密钥用户仅查看构建标识，不暴露部署环境、更新状态或内部诊断。
+    VersionView {
+        version: version.version,
+        git_sha: version.git_sha,
+    }
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
