@@ -2,6 +2,37 @@
 
 use serde_json::{Map, Value, json};
 
+/// 非官方客户端及跨客户端历史回填的兼容入口；调用方必须已选定 Codex/OAuth 上游。
+/// 只处理已验证被拒绝的字段，不根据客户端品牌推断整份历史是否合法。
+pub(crate) fn normalize_non_codex_request_body(body: &mut Map<String, Value>) {
+    let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for item in input {
+        let Some(item) = item.as_object_mut() else {
+            continue;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            continue;
+        }
+        // SDK 输出项的 status 不属于 Codex reasoning 输入合同；其他项的 status 可能合法。
+        item.shift_remove("status");
+        // Codex 只接受空 content 数组；仅在加密历史仍可回填时去掉冗余明文，
+        // 没有加密内容的历史不自动丢弃，保留给上游明确拒绝。
+        if item
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| !content.trim().is_empty())
+            && item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| !content.is_empty())
+        {
+            item.shift_remove("content");
+        }
+    }
+}
+
 /// 补齐 Codex 请求缺省字段并适配已确认不兼容的请求形状，不递归清洗业务正文。
 ///
 /// 兼容基准是 Codex Core/Desktop 的模型请求，不是公开 OpenAI Responses API。

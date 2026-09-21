@@ -346,7 +346,7 @@ pub async fn initialize(
         config.session_ttl_minutes,
         client_config.session_ttl_minutes,
         store.auth(),
-        client_key_verifier,
+        client_key_verifier.clone(),
     ));
     auth.ensure_default_admin(config.default_password.expose())
         .await?;
@@ -374,6 +374,7 @@ pub async fn initialize(
     let system = Arc::new(DefaultSystemService::new(system));
     let key_usage = Arc::new(use_case::key_usage::DefaultKeyUsageService::new(
         auth.clone(),
+        client_key_verifier,
         store.client_keys(),
         store.observability(),
         system.clone(),

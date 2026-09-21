@@ -82,6 +82,7 @@ export interface UsageListRecord {
   accountId: string | null
   accountEmail: string | null
   accountName: string | null
+  accountNotes: string | null
   route: string
   model: string | null
   requestedModel: string | null

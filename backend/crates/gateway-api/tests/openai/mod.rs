@@ -6,6 +6,7 @@ mod models;
 mod responses;
 mod router;
 mod search;
+mod usage;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU32;

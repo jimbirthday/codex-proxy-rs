@@ -270,6 +270,220 @@ async fn selected_proxy_location_overrides_global_and_reloads_without_mutating_c
 
 const OFFICIAL_FIXTURE: &[u8] =
     include_bytes!("../transport/fixtures/official_models_snapshot.json");
+
+#[tokio::test]
+async fn replay_compatibility_should_remove_only_reasoning_status_on_both_transports() {
+    let input = json!([
+        {"type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"hello"}]},
+        {"type":"reasoning","id":"rs_replay","status":"completed","summary":[],"content":[],"encrypted_content":"test-cipher","extension":{"status":"keep","content":[1]}},
+        {"type":"function_call","call_id":"call_replay","name":"echo","arguments":"{}","status":"completed"},
+        {"type":"function_call_output","call_id":"call_replay","output":{"status":"keep","content":[1]},"status":"completed"},
+        {"type":"tool_search_output","call_id":"call_search","status":"completed","tools":[]},
+        {"type":"reasoning","status":"in_progress","summary":[],"encrypted_content":"second-test-cipher"},
+        {"type":"future_item","status":"keep","content":[1]},
+        "opaque-item"
+    ]);
+    let mut expected = input.clone();
+    for index in [1, 5] {
+        expected[index]
+            .as_object_mut()
+            .unwrap()
+            .shift_remove("status");
+    }
+    for websocket in [false, true] {
+        let actual = capture_replay_compatibility_request(input.clone(), false, websocket).await;
+        // 比较序列化结果，同时保护未修改字段的顺序。
+        assert_eq!(actual["input"].to_string(), expected.to_string());
+    }
+}
+
+#[tokio::test]
+async fn replay_compatibility_should_keep_encrypted_history_when_removing_nonempty_content() {
+    let input = json!([
+        {"type":"reasoning","id":"rs_replay","summary":[{"type":"summary_text","text":"keep summary"}],"content":[{"type":"reasoning_text","text":"synthetic replay"}],"encrypted_content":"test-cipher","extension":9007199254740993_u64},
+        {"type":"compaction","id":"cmp_replay","content":[{"type":"text","text":"keep compaction"}],"encrypted_content":"compaction-test-cipher"},
+        {"type":"message","role":"assistant","content":[{"type":"output_text","text":"keep answer"}]}
+    ]);
+    let mut expected = input.clone();
+    expected[0].as_object_mut().unwrap().shift_remove("content");
+    for websocket in [false, true] {
+        let actual = capture_replay_compatibility_request(input.clone(), false, websocket).await;
+        assert_eq!(actual["input"].to_string(), expected.to_string());
+    }
+}
+
+#[tokio::test]
+async fn replay_compatibility_should_preserve_plaintext_only_and_unrecognized_content_shapes() {
+    let input = json!([
+        {"type":"reasoning","summary":[],"content":[{"type":"reasoning_text","text":"only history"}]},
+        {"type":"reasoning","summary":[],"content":[1],"encrypted_content":""},
+        {"type":"reasoning","summary":[],"content":[1],"encrypted_content":"  "},
+        {"type":"reasoning","summary":[],"content":[1],"encrypted_content":null},
+        {"type":"reasoning","summary":[],"content":[1],"encrypted_content":42},
+        {"type":"reasoning","summary":[],"content":{"status":"keep"},"encrypted_content":"test-cipher"},
+        {"type":"reasoning","summary":[],"content":"keep","encrypted_content":"test-cipher"}
+    ]);
+    for websocket in [false, true] {
+        let actual = capture_replay_compatibility_request(input.clone(), false, websocket).await;
+        assert_eq!(actual["input"].to_string(), input.to_string());
+    }
+}
+
+#[tokio::test]
+async fn replay_compatibility_should_leave_normal_official_history_unchanged() {
+    let input = json!([
+        {"type":"reasoning","id":"rs_empty","summary":[],"content":[],"encrypted_content":"test-cipher"},
+        {"type":"reasoning","id":"rs_null","summary":[],"content":null,"encrypted_content":"test-cipher"},
+        {"type":"reasoning","id":"rs_absent","summary":[],"encrypted_content":"test-cipher"},
+        {"type":"message","role":"user","content":[{"type":"input_text","text":"do not change status/content"}]},
+        {"type":"custom_tool_call","call_id":"call_custom","status":"completed","name":"custom","input":"keep"},
+        {"type":"tool_search_call","call_id":"call_search","status":"completed","arguments":{}},
+        {"type":"mcp_call","status":"completed","output":"keep"},
+        {"summary":[],"content":[1],"status":"keep"},
+        {"type":"future_item","content":[1],"status":"keep"},
+        null,
+        "opaque-item"
+    ]);
+    for websocket in [false, true] {
+        let actual = capture_replay_compatibility_request(input.clone(), false, websocket).await;
+        assert_eq!(actual["input"].to_string(), input.to_string());
+    }
+}
+
+#[tokio::test]
+async fn replay_compatibility_should_not_apply_codex_rules_to_api_key_accounts() {
+    let input = json!([{
+        "type":"reasoning","id":"rs_api","status":"completed","summary":[],
+        "content":[{"type":"reasoning_text","text":"API-specific history"}],
+        "encrypted_content":"test-cipher"
+    }]);
+    for websocket in [false, true] {
+        let actual = capture_replay_compatibility_request(input.clone(), true, websocket).await;
+        assert_eq!(actual["input"].to_string(), input.to_string());
+    }
+}
+
+#[tokio::test]
+async fn replay_compatibility_should_preserve_non_array_input_without_guessing() {
+    for input in [
+        Value::Null,
+        json!({"type":"reasoning","status":"keep"}),
+        json!(7),
+    ] {
+        let actual = capture_replay_compatibility_request(input.clone(), false, false).await;
+        assert_eq!(actual["input"], input);
+    }
+}
+
+async fn capture_replay_compatibility_request(
+    input: Value,
+    api_key: bool,
+    websocket: bool,
+) -> Value {
+    let http = MockServer::start().await;
+    let (base_url, websocket_server) = if websocket {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let task =
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut websocket = accept_codex_test_websocket(stream).await;
+                let frame = websocket.next().await.unwrap().unwrap();
+                let body: Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+                websocket.send(Message::Text(json!({
+                "type":"response.completed","response":{
+                    "id":"resp_replay","model":"gpt-5.4","status":"completed","output":[],
+                    "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                }
+            }).to_string().into())).await.unwrap();
+                body
+            });
+        (base_url, Some(task))
+    } else {
+        Mock::given(method("POST"))
+            .and(path(if api_key {
+                "/responses"
+            } else {
+                "/codex/responses"
+            }))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(CAPTURE_COMPLETED_SSE, "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&http)
+            .await;
+        (http.uri(), None)
+    };
+    let store = Arc::new(MemoryAccountStore::default());
+    if api_key {
+        store
+            .seed_api_key(
+                "acct_provider_contract",
+                base_url.clone(),
+                if websocket {
+                    provider_openai::credential::ApiKeyTransport::PreferWebsocket
+                } else {
+                    provider_openai::credential::ApiKeyTransport::Http
+                },
+            )
+            .await;
+    } else {
+        create_account(&store, "acct_provider_contract").await;
+    }
+    let original = json!({
+        "model":"gpt-5.4","store":false,"stream":true,"input":input,
+        "instructions":"Preserve the original instructions.",
+        "tools":[{"type":"function","name":"echo","parameters":{"type":"object","properties":{"status":{"type":"string"},"content":{"type":"array"}}}}],
+        "future_field":{"status":"keep","content":[1]},
+        "client_metadata":{"extension":{"status":"keep","content":[1]}}
+    });
+    let operation = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object("openai", original.as_object().unwrap().clone())
+            .unwrap()
+            .with_context(Map::from_iter([(
+                "use_websocket".to_owned(),
+                json!(websocket),
+            )])),
+    ));
+    let provider = provider_with_base_url(&store, base_url);
+    let mut stream = provider
+        .execute(
+            planned_request("openai", operation),
+            context("req_replay_compatibility", CancellationToken::new()),
+        )
+        .await
+        .unwrap();
+    while let Some(event) = stream.next().await {
+        event.expect("successful upstream completion");
+    }
+    let actual = if let Some(server) = websocket_server {
+        timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+    } else {
+        let requests = http.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "compatibility must run before the first send, without retry"
+        );
+        captured_request_body(&requests[0])
+    };
+    for field in ["model", "store", "instructions", "tools", "future_field"] {
+        assert_eq!(
+            actual[field].to_string(),
+            original[field].to_string(),
+            "unexpected change in {field}"
+        );
+    }
+    assert_eq!(
+        actual["client_metadata"]["extension"],
+        original["client_metadata"]["extension"]
+    );
+    actual
+}
+
 const CAPTURE_COMPLETED_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_scope_capture\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"

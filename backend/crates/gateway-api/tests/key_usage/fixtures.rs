@@ -100,6 +100,7 @@ fn usage_record() -> UsageListRecord {
         provider_account_ref: Some("private-sentinel".to_owned()),
         provider_account_name: Some("private-sentinel".to_owned()),
         provider_account_email: Some("private-sentinel".to_owned()),
+        provider_account_notes: Some("private-sentinel".to_owned()),
         provider_account_authentication_kind: Some("private-sentinel".to_owned()),
         upstream_model_id: Some("private-sentinel".to_owned()),
         upstream_transport: Some("websocket".to_owned()),

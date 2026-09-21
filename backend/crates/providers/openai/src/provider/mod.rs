@@ -92,7 +92,7 @@ use crate::transport::{
     CodexBackendJsonResponse, CodexBackendStreamingResponse, CodexBackendTransport,
     CodexClientError, CodexRateLimitUpdates, CodexRequestContext, CodexResponseMetadata,
     CodexResponseMetadataUpdates, CodexTransportMetrics, CodexUpstreamDiagnostics,
-    CodexWebSocketPool, endpoint_url,
+    CodexWebSocketPool, endpoint_url, normalize_non_codex_request_body,
 };
 use crate::turn_state::TurnStateStore;
 
@@ -563,10 +563,13 @@ impl Provider for CodexProvider {
         if matches!(
             lease.authentication(),
             crate::credential::CodexRuntimeAuthentication::OAuth(_)
-        ) && upstream_request.turn_state.is_none()
-            && let Some(state) = self.turn_states.state(lease.account_id(), upstream_model)
-        {
-            upstream_request.turn_state = Some(state);
+        ) {
+            normalize_non_codex_request_body(upstream_request.body_mut());
+            if upstream_request.turn_state.is_none()
+                && let Some(state) = self.turn_states.state(lease.account_id(), upstream_model)
+            {
+                upstream_request.turn_state = Some(state);
+            }
         }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease

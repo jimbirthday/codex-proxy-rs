@@ -5,4 +5,5 @@ mod body;
 mod headers;
 
 pub(super) use body::normalize_codex_request_body;
+pub(crate) use body::normalize_non_codex_request_body;
 pub(super) use headers::is_non_codex_request_header;

@@ -19,6 +19,7 @@ mod response_meta;
 pub(crate) mod session;
 pub mod subscription;
 mod time;
+pub(crate) use downstream::normalize_non_codex_request_body;
 pub(crate) use endpoints::valid_upstream_base_url;
 pub mod tls;
 pub mod usage;

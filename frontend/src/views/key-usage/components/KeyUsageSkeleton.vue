@@ -56,7 +56,7 @@ const metrics = [
     <BaseCard title="额度概览" aria-busy="true">
       <div class="flex flex-1 flex-col justify-between gap-6" aria-hidden="true">
         <div class="grid flex-1 gap-6 sm:grid-cols-2">
-          <div v-for="label in ['今日额度', '7日额度']" :key="label" class="flex min-w-0 flex-col justify-between gap-4">
+          <div v-for="label in ['今日额度', '周额度']" :key="label" class="flex min-w-0 flex-col justify-between gap-4">
             <div>
               <div class="text-cp-sm text-cp-text-secondary">
                 {{ label }}

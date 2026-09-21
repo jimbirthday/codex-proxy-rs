@@ -11,6 +11,7 @@ use super::{
     models::{model_detail, models},
     responses::{responses, responses_websocket},
     search::standalone_search,
+    usage,
 };
 
 use crate::ApiState;
@@ -25,6 +26,7 @@ pub(crate) fn router() -> Router<ApiState> {
         .route("/v1/models", get(models))
         // 官方 OpenAI 模型详情合同使用 path ID；它不属于 Admin API 约束。
         .route("/v1/models/{model_id}", get(model_detail))
+        .merge(usage::router())
         // OpenAI 数据面正文属于客户端/上游协议；代理不能用私有大小上限提前拒绝
         // 上游本可接受的未来 payload。
         .layer(DefaultBodyLimit::disable())

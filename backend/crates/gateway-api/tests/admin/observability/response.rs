@@ -966,6 +966,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
             provider_account_ref: Some("acct_snapshot".to_owned()),
             provider_account_name: Some("Snapshot Alpha".to_owned()),
             provider_account_email: Some("alpha@example.invalid".to_owned()),
+            provider_account_notes: Some("Team workspace".to_owned()),
             provider_account_authentication_kind: Some("oauth".to_owned()),
             upstream_model_id: Some("grok-4.5".to_owned()),
             upstream_transport: Some("http_sse".to_owned()),
@@ -1057,6 +1058,7 @@ async fn usage_route_should_expose_table_facts_without_detail_payload() {
     let value: serde_json::Value = serde_json::from_slice(&body).expect("usage response JSON");
 
     assert_eq!(value["data"]["items"][0]["clientApiKeyName"], "Production");
+    assert_eq!(value["data"]["items"][0]["accountNotes"], "Team workspace");
     assert_eq!(
         value["data"]["items"][0]["billing"]["longContextBillingApplied"],
         true

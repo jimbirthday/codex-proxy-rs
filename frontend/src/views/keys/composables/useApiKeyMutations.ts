@@ -141,7 +141,7 @@ export function useApiKeyMutations(options: {
   }
 
   function validateForm() {
-    for (const [label, value] of [['日限额', form.value.dailyLimitUsd], ['7日限额', form.value.weeklyLimitUsd]]) {
+    for (const [label, value] of [['日限额', form.value.dailyLimitUsd], ['周限额', form.value.weeklyLimitUsd]]) {
       if (value.trim() && !/^\d{1,10}(?:\.\d{1,10})?$/.test(value.trim())) {
         toast.warning(`${label}必须是非负金额，最多 10 位小数`)
         return false

@@ -39,6 +39,12 @@ impl Decimal {
         self.0
     }
 
+    /// 非负金额相减，超支时返回零。
+    #[must_use]
+    pub const fn saturating_sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+
     #[must_use]
     pub fn checked_add(self, other: Self) -> Option<Self> {
         self.0

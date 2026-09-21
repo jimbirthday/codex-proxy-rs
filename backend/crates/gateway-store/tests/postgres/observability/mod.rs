@@ -160,6 +160,124 @@ async fn usage_page_should_always_return_total() {
 }
 
 #[tokio::test]
+async fn usage_list_should_resolve_current_notes_by_account_id() {
+    let Some(database) = TestDatabase::create("usage_account_notes").await else {
+        return;
+    };
+    let now = Utc::now();
+    seed_observability_facts(&database.pool, now)
+        .await
+        .expect("seed observability facts");
+    sqlx::query(
+        "insert into provider_accounts (
+           id, provider_kind, name, email, notes, upstream_user_id,
+           upstream_account_id, plan_type, authentication_kind,
+           provider_credentials_json, credential_revision, credential_observed_at,
+           has_refresh_token, created_at, updated_at
+         ) select 'acct_team', provider_kind, name, email, '团队工作区', upstream_user_id,
+                  'team-workspace', 'team', authentication_kind,
+                  provider_credentials_json, credential_revision, credential_observed_at,
+                  has_refresh_token, created_at, updated_at
+           from provider_accounts where id = 'acct_observe'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("seed same-email team account");
+    sqlx::query(
+        "update model_requests
+         set provider_account_id = 'acct_team', provider_account_ref = 'acct_team',
+             downstream_committed_at = completed_at
+         where id = 'req_observe_uncommitted'",
+    )
+    .execute(&database.pool)
+    .await
+    .expect("assign completed request to team account");
+    let range =
+        admin_observability::TimeRange::new(now - TimeDelta::hours(1), now + TimeDelta::hours(1))
+            .expect("admin observability range");
+    let store = admin_observability_store(&database.pool);
+
+    for notes in [None, Some("个人主号"), Some("个人备用号"), None] {
+        sqlx::query("update provider_accounts set notes = $1 where id = 'acct_observe'")
+            .bind(notes)
+            .execute(&database.pool)
+            .await
+            .expect("update current account notes");
+        let page = store
+            .list_usage_records(admin_observability::UsageQuery {
+                range,
+                filter: admin_observability::UsageFilter::default(),
+                current_page: 1,
+                page_size: PageSize::new(10).expect("page size"),
+            })
+            .await
+            .expect("usage list with current notes");
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+        let personal = page
+            .items
+            .iter()
+            .find(|record| record.id == "req_observe_success")
+            .expect("personal request");
+        let team = page
+            .items
+            .iter()
+            .find(|record| record.id == "req_observe_uncommitted")
+            .expect("team request");
+        assert_eq!(
+            personal.provider_account_ref.as_deref(),
+            Some("acct_observe")
+        );
+        assert_eq!(personal.provider_account_email, team.provider_account_email);
+        assert_eq!(personal.provider_account_notes.as_deref(), notes);
+        assert_eq!(team.provider_account_notes.as_deref(), Some("团队工作区"));
+    }
+
+    let dashboard = store
+        .dashboard_summary(range, now)
+        .await
+        .expect("dashboard with current account notes");
+    assert_eq!(
+        dashboard
+            .recent_requests
+            .iter()
+            .find(|record| record.provider_account_ref.as_deref() == Some("acct_team"))
+            .expect("team dashboard request")
+            .provider_account_notes
+            .as_deref(),
+        Some("团队工作区")
+    );
+
+    sqlx::query("delete from provider_accounts where id = 'acct_team'")
+        .execute(&database.pool)
+        .await
+        .expect("delete team account");
+    let page = store
+        .list_usage_records(admin_observability::UsageQuery {
+            range,
+            filter: admin_observability::UsageFilter {
+                provider_account_ref: Some("acct_team".to_owned()),
+                ..admin_observability::UsageFilter::default()
+            },
+            current_page: 1,
+            page_size: PageSize::new(10).expect("page size"),
+        })
+        .await
+        .expect("deleted account history");
+    assert_eq!(page.total, 1);
+    assert_eq!(
+        page.items[0].provider_account_ref.as_deref(),
+        Some("acct_team")
+    );
+    assert_eq!(
+        page.items[0].provider_account_email.as_deref(),
+        Some("account@example.invalid")
+    );
+    assert_eq!(page.items[0].provider_account_notes, None);
+    database.close().await;
+}
+
+#[tokio::test]
 async fn usage_search_should_match_literal_prefix_instead_of_substring() {
     let Some(database) = TestDatabase::create("usage_literal_prefix_search").await else {
         return;

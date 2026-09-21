@@ -9,6 +9,7 @@ pub mod responses;
 pub mod router;
 pub mod search;
 pub(crate) mod service;
+mod usage;
 
 /// 客户端可读的 ID 必须能按现有请求记录检索；不以无关入口 ID 补位。
 fn with_model_request_id(

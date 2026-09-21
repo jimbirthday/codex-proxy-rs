@@ -63,6 +63,13 @@ withDefaults(
       >
         {{ usageAccountText(row) }}
       </span>
+      <span
+        v-if="row.accountNotes?.trim()"
+        class="mt-1 block max-w-full truncate text-cp-xs font-emphasis text-cp-text-quaternary"
+        :title="row.accountNotes"
+      >
+        {{ row.accountNotes }}
+      </span>
     </template>
 
     <template #clientIp="{ row }">

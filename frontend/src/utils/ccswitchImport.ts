@@ -11,6 +11,39 @@ export interface CodexCcSwitchImportInput {
   websocketEnabled?: boolean
 }
 
+function buildUsageScript(apiKey: string, baseUrl: string) {
+  // CC Switch 的占位符直接替换 JS 源码，不能安全承载含引号的自定义 Key。
+  // 按本次导入值生成字符串字面量，并转义左花括号，避免值中的占位符被二次替换。
+  const url = JSON.stringify(`${baseUrl}/usage`).replaceAll('{', '\\u007b')
+  const authorization = JSON.stringify(`Bearer ${apiKey}`).replaceAll('{', '\\u007b')
+  // 不限额时省略 total / remaining，避免把无限额度显示成余额为零。
+  return `({
+  request: {
+    url: ${url},
+    method: "GET",
+    headers: { Authorization: ${authorization} }
+  },
+  extractor: function(response) {
+    return [["daily", "日额度"], ["weekly", "周额度"]].map(function(entry) {
+      var budget = response[entry[0]];
+      var result = {
+        planName: entry[1],
+        isValid: true,
+        used: Number(budget.used),
+        unit: response.unit
+      };
+      if (budget.total === null) {
+        result.extra = "不限额";
+      } else {
+        result.total = Number(budget.total);
+        result.remaining = Number(budget.remaining);
+      }
+      return result;
+    });
+  }
+})`
+}
+
 export function buildCodexCcSwitchImportDeeplink(input: CodexCcSwitchImportInput): string {
   const configFiles = buildCodexConfigFiles({
     apiKey: input.apiKey,
@@ -32,7 +65,9 @@ export function buildCodexCcSwitchImportDeeplink(input: CodexCcSwitchImportInput
     ['apiKey', input.apiKey],
     ['configFormat', 'json'],
     ['config', config],
-    ['usageEnabled', 'false'],
+    ['usageEnabled', 'true'],
+    ['usageScript', encodeBase64(buildUsageScript(input.apiKey, configFiles.baseUrl))],
+    ['usageAutoInterval', '30'],
   ]
 
   return `ccswitch://v1/import?${new URLSearchParams(entries).toString()}`

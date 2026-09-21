@@ -27,7 +27,7 @@ Client Key 通过账号分组限定路由范围：未绑定分组时可使用全
 
 运行设置可以分别配置 `minCodexDesktopVersion` 与 `minCodexCliVersion`。两者只接受 SemVer，`null`
 表示不限制。API 在 Client Key 鉴权成功后识别官方 Desktop/CLI 请求头；适用门禁的客户端没有合法版本，或版本
-低于对应门槛时，所有 `/v1/*` HTTP 请求和新 WebSocket 握手在访问上游前返回 `426 Upgrade Required`。
+低于对应门槛时，除只读 `/v1/usage` 外的 `/v1/*` HTTP 请求和新 WebSocket 握手在访问上游前返回 `426 Upgrade Required`。
 未知客户端保持兼容，不应用版本门禁。
 
 Desktop 应用版本优先取 `version` 头，未提供时取 User-Agent 中的 `(Codex Desktop; <版本>)`。
@@ -156,6 +156,7 @@ WebSocket message 和 frame 不设置网关私有长度上限；协议可接受�
 | `POST` | `/v1/images/edits` | 通过 OpenAI Provider 发起图像编辑；JSON 请求与响应正文原样转发 |
 | `GET` | `/v1/models` | 返回当前 Client Key 账号范围内各 Provider 的可用公开模型并集；有两种响应形态，见下 |
 | `GET` | `/v1/models/{model_id}` | 返回 OpenAI 兼容的单模型详情 |
+| `GET` | `/v1/usage` | 查询当前 Client Key 的日与周额度，仅使用网关已结算的 USD 账本 |
 
 Codex 的 review 等子代理请求仍使用 `/v1/responses`，并通过 `x-openai-subagent` 请求头携带子代理类型；
 网关不提供独立的子代理请求路径。
@@ -195,8 +196,13 @@ Responses 上游编码会移除 Codex 不接受的顶层 `temperature`、`max_ou
 因为 Codex 后端只接受条目数组；数组及其他类型原样透传。`input` 数组中显式指定 `type: "message"`
 且 `role: "system"` 的消息，其角色转换为 Codex 接受的 `developer`；消息内容、顺序、其他字段和顶层
 `instructions` 保持不变。HTTP/SSE 与 WebSocket 共用这条正文兼容规则。
-`prompt_cache_key`、`reasoning`、`include` 等 Codex 参数继续保留。过滤只作用于顶层，
+`prompt_cache_key`、`reasoning`、`include` 等 Codex 参数继续保留。上述参数过滤只作用于顶层，
 不删除工具参数 schema、输入内容或 `client_metadata` 内的同名业务字段；其他未知字段继续透传。
+
+Codex/OAuth 上游的历史回填按字段形状兼容，不以 User-Agent 品牌区分：显式 `type: "reasoning"`
+的 `input` 项移除顶层 `status`；该项具有非空字符串 `encrypted_content` 时，还会移除非空数组
+`content`。其他字段及顺序保持不变，缺少非空加密载荷的明文历史由上游判定。
+普通消息、工具项及未知类型不受此规则影响，API Key 上游不应用此规则。
 
 请求头过滤不提供客户端匿名化；系统提示词、工具定义、工具结果、工作目录及其他业务 metadata
 保持原有语义，可能包含客户端环境信息。
@@ -296,6 +302,30 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 官方 Codex 的 WebSocket 客户端支持这一流程。其他客户端需要自行处理，网关不会跨账号发送原增量输入。
 普通限流、容量不足、发送结果不明以及已经交付输出的失败不触发此转换。
 
+### API Key 额度查询
+
+`GET /v1/usage` 使用 `Authorization: Bearer <Client Key>`，不接受会话 Cookie、管理 API Key 或查询参数。
+只返回该 Key 的日与周额度，不包含明文 Key、账号资料或其他 Key 的数据。查询不会调用上游、扣费、占用推理并发/RPM，
+也不会更新最近使用时间或开启预算窗口；额度耗尽后仍可查询。
+
+成功响应直接返回以下 JSON，不使用管理接口信封，所有响应带 `Cache-Control: no-store`：
+
+```json
+{
+  "unit": "USD",
+  "daily": { "total": "1", "used": "0.640001", "remaining": "0.359999", "resetsAt": "2026-09-21T16:00:00Z" },
+  "weekly": { "total": "5", "used": "2.35", "remaining": "2.65", "resetsAt": "2026-09-27T16:00:00Z" }
+}
+```
+
+金额使用十进制字符串，`total` 为当前周期限额，`used` 为该周期已结算金额，`remaining` 为限额减已用且最低为零。
+不限额时 `total`、`remaining` 均为 `null`，仍返回已用金额。`resetsAt` 为 RFC3339 时间，尚未开启或已到期的窗口返回 `null`，
+已到期窗口的 `used` 为 `"0"`。日窗口按北京时间零点划分，周窗口沿用首次使用起的七天周期，不固定为周一。
+修改限额、管理员重置和费用结算均复用现有 Key 账本，不从请求日志重算余额。
+
+缺失、非法、已禁用或已删除的 Key 返回 OpenAI 风格 `401` 错误；未知查询参数返回 `400 invalid_usage_query`，
+读取账本失败返回 `503 usage_unavailable`，不会用零余额掩盖故障。
+
 ## 4. 浏览器认证
 
 ### 统一登录与会话
@@ -355,7 +385,7 @@ OpenAI 选号阶段确认本次可选账号全部额度耗尽时，HTTP 返回 `
 `kind` 为 `success`（默认）或 `error`。分页响应为 `{ items, currentPage, pageSize, total }`。
 
 overview 返回 `asOf`、`startTime`、`endTime`、`key`、`summary`、`trend`、`healthTimeline`。
-`key` 仅包含名称、掩码前缀、并发/RPM、日与七日限额、已用 USD 及重置时间；零限额表示不限，
+`key` 仅包含名称、掩码前缀、并发/RPM、日与周限额、已用 USD 及重置时间；零限额表示不限，
 未启动窗口的重置时间为 null。额度使用现有结算账本，不受日志日期或模型筛选影响。
 健康时间线沿用管理端的 96 个北京时间日内桶与可用性语义，不受历史范围和模型筛选影响。
 
@@ -1353,6 +1383,9 @@ errorCode, errorMessage, startedAt, completedAt, expiresAt, createdAt, updatedAt
 用量查询可组合页码/游标、时间范围、Provider、Client Key、账号、模型、route、transport、状态码、
 request/response/upstream ID、outcome 与搜索文本。诊断 `dimension` 可取 `model`、`account`、
 `apiKey`、`provider`、`transport`、`failureClass`、`status`。
+
+管理端请求列表及 Dashboard 最近请求中的 `accountNotes` 为账号当前备注，按内部账号 ID 关联。
+备注不写入请求历史快照；无备注或账号已删除时返回 `null`，修改备注不改变历史请求的账号归属。
 
 管理端请求列表与详情分别保留 `requestedModel`（客户端请求）、`upstreamModel`（网关发送）与
 `upstreamResponseModel`（上游返回）。返回模型缺失时为 `null`，不使用请求或映射模型补齐。

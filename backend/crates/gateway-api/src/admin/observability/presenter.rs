@@ -286,6 +286,7 @@ pub(crate) fn usage_list_record_view(record: domain::UsageListRecord) -> UsageLi
         account_id: record.provider_account_ref,
         account_email: record.provider_account_email,
         account_name: record.provider_account_name,
+        account_notes: record.provider_account_notes,
         route: record.endpoint,
         model,
         requested_model: record.requested_model_id,

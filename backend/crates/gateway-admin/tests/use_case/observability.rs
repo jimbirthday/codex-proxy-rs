@@ -880,6 +880,7 @@ fn total_record(
         provider_account_ref: None,
         provider_account_name: None,
         provider_account_email: None,
+        provider_account_notes: None,
         provider_account_authentication_kind: None,
         upstream_model_id: Some("gpt-5.5".to_owned()),
         upstream_transport: None,

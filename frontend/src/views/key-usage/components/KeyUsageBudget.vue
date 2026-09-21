@@ -8,7 +8,7 @@ import { keyUsageTime, money } from '../utils/format'
 const props = defineProps<{ budget: KeyUsageBudget }>()
 const windows = computed(() => [
   { label: '今日额度', limit: props.budget.dailyLimitUsd, used: props.budget.dailyUsedUsd, reset: props.budget.dailyResetsAt },
-  { label: '7日额度', limit: props.budget.weeklyLimitUsd, used: props.budget.weeklyUsedUsd, reset: props.budget.weeklyResetsAt },
+  { label: '周额度', limit: props.budget.weeklyLimitUsd, used: props.budget.weeklyUsedUsd, reset: props.budget.weeklyResetsAt },
 ].map(window => ({
   ...window,
   limited: Number(window.limit) > 0,

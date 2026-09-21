@@ -153,13 +153,13 @@ const profileProviderOptions = [
             </template>
           </BaseInput>
         </BaseFormItem>
-        <BaseFormItem label="7日限额">
+        <BaseFormItem label="周限额">
           <BaseInput
             v-model="form.weeklyLimitUsd"
             type="number"
             min="0"
             step="any"
-            aria-label="7日限额（美元）"
+            aria-label="周限额（美元）"
             placeholder="不限制"
             :disabled="saving"
           >

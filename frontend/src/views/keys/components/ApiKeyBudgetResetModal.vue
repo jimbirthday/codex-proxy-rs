@@ -17,12 +17,12 @@ const { loading, run } = useAsyncAction()
 const periods = [
   { label: '全部', value: 'all' },
   { label: '日额度', value: 'daily' },
-  { label: '7日额度', value: 'weekly' },
+  { label: '周额度', value: 'weekly' },
 ]
 const windows = computed(() => props.apiKey
   ? [
       { value: 'daily', label: '日额度', used: props.apiKey.dailyUsedUsd },
-      { value: 'weekly', label: '7日额度', used: props.apiKey.weeklyUsedUsd },
+      { value: 'weekly', label: '周额度', used: props.apiKey.weeklyUsedUsd },
     ].map(window => ({ ...window, selected: period.value === 'all' || period.value === window.value }))
   : [])
 

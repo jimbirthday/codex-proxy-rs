@@ -128,6 +128,7 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             mr.provider_kind, mr.provider_account_ref,
             mr.provider_account_name_snapshot as provider_account_name,
             mr.provider_account_email_snapshot as provider_account_email,
+            account.notes as provider_account_notes,
             mr.provider_account_authentication_kind_snapshot
               as provider_account_authentication_kind,
             mr.upstream_model_id, mr.upstream_transport, mr.upstream_response_model, mr.service_tier,
@@ -142,7 +143,8 @@ pub(crate) const USAGE_LIST_RECORD_SELECT: &str =
             mr.reasoning_effort, mr.reasoning_preset, mr.subagent_kind, mr.compact,
             mr.started_at
      from model_requests mr
-     left join client_api_keys client_key on client_key.id = mr.client_api_key_ref";
+     left join client_api_keys client_key on client_key.id = mr.client_api_key_ref
+     left join provider_accounts account on account.id = mr.provider_account_ref";
 
 pub(crate) const USAGE_RECORD_DETAIL_SELECT: &str =
     "select mr.id, mr.client_api_key_ref, mr.config_revision,
