@@ -7,7 +7,7 @@ use gateway_store::postgres::{
 
 use super::TestDatabase;
 
-fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
+pub(super) fn settings_with_margin(refresh_margin_seconds: u64) -> RuntimeSettingsUpdate {
     RuntimeSettingsUpdate {
         openai_client_profile: None,
         xai_client_profile: None,

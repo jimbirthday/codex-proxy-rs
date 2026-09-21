@@ -417,6 +417,27 @@ pub trait ObservabilityStore: Send + Sync {
 /// Runtime settings 与管理员 API Key 写入。
 #[async_trait]
 pub trait SettingsStore: Send + Sync {
+    async fn load_turn_state_probe_policy(
+        &self,
+    ) -> AdminStoreResult<crate::model::turn_state::TurnStateProbePolicy> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "turn state probe policy",
+            "unsupported",
+        ))
+    }
+    async fn update_turn_state_probe_policy(
+        &self,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
+        _context: &MutationContext,
+    ) -> AdminStoreResult<Revision> {
+        Err(AdminStoreError::new(
+            AdminStoreErrorKind::Unavailable,
+            "turn state probe policy",
+            "unsupported",
+        ))
+    }
+
     async fn load_pricing(&self) -> AdminStoreResult<crate::model::pricing::StoredPricing>;
     async fn sync_pricing(
         &self,

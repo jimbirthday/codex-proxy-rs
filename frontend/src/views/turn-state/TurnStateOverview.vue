@@ -16,6 +16,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   selectAccount: [accountId: string]
+  selectModel: [accountId: string, modelId: string]
 }>()
 
 const entryMap = computed(() => {
@@ -80,7 +81,7 @@ function sourceLabel(source: string | null | undefined) {
 </script>
 
 <template>
-  <BaseCard title="账号状态总览" description="区分 State 已获取与已用于请求">
+  <BaseCard title="账号状态总览" description="显示已有运行记录的模型，区分 State 已获取与已用于请求">
     <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-5" aria-live="polite" :aria-busy="loading || undefined">
       <div class="min-h-22 rounded-cp bg-cp-fill-quaternary px-3.5 py-3">
         <span class="inline-flex items-center gap-2 text-cp-xs font-heavy text-cp-text-quaternary"><ShieldCheck class="size-3.5" />OAuth 账号</span>
@@ -125,25 +126,23 @@ function sourceLabel(source: string | null | undefined) {
       :icon="ShieldCheck"
       surface="none"
     />
-    <div v-else class="mt-5 overflow-hidden rounded-cp border border-cp-split">
-      <div class="hidden grid-cols-[minmax(220px,1.2fr)_minmax(160px,1fr)_minmax(160px,1fr)_minmax(180px,1fr)] gap-4 bg-cp-fill-quaternary px-4 py-2.5 text-cp-xs font-heavy text-cp-text-quaternary md:grid">
+    <div v-else class="mt-5 rounded-cp border border-cp-split">
+      <div class="hidden grid-cols-[minmax(0,1.1fr)_minmax(0,0.8fr)_minmax(0,1.8fr)_minmax(0,1fr)] gap-4 bg-cp-fill-quaternary px-4 py-2.5 text-cp-xs font-heavy text-cp-text-quaternary xl:grid">
         <span>OAuth 账号</span><span>请求状态</span><span>模型覆盖</span><span>来源 / 下次轮换</span>
       </div>
       <div class="divide-y divide-cp-split">
-        <button
+        <div
           v-for="row in rows"
           :key="row.account.id"
-          type="button"
-          class="grid w-full gap-3 bg-cp-bg-container px-4 py-3.5 text-left transition-colors hover:bg-cp-fill-quaternary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cp-primary md:grid-cols-[minmax(220px,1.2fr)_minmax(160px,1fr)_minmax(160px,1fr)_minmax(180px,1fr)] md:items-center md:gap-4"
+          class="grid w-full gap-3 bg-cp-bg-container px-4 py-3.5 text-left transition-colors hover:bg-cp-fill-quaternary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-cp-primary xl:grid-cols-[minmax(0,1.1fr)_minmax(0,0.8fr)_minmax(0,1.8fr)_minmax(0,1fr)] xl:items-center xl:gap-4"
           :class="row.account.id === selectedAccountId ? 'bg-cp-fill-quaternary' : undefined"
-          @click="emit('selectAccount', row.account.id)"
         >
           <span class="min-w-0">
-            <span class="block truncate text-cp-sm font-heavy text-cp-text">{{ row.account.email || row.account.name || row.account.id }}</span>
-            <span class="mt-1 block text-cp-xs text-cp-text-secondary">{{ row.account.planTypeDisplay }} · {{ row.account.id }}</span>
+            <button type="button" class="block max-w-full break-all text-left text-cp-sm font-heavy text-cp-text hover:text-cp-primary focus-visible:outline-2 focus-visible:outline-cp-primary" @click="emit('selectAccount', row.account.id)">{{ row.account.email || row.account.name || row.account.id }}</button>
+            <span class="mt-1 block break-all text-cp-xs text-cp-text-secondary">{{ row.account.planTypeDisplay }} · {{ row.account.id }}</span>
           </span>
           <span class="min-w-0">
-            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary md:hidden">请求状态</span>
+            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary xl:hidden">请求状态</span>
             <span class="flex items-center gap-2 text-cp-sm font-heavy" :class="row.status === 'missing' ? 'text-cp-error-text' : row.status === 'ready' ? 'text-cp-warning-text' : 'text-cp-success-text'">
               <CheckCircle2 v-if="row.status === 'applied'" class="size-4" />
               <PlayCircle v-else-if="row.status === 'ready'" class="size-4" />
@@ -152,21 +151,20 @@ function sourceLabel(source: string | null | undefined) {
             </span>
           </span>
           <span class="min-w-0 text-cp-sm text-cp-text-secondary">
-            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary md:hidden">模型覆盖</span>
+            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary xl:hidden">模型覆盖</span>
             <span v-if="row.entries.length === 0">尚未探测</span>
             <span v-else class="flex flex-wrap gap-1.5">
-              <span v-for="entry in row.entries.slice(0, 3)" :key="entry.model" class="rounded-cp-sm bg-cp-fill-quaternary px-1.5 py-0.5 font-mono text-cp-xs" :class="entry.stateAvailable && entry.stateFirstAppliedAt ? 'text-cp-success-text' : entry.stateAvailable ? 'text-cp-warning-text' : 'text-cp-text-secondary'">
+              <button v-for="entry in row.entries" :key="entry.model" type="button" class="max-w-full break-all rounded-cp-sm bg-cp-fill-quaternary px-2 py-1.5 text-left font-mono text-cp-xs hover:bg-cp-fill-tertiary focus-visible:outline-2 focus-visible:outline-cp-primary" :class="entry.stateAvailable && entry.stateFirstAppliedAt ? 'text-cp-success-text' : entry.stateAvailable ? 'text-cp-warning-text' : 'text-cp-text-secondary'" @click="emit('selectModel', row.account.id, entry.model)">
                 {{ entry.model }}{{ entry.stateAvailable && entry.stateFirstAppliedAt ? ' · 已使用' : entry.stateAvailable ? ' · 待使用' : ' · 无' }}
-              </span>
-              <span v-if="row.entries.length > 3" class="text-cp-xs text-cp-text-quaternary">+{{ row.entries.length - 3 }}</span>
+              </button>
             </span>
           </span>
           <span class="text-cp-sm text-cp-text-secondary">
-            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary md:hidden">来源 / 下次轮换</span>
+            <span class="mb-1 block text-cp-xs font-heavy text-cp-text-quaternary xl:hidden">来源 / 下次轮换</span>
             <span v-if="!row.current">—</span>
             <span v-else>{{ sourceLabel(row.current.stateSource) }}<span class="mt-1 block font-mono text-cp-xs text-cp-text-quaternary">{{ formatDateTime(row.current.nextRotationAt) }}</span></span>
           </span>
-        </button>
+        </div>
       </div>
     </div>
   </BaseCard>

@@ -370,6 +370,10 @@ where
         .route("/api/admin/settings/pricing/sync", post(sync_pricing::<S>))
         .route("/api/admin/settings", get(settings::<S>))
         .route(
+            "/api/admin/settings/turn-state-probe",
+            get(turn_state_probe_policy::<S>).post(update_turn_state_probe_policy::<S>),
+        )
+        .route(
             "/api/admin/settings/client-profiles/{provider}",
             get(client_profile_options::<S>),
         )
@@ -785,5 +789,43 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(result.into_inner()),
+    ))
+}
+
+async fn turn_state_probe_policy<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let policy = state
+        .admin_services()
+        .settings()
+        .turn_state_probe_policy()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(policy),
+    ))
+}
+async fn update_turn_state_probe_policy<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(policy): AdminJson<gateway_admin::model::turn_state::TurnStateProbePolicy>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    state
+        .admin_services()
+        .settings()
+        .update_turn_state_probe_policy(&auth.context().mutation_context(), policy.clone())
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(policy),
     ))
 }

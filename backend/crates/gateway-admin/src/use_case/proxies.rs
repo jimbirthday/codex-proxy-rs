@@ -225,7 +225,13 @@ impl ProxiesService for DefaultProxiesService {
             .store
             .delete(id, revision, context)
             .await
-            .map_err(|error| map_store_error(error, "proxy"))?;
+            .map_err(|error| {
+                if error.resource() == "turn_state_probe_policy" {
+                    AdminError::conflict("该代理正用于状态探测，请先调整探测策略")
+                } else {
+                    map_store_error(error, "proxy")
+                }
+            })?;
         publish_committed(self.snapshot.as_ref(), result).await?;
         Ok(result)
     }

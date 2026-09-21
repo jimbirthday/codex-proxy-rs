@@ -662,6 +662,15 @@ impl ProxyStore for PgProxyRepository {
         let config_revision = bump_config_revision_in_transaction(&mut transaction)
             .await
             .map_err(store_error)?;
+        let referenced = sqlx::query_scalar::<_, bool>("select (turn_state_probe_policy_json -> 'proxyIds') ? $1 from runtime_settings where id = 1")
+            .bind(id).fetch_one(&mut *transaction).await.map_err(|_| store_error(unavailable()))?;
+        if referenced {
+            return Err(AdminStoreError::new(
+                gateway_admin::ports::store::AdminStoreErrorKind::Conflict,
+                "turn_state_probe_policy",
+                "proxy is referenced",
+            ));
+        }
         let result = sqlx::query("delete from outbound_proxies where id = $1 and revision = $2")
             .bind(id)
             .bind(i64::try_from(revision.get()).map_err(|_| store_error(invalid()))?)

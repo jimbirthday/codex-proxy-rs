@@ -91,6 +91,7 @@ struct TurnStateProbeCall {
     model: String,
     trigger: TurnStateSource,
     target_ids: Vec<String>,
+    policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
 }
 
 pub(super) struct FakeProviderAdmin {
@@ -341,6 +342,7 @@ impl ProviderAdmin for FakeProviderAdmin {
         model: &UpstreamModelId,
         targets: Vec<TurnStateProbeTarget>,
         trigger: TurnStateSource,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         self.turn_state_probe_calls
             .lock()
@@ -350,6 +352,7 @@ impl ProviderAdmin for FakeProviderAdmin {
                 model: model.as_str().to_owned(),
                 trigger,
                 target_ids: targets.into_iter().map(|target| target.id).collect(),
+                policy,
             });
         self.require_available()?;
         let now = Utc::now();
@@ -1089,10 +1092,18 @@ impl AccountStore for FakeAccountStore {
     }
 }
 
-struct StaticSettingsStore;
+#[derive(Default)]
+struct StaticSettingsStore {
+    probe_policy: Option<gateway_admin::model::turn_state::TurnStateProbePolicy>,
+}
 
 #[async_trait]
 impl SettingsStore for StaticSettingsStore {
+    async fn load_turn_state_probe_policy(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::turn_state::TurnStateProbePolicy> {
+        self.probe_policy.clone().ok_or_else(store_unavailable)
+    }
     async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
         Ok(Default::default())
     }
@@ -1715,7 +1726,9 @@ async fn accounts_batch_update_should_commit_once_and_notify_each_provider() {
     store.set_accounts(vec![openai_account, xai_account]);
     let services = super::AdminHarness::new()
         .accounts(store.clone())
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(openai)
         .provider(xai)
         .probe(Arc::new(SuccessfulAccountProbe))
@@ -1906,7 +1919,9 @@ async fn accounts_list_should_degrade_quota_failure_to_empty_window_without_drop
     store.set_accounts(vec![account_record("openai"), xai_account]);
     let services = super::AdminHarness::new()
         .accounts(store.clone())
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(openai)
         .provider(failing)
         .probe(Arc::new(SuccessfulAccountProbe))
@@ -3037,7 +3052,9 @@ async fn accounts_service_with_probe(
 ) -> AdminServices {
     super::AdminHarness::new()
         .accounts(store)
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(provider)
         .probe(probe)
         .build()
@@ -3250,7 +3267,9 @@ async fn turn_state_services(
 ) -> AdminServices {
     super::AdminHarness::new()
         .accounts(FakeAccountStore::new("openai", events()))
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(provider)
         .probe(Arc::new(SuccessfulAccountProbe))
         .proxies(TurnStateTestProxyStore::new(proxies))
@@ -3266,7 +3285,9 @@ async fn turn_state_bundle(
     account.outbound_proxy = Some(turn_state_proxy(2).proxy);
     super::AdminHarness::new()
         .accounts(FakeAccountStore::with_account(account, events()))
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(provider)
         .probe(Arc::new(SuccessfulAccountProbe))
         .proxies(TurnStateTestProxyStore::new(proxies))
@@ -3331,6 +3352,7 @@ async fn manual_turn_state_probe_should_forward_the_complete_proxy_directory() {
             model: "gpt-5.3-codex".to_owned(),
             trigger: TurnStateSource::ManualProbe,
             target_ids,
+            policy: Default::default(),
         }]
     );
 }
@@ -3417,6 +3439,7 @@ async fn turn_state_renewal_should_forward_saved_proxy_directory() {
             model: "gpt-5.3-codex".to_owned(),
             trigger: TurnStateSource::AutomaticRenewal,
             target_ids,
+            policy: Default::default(),
         }]
     );
 }
@@ -3478,7 +3501,9 @@ async fn free_probe_keeps_custom_duplicate_credentials_and_uses_independent_prox
     };
     let services = super::AdminHarness::new()
         .accounts(FakeAccountStore::new("openai", events()))
-        .settings(Arc::new(StaticSettingsStore))
+        .settings(Arc::new(StaticSettingsStore {
+            probe_policy: Some(Default::default()),
+        }))
         .provider(FakeProviderAdmin::new("openai", events()))
         .proxies(TurnStateTestProxyStore::new(vec![turn_state_proxy(7)]))
         .http_probe(Arc::new(EchoHttpProbe))
@@ -3565,5 +3590,88 @@ async fn automatic_turn_state_probe_requires_saved_proxies() {
     provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject]]);
     let mut bundle = turn_state_bundle(provider.clone(), Vec::new()).await;
     run_turn_state_cycle(&mut bundle).await;
+    assert!(provider.turn_state_probe_calls().is_empty());
+}
+
+#[tokio::test]
+async fn turn_state_policy_saved_switches_control_manual_and_worker_independently() {
+    use gateway_admin::model::turn_state::{TurnStateProbePolicy, TurnStateProxyMode};
+    for (manual, automatic) in [(true, true), (false, true), (true, false), (false, false)] {
+        let provider = FakeProviderAdmin::new("openai", events());
+        let subject = turn_state_subject();
+        provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject.clone()]]);
+        let policy = TurnStateProbePolicy {
+            manual_enabled: manual,
+            automatic_enabled: automatic,
+            mode: TurnStateProxyMode::Fixed,
+            proxy_ids: vec!["proxy-001".to_owned()],
+            candidate_limit: 1,
+        };
+        let mut bundle = super::AdminHarness::new()
+            .accounts(FakeAccountStore::new("openai", events()))
+            .settings(Arc::new(StaticSettingsStore {
+                probe_policy: Some(policy.clone()),
+            }))
+            .provider(provider.clone())
+            .probe(Arc::new(SuccessfulAccountProbe))
+            .proxies(TurnStateTestProxyStore::new(vec![
+                turn_state_proxy(0),
+                turn_state_proxy(1),
+            ]))
+            .build_bundle()
+            .await;
+        run_turn_state_cycle(&mut bundle).await;
+        assert_eq!(
+            provider.turn_state_probe_calls().len(),
+            usize::from(automatic)
+        );
+        let services = super::AdminHarness::new()
+            .accounts(FakeAccountStore::new("openai", events()))
+            .settings(Arc::new(StaticSettingsStore {
+                probe_policy: Some(policy.clone()),
+            }))
+            .provider(provider.clone())
+            .probe(Arc::new(SuccessfulAccountProbe))
+            .proxies(TurnStateTestProxyStore::new(vec![
+                turn_state_proxy(0),
+                turn_state_proxy(1),
+            ]))
+            .build()
+            .await;
+        let result = services
+            .accounts()
+            .probe_turn_state(subject.account_id, subject.model)
+            .await;
+        assert_eq!(result.is_ok(), manual);
+        assert_eq!(
+            provider.turn_state_probe_calls().len(),
+            usize::from(automatic) + usize::from(manual)
+        );
+        for call in provider.turn_state_probe_calls() {
+            assert_eq!(call.policy, policy);
+            assert_eq!(call.target_ids, vec!["proxy-000", "proxy-001"]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn turn_state_policy_load_failure_does_not_fall_back_to_default() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let services = super::AdminHarness::new()
+        .accounts(FakeAccountStore::new("openai", events()))
+        .settings(Arc::new(StaticSettingsStore::default()))
+        .provider(provider.clone())
+        .probe(Arc::new(SuccessfulAccountProbe))
+        .proxies(TurnStateTestProxyStore::new(vec![turn_state_proxy(0)]))
+        .build()
+        .await;
+    let subject = turn_state_subject();
+    assert!(
+        services
+            .accounts()
+            .probe_turn_state(subject.account_id, subject.model)
+            .await
+            .is_err()
+    );
     assert!(provider.turn_state_probe_calls().is_empty());
 }

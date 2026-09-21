@@ -15,6 +15,34 @@ pub(crate) struct AdminSettingsStoreAdapter {
 
 #[async_trait::async_trait]
 impl SettingsStore for AdminSettingsStoreAdapter {
+    async fn load_turn_state_probe_policy(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::turn_state::TurnStateProbePolicy> {
+        self.control_plane
+            .load_turn_state_probe_policy()
+            .await
+            .map_err(|error| admin_store_error("turn state probe policy", error))
+    }
+    async fn update_turn_state_probe_policy(
+        &self,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+        context: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        let audit = mutation_audit(
+            context,
+            "turn_state_probe_policy.update",
+            "runtime_settings",
+            "1",
+            vec!["turn_state_probe_policy_json".to_owned()],
+        );
+        let revision = self
+            .control_plane
+            .update_turn_state_probe_policy(policy, audit)
+            .await
+            .map_err(|error| admin_store_error("turn state probe policy", error))?;
+        admin_revision(revision)
+    }
+
     async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
         self.control_plane
             .load_pricing()

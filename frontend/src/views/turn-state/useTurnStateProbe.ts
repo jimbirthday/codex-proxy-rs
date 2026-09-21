@@ -19,6 +19,7 @@ interface SelectOption {
 }
 
 export function useTurnStateProbe() {
+  const manualEnabled = shallowRef(false)
   const accounts = ref<Account[]>([])
   const models = ref<SelectOption[]>([])
   const selectedAccountId = shallowRef('')
@@ -38,6 +39,7 @@ export function useTurnStateProbe() {
   let detailController: AbortController | undefined
   let probeController: AbortController | undefined
   let selectionVersion = 0
+  let requestedModel: { accountId: string, modelId: string } | undefined
 
   const accountOptions = computed<SelectOption[]>(() => accounts.value.map(account => ({
     label: account.email || account.name || account.label || account.id,
@@ -48,7 +50,7 @@ export function useTurnStateProbe() {
     accounts.value.find(account => account.id === selectedAccountId.value) ?? null,
   )
   const canProbe = computed(() =>
-    Boolean(selectedAccountId.value && selectedModelId.value) && !probing.value,
+    manualEnabled.value && Boolean(selectedAccountId.value && selectedModelId.value) && !probing.value,
   )
 
   function cancelDetails() {
@@ -155,8 +157,14 @@ export function useTurnStateProbe() {
         label: model.label || model.id,
         value: model.id,
       }))
-      selectedModelId.value = models.value.some(model => model.value === previousModel)
-        ? previousModel
+      const historicalModel = requestedModel?.accountId === accountId ? requestedModel.modelId : undefined
+      const targetModel = historicalModel ?? previousModel
+      requestedModel = undefined
+      // 仅显式点击的历史模型可补入目录，避免把上一账号的模型带入新账号。
+      if (historicalModel && !models.value.some(model => model.value === historicalModel))
+        models.value.push({ label: `${targetModel}（历史记录）`, value: targetModel })
+      selectedModelId.value = models.value.some(model => model.value === targetModel)
+        ? targetModel
         : models.value[0]?.value ?? ''
       if (refresh)
         toast.success(`已刷新 ${models.value.length} 个上游模型`)
@@ -212,7 +220,7 @@ export function useTurnStateProbe() {
   async function runProbe() {
     const accountId = selectedAccountId.value
     const modelId = selectedModelId.value
-    if (!accountId || !modelId || probing.value)
+    if (!canProbe.value)
       return
     const version = selectionVersion
     probeController?.abort()
@@ -249,10 +257,30 @@ export function useTurnStateProbe() {
     }
   }
 
+  function selectModel(accountId: string, modelId: string) {
+    if (accountId !== selectedAccountId.value) {
+      requestedModel = { accountId, modelId }
+      selectedAccountId.value = accountId
+    }
+    else if (loadingModels.value || refreshingModels.value) {
+      requestedModel = { accountId, modelId }
+    }
+    else {
+      if (!models.value.some(model => model.value === modelId))
+        models.value.push({ label: `${modelId}（历史记录）`, value: modelId })
+      selectedModelId.value = modelId
+    }
+  }
+
   watch(selectedAccountId, () => {
     void loadModels()
   })
   watch(selectedModelId, () => {
+    // 模型目录切换时的清空不应取消正在加载的新账号目录。
+    if (!selectedModelId.value) {
+      snapshot.value = null
+      return
+    }
     cancelDetails()
     void loadSnapshot()
   })
@@ -267,6 +295,7 @@ export function useTurnStateProbe() {
   })
 
   return {
+    selectModel,
     accounts,
     accountOptions,
     models,
@@ -282,6 +311,7 @@ export function useTurnStateProbe() {
     loadingSnapshot,
     probing,
     canProbe,
+    manualEnabled,
     error,
     loadAccounts,
     loadOverview,

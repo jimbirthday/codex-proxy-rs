@@ -406,14 +406,29 @@ impl OpenAiAdminProvider {
         model: &UpstreamModelId,
         targets: Vec<TurnStateProbeTarget>,
         trigger: TurnStateSource,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         let attempt_limit = match trigger {
-            TurnStateSource::AutomaticRenewal | TurnStateSource::ManualProbe => 3,
+            TurnStateSource::AutomaticRenewal | TurnStateSource::ManualProbe => {
+                usize::from(policy.candidate_limit)
+            }
             TurnStateSource::UpstreamResponse => {
                 return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
             }
         };
+        policy
+            .validate()
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        if trigger == TurnStateSource::ManualProbe && !policy.manual_enabled {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
+                .with_public_message("手动状态探测已关闭"));
+        }
         let started_at = Utc::now();
+        if trigger == TurnStateSource::AutomaticRenewal && !policy.automatic_enabled {
+            return Ok(empty_turn_state_probe_result(
+                account_id, model, trigger, started_at,
+            ));
+        }
         let account = self.account(account_id).await?;
         if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
             return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
@@ -431,7 +446,7 @@ impl OpenAiAdminProvider {
             account_id,
             model,
             account.revision(),
-            targets,
+            crate::turn_state::TurnStateProbeCandidates { targets, policy },
             account.outbound_proxy(),
             trigger,
         ) {
@@ -834,8 +849,9 @@ impl ProviderAdmin for OpenAiAdminProvider {
         model: &UpstreamModelId,
         targets: Vec<TurnStateProbeTarget>,
         trigger: TurnStateSource,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
-        self.probe_turn_state_impl(account_id, model, targets, trigger)
+        self.probe_turn_state_impl(account_id, model, targets, trigger, policy)
             .await
     }
 

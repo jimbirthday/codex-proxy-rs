@@ -23,6 +23,19 @@ use super::{map_store_error, publish_committed};
 /// API 消费的 Runtime settings 管理服务。
 #[async_trait]
 pub trait SettingsService: Send + Sync {
+    async fn turn_state_probe_policy(
+        &self,
+    ) -> Result<crate::model::turn_state::TurnStateProbePolicy, AdminError> {
+        Err(AdminError::unavailable("无法读取探测策略"))
+    }
+    async fn update_turn_state_probe_policy(
+        &self,
+        _context: &MutationContext,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::unavailable("无法保存探测策略"))
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError>;
@@ -104,6 +117,34 @@ impl DefaultSettingsService {
 
 #[async_trait]
 impl SettingsService for DefaultSettingsService {
+    async fn turn_state_probe_policy(
+        &self,
+    ) -> Result<crate::model::turn_state::TurnStateProbePolicy, AdminError> {
+        self.store
+            .load_turn_state_probe_policy()
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe policy"))
+    }
+    async fn update_turn_state_probe_policy(
+        &self,
+        context: &MutationContext,
+        policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<(), AdminError> {
+        policy.validate()?;
+        let revision = self
+            .store
+            .update_turn_state_probe_policy(policy, context)
+            .await
+            .map_err(|error| {
+                if error.kind() == crate::ports::store::AdminStoreErrorKind::Invalid {
+                    AdminError::invalid("所选代理已不存在，请刷新后重新选择")
+                } else {
+                    map_store_error(error, "turn state probe policy")
+                }
+            })?;
+        publish_committed(self.snapshot.as_ref(), revision).await
+    }
+
     async fn preview_pricing_sync(
         &self,
     ) -> Result<crate::model::pricing::PricingSyncPreview, AdminError> {

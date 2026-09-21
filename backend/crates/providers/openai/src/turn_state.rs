@@ -8,8 +8,8 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use gateway_admin::model::turn_state::{
-    TurnStateOverviewEntry, TurnStateProbeResult, TurnStateProbeSubject, TurnStateProbeTarget,
-    TurnStateSnapshot, TurnStateSource,
+    TurnStateOverviewEntry, TurnStateProbePolicy, TurnStateProbeResult, TurnStateProbeSubject,
+    TurnStateProbeTarget, TurnStateProxyMode, TurnStateSnapshot, TurnStateSource,
 };
 use gateway_core::{
     account::{CredentialRevision, OutboundProxy, ProviderAccountId},
@@ -187,6 +187,11 @@ impl ProxySchedule {
         self.cooldown_until = None;
         self.touched_at = now;
     }
+}
+
+pub(crate) struct TurnStateProbeCandidates {
+    pub(crate) targets: Vec<TurnStateProbeTarget>,
+    pub(crate) policy: TurnStateProbePolicy,
 }
 
 pub(crate) enum TurnStateProbeAdmission {
@@ -451,7 +456,7 @@ impl TurnStateStore {
         account_id: &ProviderAccountId,
         model: &UpstreamModelId,
         credential_revision: CredentialRevision,
-        targets: Vec<TurnStateProbeTarget>,
+        candidates: TurnStateProbeCandidates,
         bound_proxy: Option<&OutboundProxy>,
         trigger: TurnStateSource,
     ) -> TurnStateProbeAdmission {
@@ -466,7 +471,7 @@ impl TurnStateStore {
         {
             return TurnStateProbeAdmission::Busy;
         }
-        let targets = normalize_targets(targets);
+        let targets = normalize_targets(candidates.targets);
         if targets.is_empty() {
             return TurnStateProbeAdmission::NoCandidates;
         }
@@ -482,13 +487,21 @@ impl TurnStateStore {
             schedule_now,
         );
         synchronize_candidates(&mut schedule, &mut entries, account_id, &targets);
+        let targets = targets
+            .into_iter()
+            .filter(|target| candidates.policy.allows(&target.id))
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            return TurnStateProbeAdmission::NoCandidates;
+        }
         if !ensure_entry(&mut entries, &mut schedule, &subject, now, schedule_now) {
             return TurnStateProbeAdmission::CapacityExhausted;
         }
 
+        // 代理池可能已调整，代理冷却按本轮候选重新计算，账号/模型退避仍然保留。
         let entry_limit = entries
             .get(&subject)
-            .and_then(|entry| entry.next_allowed_at);
+            .and_then(|entry| entry.failure_backoff_until);
         let account = schedule
             .accounts
             .get(account_id)
@@ -510,7 +523,14 @@ impl TurnStateStore {
         {
             return TurnStateProbeAdmission::Deferred;
         }
-        let ordered = ordered_candidates(&schedule, &entries, &subject, &targets, bound_proxy);
+        let ordered = ordered_candidates(
+            &schedule,
+            &entries,
+            &subject,
+            &targets,
+            bound_proxy,
+            candidates.policy.mode,
+        );
         let mut available = Vec::new();
         let mut earliest_recovery = None;
         for target in &ordered {
@@ -527,6 +547,11 @@ impl TurnStateStore {
             entry.next_allowed_at = later(entry.failure_backoff_until, Some(until));
             entry.schedule_touched_at = schedule_now;
             return TurnStateProbeAdmission::Deferred;
+        }
+        if candidates.policy.mode == TurnStateProxyMode::Random
+            && !shuffle_candidates(&mut available)
+        {
+            return TurnStateProbeAdmission::CapacityExhausted;
         }
         if !reserve_proxy_records(&mut schedule, &subject, &targets, schedule_now) {
             return TurnStateProbeAdmission::CapacityExhausted;
@@ -1269,7 +1294,7 @@ fn check_probe_request(
     {
         return ProbeRequestCheck::Rejected;
     }
-    // 预算耗尽就结束本轮，不持有账号 gate 等待下一个五分钟窗口。
+    // 预算耗尽就结束本轮，不持有账号 gate 等待下一个滚动窗口。
     if budget_recovery(account, now).is_some()
         || account.rate_limit_until.is_some_and(|until| until > now)
         || (run.trigger == TurnStateSource::AutomaticRenewal
@@ -1347,6 +1372,7 @@ fn ordered_candidates(
     subject: &TurnStateKey,
     targets: &[TurnStateProbeTarget],
     bound_proxy: Option<&OutboundProxy>,
+    mode: TurnStateProxyMode,
 ) -> Vec<TurnStateProbeTarget> {
     let by_id = targets
         .iter()
@@ -1356,7 +1382,7 @@ fn ordered_candidates(
     let mut seen = HashSet::new();
     for target in targets
         .iter()
-        .filter(|target| target.proxy.as_ref() == bound_proxy)
+        .filter(|target| mode == TurnStateProxyMode::Smart && target.proxy.as_ref() == bound_proxy)
     {
         if seen.insert(target.id.as_str()) {
             result.push(target.clone());
@@ -1371,7 +1397,11 @@ fn ordered_candidates(
             .get(&subject.account_id)
             .and_then(|account| account.preferred_proxy.as_ref()),
     ];
-    for preferred in preferences.into_iter().flatten() {
+    for preferred in preferences
+        .into_iter()
+        .flatten()
+        .filter(|_| mode == TurnStateProxyMode::Smart)
+    {
         if let Some(target) = by_id.get(preferred.id.as_str())
             && target.proxy == preferred.proxy
             && seen.insert(target.id.as_str())
@@ -1604,4 +1634,22 @@ fn earlier(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
         (Some(value), None) | (None, Some(value)) => Some(value),
         (None, None) => None,
     }
+}
+
+/// 仅对本轮可用候选无放回洗牌；随机抽样不会改变目录或抹掉未选中代理的冷却。
+fn shuffle_candidates(targets: &mut [TurnStateProbeTarget]) -> bool {
+    for index in (1..targets.len()).rev() {
+        let bound = (index + 1) as u64;
+        let threshold = bound.wrapping_neg() % bound;
+        let selected = loop {
+            let Ok(value) = getrandom::u64() else {
+                return false;
+            };
+            if value >= threshold {
+                break (value % bound) as usize;
+            }
+        };
+        targets.swap(index, selected);
+    }
+    true
 }

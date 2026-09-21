@@ -359,6 +359,7 @@ pub async fn initialize(
         probe.clone(),
         store.proxies(),
         use_case::accounts::AccountDiagnosticsDependencies {
+            settings: store.settings(),
             http_probe: proxy_probe.clone(),
             store: store.turn_state_probe_capture(),
             auth: store.auth(),

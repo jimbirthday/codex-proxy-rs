@@ -410,6 +410,7 @@ impl AuthStore for MemoryAuthStore {
 }
 
 pub(super) struct MemorySettingsStore {
+    turn_state_policy: Mutex<gateway_admin::model::turn_state::TurnStateProbePolicy>,
     pricing: Mutex<gateway_admin::model::pricing::StoredPricing>,
     settings: Mutex<RuntimeSettings>,
     api_key: Arc<Mutex<Option<AdminApiKey>>>,
@@ -433,6 +434,7 @@ impl gateway_admin::ports::pricing::PricingSource for StaticPricingSource {
 impl MemorySettingsStore {
     fn new(api_key: Arc<Mutex<Option<AdminApiKey>>>) -> Self {
         Self {
+            turn_state_policy: Mutex::default(),
             settings: Mutex::new(test_runtime_settings()),
             pricing: Mutex::default(),
             api_key,
@@ -446,6 +448,22 @@ impl MemorySettingsStore {
 
 #[async_trait]
 impl SettingsStore for MemorySettingsStore {
+    async fn load_turn_state_probe_policy(
+        &self,
+    ) -> AdminStoreResult<gateway_admin::model::turn_state::TurnStateProbePolicy> {
+        Ok(self.turn_state_policy.lock().unwrap().clone())
+    }
+    async fn update_turn_state_probe_policy(
+        &self,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+        _: &MutationContext,
+    ) -> AdminStoreResult<gateway_admin::model::Revision> {
+        *self.turn_state_policy.lock().unwrap() = policy;
+        let mut settings = self.settings.lock().unwrap();
+        settings.config_revision = next_revision(settings.config_revision);
+        Ok(settings.config_revision)
+    }
+
     async fn load_pricing(&self) -> AdminStoreResult<gateway_admin::model::pricing::StoredPricing> {
         Ok(self.pricing.lock().expect("pricing").clone())
     }

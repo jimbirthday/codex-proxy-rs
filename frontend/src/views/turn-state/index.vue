@@ -9,10 +9,12 @@ import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
 import { formatDateTime } from '@/utils/date'
 import TurnStateOverview from './TurnStateOverview.vue'
+import TurnStatePolicyCard from './TurnStatePolicyCard.vue'
 import TurnStateProbeHistory from './TurnStateProbeHistory.vue'
 import { useTurnStateProbe } from './useTurnStateProbe'
 
 const {
+  selectModel,
   accounts,
   accountOptions,
   models,
@@ -28,6 +30,7 @@ const {
   loadingSnapshot,
   probing,
   canProbe,
+  manualEnabled,
   error,
   loadAccounts,
   loadOverview,
@@ -100,16 +103,19 @@ function invalidationMessage(reason: string | null | undefined) {
       </template>
     </BasePageHeader>
 
+    <TurnStatePolicyCard @manual-enabled="manualEnabled = $event" />
+
     <TurnStateOverview
       :accounts="accounts"
       :entries="overview"
       :loading="loadingAccounts || loadingOverview"
       :selected-account-id="selectedAccountId"
       @select-account="selectedAccountId = $event"
+      @select-model="selectModel"
     />
 
     <div class="mt-5 grid min-w-0 gap-4 xl:grid-cols-[minmax(320px,0.82fr)_minmax(0,1.8fr)]">
-      <BaseCard title="探测目标" description="选择账号和上游模型；探测仅使用已保存代理">
+      <BaseCard title="探测目标" description="选择账号和上游模型，使用已保存的探测策略">
         <div class="grid gap-4">
           <div class="grid gap-2">
             <span id="turn-state-account-label" class="text-cp-sm font-heavy text-cp-text-secondary">OAuth 账号</span>
@@ -164,7 +170,7 @@ function invalidationMessage(reason: string | null | undefined) {
             <template #icon>
               <RotateCw class="size-4.5" />
             </template>
-            {{ probing ? '正在探测候选代理' : '通过代理探测并替换' }}
+            {{ probing ? '正在探测候选代理' : manualEnabled ? '通过代理探测并替换' : '手动探测未开启' }}
           </BaseButton>
         </div>
       </BaseCard>

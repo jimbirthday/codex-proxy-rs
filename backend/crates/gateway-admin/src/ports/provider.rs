@@ -163,6 +163,7 @@ pub trait ProviderAdmin: Send + Sync {
         _model: &UpstreamModelId,
         _targets: Vec<TurnStateProbeTarget>,
         _trigger: TurnStateSource,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }

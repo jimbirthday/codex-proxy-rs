@@ -1048,3 +1048,68 @@ async fn pricing_endpoints_require_administrator_authentication() {
         );
     }
 }
+
+#[tokio::test]
+async fn turn_state_policy_routes_require_auth_and_round_trip_validated_settings() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    for method in [Method::GET, Method::POST] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri("/api/admin/settings/turn-state-probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let policy = json!({"manualEnabled":false,"automaticEnabled":true,"mode":"pool","proxyIds":["proxy-b","proxy-c"],"candidateLimit":2});
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/turn-state-probe",
+            Some(policy.clone()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_json(response).await["data"], policy);
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/api/admin/settings/turn-state-probe",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(response).await["data"], policy);
+    for (invalid, status) in [
+        (json!({"mode":"direct"}), StatusCode::UNPROCESSABLE_ENTITY),
+        (
+            json!({"manualEnabled":true,"automaticEnabled":true,"mode":"fixed","proxyIds":[],"candidateLimit":1}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"manualEnabled":true,"automaticEnabled":true,"mode":"random","proxyIds":["a","a"],"candidateLimit":4}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(request(
+                Method::POST,
+                "/api/admin/settings/turn-state-probe",
+                Some(invalid),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+    }
+}

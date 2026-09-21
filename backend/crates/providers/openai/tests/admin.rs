@@ -868,6 +868,7 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
                 },
             ],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("turn state probe");
@@ -1023,6 +1024,7 @@ async fn turn_state_smart_scheduling_prefers_exact_model_and_keeps_business_refr
             &upstream_model("gpt-5.4"),
             vec![probe_target("probe", &proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("probe state");
@@ -1135,6 +1137,7 @@ async fn turn_state_smart_scheduling_falls_back_on_lease_busy_and_invalidated_st
             &upstream_model("gpt-5.4"),
             vec![probe_target("probe", &proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("probe state");
@@ -1313,6 +1316,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 &manual_model,
                 manual_targets,
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -1344,6 +1348,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("key backoff remains active one second before its boundary");
@@ -1357,7 +1362,8 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 account.id(),
                 &upstream_model("other"),
                 targets.clone(),
-                TurnStateSource::ManualProbe
+                TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -1371,7 +1377,8 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 account.id(),
                 &model,
                 targets.clone(),
-                TurnStateSource::ManualProbe
+                TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -1384,6 +1391,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("next manual round");
@@ -1421,6 +1429,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                     .filter(|target| target.id == "d")
                     .collect(),
                 TurnStateSource::AutomaticRenewal,
+                Default::default(),
             )
             .await
     });
@@ -1505,6 +1514,7 @@ async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_se
             &model,
             vec![direct.clone()],
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await;
     assert!(rejected.is_err());
@@ -1518,6 +1528,7 @@ async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_se
                 probe_target("b", &second),
             ],
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await
         .expect("cold recovery");
@@ -1577,6 +1588,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("manual seed");
@@ -1602,6 +1614,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("invalidate applied state");
@@ -1628,6 +1641,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target.clone()],
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await
         .expect("renew active state");
@@ -1639,6 +1653,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("invalidate unused replacement");
@@ -1689,6 +1704,7 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
             &model,
             vec![a.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed preferred a");
@@ -1700,6 +1716,7 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
             &model,
             vec![a, b.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("bound b before preferred a");
@@ -1707,7 +1724,13 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
     assert_eq!(result.attempts.len(), 1);
     tokio::time::advance(Duration::from_secs(300)).await;
     admin
-        .probe_turn_state(account.id(), &model, vec![b], TurnStateSource::ManualProbe)
+        .probe_turn_state(
+            account.id(),
+            &model,
+            vec![b],
+            TurnStateSource::ManualProbe,
+            Default::default(),
+        )
         .await
         .expect("invalidate unused manual state");
     tokio::time::advance(Duration::from_secs(300)).await;
@@ -1809,6 +1832,7 @@ async fn turn_state_probe_configuration_failures_consume_budget_without_history(
             &upstream_model("gpt-config"),
             targets.clone(),
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("three configuration failures exhaust manual budget");
@@ -1841,6 +1865,7 @@ async fn turn_state_probe_configuration_failures_consume_budget_without_history(
             &upstream_model("gpt-config"),
             targets,
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("untried candidate remains available next round");
@@ -1941,6 +1966,7 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
             &model,
             targets.clone(),
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await
         .expect("automatic configuration result");
@@ -1964,6 +1990,7 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
             &model,
             targets,
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await
         .expect("untried automatic candidate");
@@ -2041,6 +2068,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &first_model_task,
                 first_targets,
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -2081,6 +2109,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &second_model_task,
                 second_targets,
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -2109,6 +2138,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &first_model,
                 third_targets,
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -2159,6 +2189,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
                     &upstream_model(&format!("gpt-slot-{index}")),
                     vec![task_target],
                     TurnStateSource::ManualProbe,
+                    Default::default(),
                 )
                 .await
         }));
@@ -2208,6 +2239,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
                 &upstream_model("gpt-serial-a"),
                 vec![serial_target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -2219,6 +2251,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
             &upstream_model("gpt-serial-b"),
             vec![probe_target("serial", &serial_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("same account manual probe must conflict");
@@ -2230,6 +2263,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
             &upstream_model("gpt-serial-b"),
             vec![probe_target("serial", &serial_proxy)],
             TurnStateSource::AutomaticRenewal,
+            Default::default(),
         )
         .await
         .expect("busy automatic probe");
@@ -2281,6 +2315,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("407 probe result");
@@ -2293,6 +2328,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &upstream_model("gpt-other-model"),
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect_err("account proxy cooldown must cross models");
@@ -2314,6 +2350,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect_err("proxy cooldown remains active one second before expiry");
@@ -2328,6 +2365,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("proxy cooldown recovery");
@@ -2348,6 +2386,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("post-success 407");
@@ -2361,6 +2400,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -2374,6 +2414,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("proxy success resets cooldown progression");
@@ -2408,6 +2449,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                 &failed_model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("model failure");
@@ -2421,6 +2463,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                 &failed_model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect_err("same model must be cooled");
@@ -2438,6 +2481,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                     &upstream_model("gpt-model-other"),
                     vec![other_target],
                     TurnStateSource::ManualProbe,
+                    Default::default(),
                 )
                 .await
         });
@@ -2486,6 +2530,7 @@ async fn first_manual_failures_do_not_create_automatic_probe_eligibility() {
                 &model,
                 vec![probe_target(account_name, &proxy)],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("first manual failure");
@@ -2543,6 +2588,7 @@ async fn turn_state_probe_accepts_valid_state_on_312_and_short_circuits() {
             &model,
             probe_targets(&proxy, &["a", "b"]),
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("312 state result");
@@ -2584,6 +2630,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-auth-failed"),
                 vec![target.clone(), probe_target("unused", &proxy)],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("auth result");
@@ -2598,6 +2645,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                     &upstream_model("gpt-auth-failed"),
                     vec![target.clone()],
                     TurnStateSource::ManualProbe,
+                    Default::default()
                 )
                 .await
                 .is_err()
@@ -2609,6 +2657,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-auth-other"),
                 vec![target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("auth failures do not cool proxy");
@@ -2654,6 +2703,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-a"),
             vec![first_target.clone(), probe_target("unused", &unused_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("429 result");
@@ -2667,6 +2717,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-b"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -2681,6 +2732,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-b"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -2694,6 +2746,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-b"),
             vec![first_target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("429 recovery");
@@ -2706,6 +2759,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-c"),
             vec![first_target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("second 429 after success");
@@ -2719,6 +2773,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-d"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -2736,6 +2791,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-d"),
             vec![first_target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("successful probe reset 429 progression");
@@ -2785,6 +2841,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect("401 probe result");
@@ -2802,6 +2859,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
             .expect_err("key backoff remains active before exact boundary");
@@ -2819,6 +2877,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("key backoff recovery");
@@ -2831,6 +2890,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("401 after reset");
@@ -2845,6 +2905,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
+                Default::default()
             )
             .await
             .is_err()
@@ -2858,6 +2919,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("first backoff restored after success");
@@ -2906,6 +2968,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
                 &upstream_model("gpt-timeout"),
                 vec![slow_target_for_task],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -2928,6 +2991,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
                     &upstream_model("gpt-fast"),
                     vec![target],
                     TurnStateSource::ManualProbe,
+                    Default::default(),
                 )
                 .await
         }));
@@ -2976,6 +3040,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
             &upstream_model("gpt-timeout-other"),
             vec![slow_target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("timeout cooldown is account proxy scoped");
@@ -3017,6 +3082,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
             &upstream_model("gpt-cooled"),
             vec![cooled_target.clone()],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("407 result");
@@ -3029,6 +3095,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
             &upstream_model("gpt-cooled-other"),
             vec![cooled_target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("cooled account rejected before slot acquisition");
@@ -3052,6 +3119,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
                     &upstream_model("gpt-active"),
                     vec![target],
                     TurnStateSource::ManualProbe,
+                    Default::default(),
                 )
                 .await
         }));
@@ -3111,6 +3179,7 @@ async fn turn_state_probe_network_failure_cools_the_account_proxy() {
                 &upstream_model("gpt-network"),
                 vec![probe_target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -3130,6 +3199,7 @@ async fn turn_state_probe_network_failure_cools_the_account_proxy() {
             &upstream_model("gpt-network-other"),
             vec![target],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("network cooldown is account proxy scoped");
@@ -3180,6 +3250,7 @@ async fn automatic_turn_state_probe_stops_when_business_refreshes_state() {
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("qualifying manual probe");
@@ -3211,6 +3282,7 @@ async fn automatic_turn_state_probe_stops_when_business_refreshes_state() {
                 &automatic_model,
                 targets,
                 TurnStateSource::AutomaticRenewal,
+                Default::default(),
             )
             .await
     });
@@ -3308,6 +3380,7 @@ async fn turn_state_probe_stale_results_cannot_replace_newer_business_state() {
                     &probe_model_task,
                     vec![probe_target("stale", &proxy)],
                     TurnStateSource::ManualProbe,
+                    Default::default(),
                 )
                 .await
         });
@@ -3376,6 +3449,7 @@ async fn turn_state_probe_exit_change_keeps_only_diagnostics() {
                 &upstream_model("gpt-5.4"),
                 vec![probe_target("old", &proxy)],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -3443,6 +3517,7 @@ async fn turn_state_snapshot_and_late_application_do_not_mark_rotated_state() {
             &model,
             vec![probe_target("old", &proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed old state");
@@ -3536,6 +3611,7 @@ async fn turn_state_proxy_address_change_clears_old_cooldown() {
             &upstream_model("gpt-address-old"),
             vec![probe_target("b", &old_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("old address 407");
@@ -3549,6 +3625,7 @@ async fn turn_state_proxy_address_change_clears_old_cooldown() {
             &upstream_model("gpt-address-new"),
             vec![probe_target("b", &new_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("same ID with new address is not cooled");
@@ -3596,6 +3673,7 @@ async fn turn_state_proxy_address_change_clears_old_preference() {
             &model,
             vec![probe_target("b", &old_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed b preference");
@@ -3608,6 +3686,7 @@ async fn turn_state_proxy_address_change_clears_old_preference() {
             &model,
             vec![probe_target("a", &proxy_a), probe_target("b", &new_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("changed preference candidates");
@@ -3655,6 +3734,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-1"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed b cooldown");
@@ -3667,6 +3747,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-2"),
             vec![probe_target("a", &proxy_a)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("remove b from directory");
@@ -3679,6 +3760,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-3"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("restored b has no old cooldown");
@@ -3718,6 +3800,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-1"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed b account preference");
@@ -3730,6 +3813,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-2"),
             vec![probe_target("a", &proxy_a)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("remove b preference");
@@ -3742,6 +3826,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-3"),
             vec![probe_target("a", &proxy_a), probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("deleted b preference does not revive");
@@ -3797,6 +3882,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
             &other_model,
             vec![probe_target("other", &other_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("seed isolated account");
@@ -3814,6 +3900,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
                 &running_model,
                 vec![old_target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -3829,6 +3916,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
             &new_model,
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("old run keeps the removed account gate");
@@ -3877,6 +3965,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
                 &replacement_model,
                 vec![new_target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -3946,6 +4035,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
                 &upstream_model("gpt-cancel-old"),
                 vec![old_target],
                 TurnStateSource::ManualProbe,
+                Default::default(),
             )
             .await
     });
@@ -3961,6 +4051,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
             &upstream_model("gpt-cancel-new"),
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect_err("removed account cannot create a second gate");
@@ -3986,6 +4077,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
             &upstream_model("gpt-cancel-new"),
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
+            Default::default(),
         )
         .await
         .expect("cancelled gate released");
@@ -5767,5 +5859,160 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
     assert_eq!(
         admin.reset_credits(account.id()).await.unwrap_err().kind(),
         ProviderAdminErrorKind::Unsupported
+    );
+}
+
+#[tokio::test]
+async fn turn_state_policy_switches_reject_new_manual_and_skip_automatic_requests() {
+    use gateway_admin::model::turn_state::TurnStateProbePolicy;
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_policy_disabled"]).await;
+    let account = store.account("acct_policy_disabled").unwrap();
+    let policy = TurnStateProbePolicy {
+        manual_enabled: false,
+        automatic_enabled: false,
+        ..Default::default()
+    };
+    let manual = bundle
+        .admin_provider()
+        .probe_turn_state(
+            account.id(),
+            &upstream_model("gpt-5.4"),
+            vec![probe_target("a", &proxy)],
+            TurnStateSource::ManualProbe,
+            policy.clone(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(manual.kind(), ProviderAdminErrorKind::Conflict);
+    let automatic = bundle
+        .admin_provider()
+        .probe_turn_state(
+            account.id(),
+            &upstream_model("gpt-5.4"),
+            vec![probe_target("a", &proxy)],
+            TurnStateSource::AutomaticRenewal,
+            policy,
+        )
+        .await
+        .unwrap();
+    assert!(automatic.attempts.is_empty());
+    assert!(proxy.received_requests().await.unwrap().is_empty());
+    assert!(base.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn turn_state_policy_fixed_failure_never_falls_back_to_other_saved_proxies() {
+    use gateway_admin::model::turn_state::{TurnStateProbePolicy, TurnStateProxyMode};
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(probe_response(200, None))
+        .expect(1)
+        .mount(&proxy)
+        .await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_policy_fixed"]).await;
+    let account = store.account("acct_policy_fixed").unwrap();
+    let result = bundle
+        .admin_provider()
+        .probe_turn_state(
+            account.id(),
+            &upstream_model("gpt-5.4"),
+            probe_targets(&proxy, &["a", "b", "c"]),
+            TurnStateSource::ManualProbe,
+            TurnStateProbePolicy {
+                mode: TurnStateProxyMode::Fixed,
+                proxy_ids: vec!["b".to_owned()],
+                candidate_limit: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.attempts.len(), 1);
+    assert_eq!(result.attempts[0].target_id, "b");
+    assert!(result.active_target_id.is_none());
+    assert!(base.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn turn_state_policy_pool_rotates_after_success_within_selected_directory() {
+    use gateway_admin::model::turn_state::{TurnStateProbePolicy, TurnStateProxyMode};
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(probe_response(200, Some('p')))
+        .expect(3)
+        .mount(&proxy)
+        .await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_policy_pool"]).await;
+    let account = store.account("acct_policy_pool").unwrap();
+    let _clock = PausedTimeGuard::new();
+    let policy = TurnStateProbePolicy {
+        mode: TurnStateProxyMode::Pool,
+        proxy_ids: vec!["b".to_owned(), "c".to_owned()],
+        candidate_limit: 1,
+        ..Default::default()
+    };
+    for expected in ["b", "c", "b"] {
+        let result = bundle
+            .admin_provider()
+            .probe_turn_state(
+                account.id(),
+                &upstream_model("gpt-5.4"),
+                probe_targets(&proxy, &["a", "b", "c"]),
+                TurnStateSource::ManualProbe,
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.active_target_id.as_deref(), Some(expected));
+        tokio::time::advance(Duration::from_secs(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn turn_state_policy_random_attempts_selected_candidates_without_replacement() {
+    use gateway_admin::model::turn_state::{TurnStateProbePolicy, TurnStateProxyMode};
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let seen = Arc::new(Notify::new());
+    let count =
+        mount_turn_state_sequence(&proxy, seen.clone(), vec![probe_response(200, None); 2]).await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_policy_random"]).await;
+    let account = store.account("acct_policy_random").unwrap();
+    let account_id = account.id().clone();
+    let targets = probe_targets(&proxy, &["a", "b", "c", "d"]);
+    let _clock = PausedTimeGuard::new();
+    let run = tokio::spawn(async move {
+        bundle
+            .admin_provider()
+            .probe_turn_state(
+                &account_id,
+                &upstream_model("gpt-5.4"),
+                targets,
+                TurnStateSource::ManualProbe,
+                TurnStateProbePolicy {
+                    mode: TurnStateProxyMode::Random,
+                    proxy_ids: vec!["b".to_owned(), "d".to_owned()],
+                    candidate_limit: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+    });
+    wait_for_request(&seen, &count, 1).await;
+    tokio::time::advance(Duration::from_secs(10)).await;
+    wait_for_request(&seen, &count, 2).await;
+    let result = run.await.unwrap().unwrap();
+    assert_eq!(result.attempts.len(), 2);
+    assert_eq!(
+        result
+            .attempts
+            .iter()
+            .map(|attempt| attempt.target_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["b", "d"])
     );
 }

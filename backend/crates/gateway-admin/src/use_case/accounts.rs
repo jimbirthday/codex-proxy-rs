@@ -241,6 +241,7 @@ pub(crate) struct DefaultAccountsService {
     snapshot: Arc<dyn SnapshotControl>,
     probe: Arc<dyn AccountProbe>,
     proxies: Arc<dyn ProxyStore>,
+    settings: Arc<dyn crate::ports::store::SettingsStore>,
     turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureStore>,
     http_probe: Arc<dyn crate::ports::proxy::ProxyProbe>,
     http_probe_records: std::sync::Mutex<BTreeMap<String, HttpProbeRecord>>,
@@ -266,6 +267,7 @@ fn prune_probe_records(records: &mut BTreeMap<String, HttpProbeRecord>) {
 
 /// 账号诊断依赖 HTTP 执行、可选采集存储与管理员审计，集中注入。
 pub(crate) struct AccountDiagnosticsDependencies {
+    pub(crate) settings: Arc<dyn crate::ports::store::SettingsStore>,
     pub(crate) store: Arc<dyn TurnStateProbeCaptureStore>,
     pub(crate) auth: Arc<dyn AuthStore>,
     pub(crate) http_probe: Arc<dyn crate::ports::proxy::ProxyProbe>,
@@ -290,6 +292,7 @@ impl DefaultAccountsService {
             probe,
             proxies,
             turn_state_probe_capture: diagnostics.store,
+            settings: diagnostics.settings,
             auth: diagnostics.auth,
             http_probe: diagnostics.http_probe,
             http_probe_records: std::sync::Mutex::new(BTreeMap::new()),
@@ -418,10 +421,31 @@ impl DefaultAccountsService {
         source: TurnStateSource,
     ) -> Result<TurnStateProbeResult, AdminError> {
         let (_, provider) = self.provider_for_account(&account_id).await?;
-        // 手动与自动传递同一完整目录，候选 ID 与配置共同维持冷却和成功偏好。
+        let policy = self
+            .settings
+            .load_turn_state_probe_policy()
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe policy"))?;
+        policy.validate()?;
+        if source == TurnStateSource::ManualProbe && !policy.manual_enabled {
+            return Err(AdminError::conflict("手动状态探测已关闭"));
+        }
+        if source == TurnStateSource::AutomaticRenewal && !policy.automatic_enabled {
+            return Ok(TurnStateProbeResult {
+                account_id: account_id.as_str().to_owned(),
+                model: model.as_str().to_owned(),
+                started_at: Utc::now(),
+                finished_at: Utc::now(),
+                trigger: source,
+                active_target_id: None,
+                state_expires_at: None,
+                attempts: Vec::new(),
+            });
+        }
+        // 完整目录用于同步冷却；策略只限制本轮允许使用的候选，不把未选中的代理当作已删除。
         let targets = self.turn_state_probe_targets().await?;
         provider
-            .probe_turn_state(&account_id, &model, targets, source)
+            .probe_turn_state(&account_id, &model, targets, source, policy)
             .await
             .map_err(|error| map_provider_error(error, "Codex turn state probe"))
     }

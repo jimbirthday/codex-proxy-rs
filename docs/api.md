@@ -439,7 +439,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `POST` | `/api/admin/accounts/free-probe` | 自定义 HTTP 请求 | 任意 HTTP(S) 地址、方法、报头与正文，独立选择账号及出口，返回完整交换字节 |
 | `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
 | `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
-| `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，从已保存代理中每轮手动最多处理 3 个候选（后台自动续采最多 1 个），取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
+| `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，按数据库中已保存策略每轮最多处理 1～3 个候选，取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
 | `GET` | `/api/admin/accounts/turn-state/capture` | 无 | 返回本进程探测报头采集窗口与异步缓冲统计 |
 | `POST` | `/api/admin/accounts/turn-state/capture/start` | `{ durationMinutes }` | 开启限时采集；`durationMinutes` 仅支持 15、60、360 |
 | `POST` | `/api/admin/accounts/turn-state/capture/stop` | 无 | 停止接收新的探测报头记录 |
@@ -524,6 +524,7 @@ Images、独立 Search 及管理员连接测试不受该文本模型限制；连
 `lastTestAt`、`lastTest: { success, latencyMs, exitIp, exitIpv4, exitIpv6, message }`、`createdAt`、`updatedAt`。
 未测试时 `lastTestAt` / `lastTest` 为 `null`。连通性失败返回 HTTP 200 和 `lastTest.success=false`；
 记录版本过期、重复 URL、删除已绑定的代理返回 409，并发测试满载返回 429。
+删除仍被状态探测策略引用的代理也返回 409，提示“该代理正用于状态探测，请先调整探测策略”。
 
 代理列表只返回关联账号数量。关联账号按需查询，每项包含 `id`、`name`、`email`、`provider`、`enabled`、
 `authenticationKind`、`planType`、`planTypeDisplay` 和 `groups: [{ id, name, color, enabled }]`，
@@ -619,11 +620,27 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 `GET /api/admin/accounts/turn-state/overview` 只读取当前 Provider 内存中已采集、已探测或已失效的账号/模型键，
 不触发上游请求，也不返回 state 原文。管理端将该结果与 OAuth 账号目录合并，因此从未探测的账号也会显示为“未获取”。
 
-`POST /api/admin/accounts/turn-state/probe` 从当前全部已保存代理中选择候选，不包含直连；未配置代理时拒绝请求。
-每轮手动探测最多处理 3 个不同候选，自动续采最多处理 1 个，连接配置失败也占用候选名额。
-优先选择账号当前绑定代理，再选择当前账号与模型最近成功的代理、该账号最近成功的代理，再轮换其余候选，并跳过仍在冷却中的代理。
+`GET /api/admin/settings/turn-state-probe` 读取探测设置，`POST` 同路径保存并返回完整设置，均要求管理员身份。
+设置保存在 PostgreSQL，手动探测和自动续采共用，不增加配置文件，也不随 `/api/admin/settings/update` 整包替换。
+
+| 字段 | 含义 |
+| --- | --- |
+| `manualEnabled` | 是否允许新的手动探测，默认 `true`；关闭时手动接口返回 HTTP 409，提示“手动状态探测已关闭” |
+| `automaticEnabled` | 是否启动新的自动续采轮次，默认 `true` |
+| `mode` | `smart` 智能选择、`fixed` 固定代理、`pool` 指定代理池、`random` 随机代理，默认 `smart` |
+| `proxyIds` | 已保存代理的 ID，最多 200 个且不重复；固定必须 1 个，代理池至少 1 个，智能必须为空；随机为空表示全部目录，否则仅在选中项内随机 |
+| `candidateLimit` | 每轮最多处理 1～3 个不同候选，默认 3，固定代理必须为 1 |
+
+保存时校验所选代理存在，策略引用的代理须先从策略移除才能删除。设置修改不取消已开始轮次，仍遵守已有冷却与账号预算。
+关闭两个开关不清除已缓存 State，也不影响普通业务响应采集。设置读取失败时拒绝启动探测。
+
+`POST /api/admin/accounts/turn-state/probe` 沿用已保存策略，不包含直连；未配置代理时拒绝请求。
+智能模式优先选择账号当前绑定代理，再选择当前账号与模型最近成功的代理、该账号最近成功的代理，再轮换其余候选。
+固定模式不会回退到其他代理，代理池模式仅在选中项内轮换，随机模式在全部或选中池内无放回抽样；所有模式跳过仍在冷却中的代理。
+代理策略限定代理目录项，不保证代理服务本身的出口 IP 固定。连接配置失败也占用候选名额；等待发送间隔不占用。
+本轮下一次发送前若滚动预算已满，结束本轮，不持有账号锁等待下一个窗口。
 一旦取得有效 state 就停止本轮，不继续尝试其余代理。同一账号的手动探测与自动续采跨模型串行执行，
-相邻实际探测请求的发送间隔至少为 10 秒，每个账号滚动 5 分钟内最多实际发送 3 次；本实例 OpenAI Provider 同时发送的探测请求最多为 2 个。
+相邻实际探测请求的发送间隔至少为 10 秒，每个账号滚动 60 秒内最多实际发送 3 次；本实例 OpenAI Provider 同时发送的探测请求最多为 2 个。
 
 `attempts` 只包含已实际发起的请求，不代表完整代理目录或所有已处理候选。每项包含代理标识、名称、
 请求是否成功、HTTP 状态码、耗时、是否取得 state 和安全诊断文案；连接或读取失败、超时时状态码可为空。
@@ -636,14 +653,14 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 因账号滚动预算、冷却、退避或运行态容量限制无法开始时，返回 HTTP 503，提示“探测处于冷却期，请稍后重试”。
 本轮仅发生连接配置失败、没有实际请求时，手动请求返回 HTTP 503，提示“本轮代理连接配置不可用，请检查代理设置”。
 自动续采遇到账号忙碌、冷却或已无需续采时跳过，不新增空历史。
-上游 401、403 或 429 会终止本轮，其状态码记录在 attempt 中，不直接作为该管理接口的 HTTP 状态码返回。
+上游 401、403、407 或 429 即使响应里带有 state 也不采纳。401、403 或 429 会终止本轮，其状态码记录在 attempt 中，不直接作为该管理接口的 HTTP 状态码返回。
 
 网络失败、超时、407 和连接配置失败使该账号下的对应代理冷却；312、缺少有效 state 的响应及其他上游错误
-使对应账号、模型与代理组合冷却。连续失败时，代理冷却依次为 5、10、20、30 分钟，之后保持 30 分钟。
+使对应账号、模型与代理组合冷却。连续失败时，代理冷却依次为 30、60、120 秒，之后保持 120 秒。
 401、403 和 429 不计入代理故障冷却；429 另触发账号级退避。
 已实际发送请求但没有成功更新状态的轮次，仅在探测期间该账号与模型的状态未被其他请求更新时，
 才触发账号与模型级退避；业务请求已刷新或撤销状态时，旧探测不会追加该退避。
-退避从 2 分钟起指数增长，附加 0～30 秒抖动，总延迟不超过 30 分钟。
+退避从 15 秒起指数增长，附加 0～5 秒抖动，总延迟不超过 120 秒。
 手动探测同样遵守这些限制，重复点击不会绕过冷却或退避。
 
 `stateSource` 区分业务响应采集、管理员手动探测和后台自动轮换。`stateFirstAppliedAt` 仅在
@@ -654,9 +671,9 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 
 没有成功更新状态时保留旧 state（若仍在 TTL 内）；若本轮收到没有有效新 state 的 312，且最终未取得可应用的新 state，
 则撤销当前账号与模型的旧值，但不撤销探测期间已被其他请求更新的状态。
-每个实例每 45 秒检查最近 1 小时内实际发送过业务请求的账号/模型键，业务请求无需携带 State 或收到新的 State。
+每个实例每 10 秒检查最近 1 小时内实际发送过业务请求的账号/模型键，业务请求无需携带 State 或收到新的 State。
 空状态、进入 TTL 剩余 5 分钟窗口、已过期或被 312 撤销的键均可续采，因此重启、新账号、新模型及闲置后的首个业务请求都能重新启用采集。
-手动与自动探测不会延长业务活跃期，替换 State 也不会清除已有业务活跃记录。自动续采直接使用账号当前出口，支持直连与未保存的代理，不更换出口。
+手动与自动探测不会延长业务活跃期，替换 State 也不会清除已有业务活跃记录。自动续采使用已保存探测策略，在允许的代理目录范围内选择出口。
 原有冷却、退避与发送预算仍然生效，不能保证首次业务请求已有 State；排队期间若状态已刷新且无需续采，则跳过。
 
 [OpenAI 官方 Codex](https://github.com/openai/codex/blob/7498521d288b9b3b96ffba4eedf089d8d6e06a84/codex-rs/core/src/client.rs#L270-L297)
@@ -1119,6 +1136,8 @@ HTTP 返回 `429`，`error.code` 为 `key_daily_budget_exceeded` 或 `key_weekly
 | --- | --- | --- |
 | `GET` | `/api/admin/settings` | 读取运行设置 |
 | `POST` | `/api/admin/settings/update` | 原子替换全部运行设置 |
+| `GET` | `/api/admin/settings/turn-state-probe` | 读取 Codex turn state 探测策略，合同见 [Codex turn state 探测](#codex-turn-state-探测) |
+| `POST` | `/api/admin/settings/turn-state-probe` | 保存完整探测策略；不修改其余运行设置 |
 | `GET` | `/api/admin/settings/client-downloads/codex-desktop/windows` | 提取 Codex Desktop Windows 离线安装直链；`refresh=true` 强制刷新进程内短缓存 |
 | `GET` | `/api/admin/settings/client-profiles/openai` | 读取六个预设、自动更新可用状态和 `globalConfiguration` |
 | `POST` | `/api/admin/settings/client-profiles/openai/preview` | body 为 `{ configuration }`，值为完整身份对象或 `null`（解析当前通用设置）；只预览，不保存 |
