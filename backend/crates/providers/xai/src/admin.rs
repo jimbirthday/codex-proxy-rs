@@ -806,6 +806,20 @@ impl ProviderAdmin for XaiAdminProvider {
         })
     }
 
+    async fn http_probe_headers(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Vec<gateway_admin::model::proxies::HttpProbeHeader>, ProviderAdminError> {
+        let credential = GrokCredentialRepository::new(self.accounts.clone())
+            .load_current(account_id)
+            .await
+            .map_err(|_| provider_error(ProviderAdminErrorKind::CredentialRefreshRequired))?;
+        Ok(vec![gateway_admin::model::proxies::HttpProbeHeader {
+            name: "authorization".to_owned(),
+            value: format!("Bearer {}", credential.access_token.expose()).into_bytes(),
+        }])
+    }
+
     async fn export_credentials(
         &self,
         credentials: Vec<ProviderExportCredentialInput>,

@@ -118,6 +118,143 @@ impl HttpProxyProbe {
 
 #[async_trait]
 impl ProxyProbe for HttpProxyProbe {
+    async fn send_http(
+        &self,
+        proxy: Option<&OutboundProxy>,
+        mut request: gateway_admin::model::proxies::HttpProbeRequest,
+    ) -> Result<gateway_admin::model::proxies::HttpProbeExchange, gateway_admin::model::AdminError>
+    {
+        use gateway_admin::model::{
+            AdminError,
+            proxies::{HttpProbeExchange, HttpProbeHeader},
+        };
+        use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+        let invalid = || AdminError::invalid("请求方法、URL 或报头不符合 HTTP 格式");
+        let method =
+            reqwest::Method::from_bytes(request.method.as_bytes()).map_err(|_| invalid())?;
+        let url = reqwest::Url::parse(&request.url).map_err(|_| invalid())?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(invalid());
+        }
+        let mut headers = HeaderMap::new();
+        for header in &request.headers {
+            headers
+                .try_append(
+                    HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| invalid())?,
+                    HeaderValue::from_bytes(&header.value).map_err(|_| invalid())?,
+                )
+                .map_err(|_| invalid())?;
+        }
+        // 显式补齐 HTTP 客户端通常自动生成的字段，使交换详情可以检查实际发送值。
+        if !headers.contains_key("host") {
+            let host = match url.port() {
+                Some(port) => format!("{}:{port}", url.host().expect("validated host")),
+                None => url.host().expect("validated host").to_string(),
+            };
+            headers.insert("host", HeaderValue::from_str(&host).map_err(|_| invalid())?);
+        }
+        if !headers.contains_key("accept") {
+            headers.insert("accept", HeaderValue::from_static("*/*"));
+        }
+        if !headers.contains_key("content-length") && !headers.contains_key("transfer-encoding") {
+            headers.insert(
+                "content-length",
+                HeaderValue::from_str(&request.body.len().to_string()).map_err(|_| invalid())?,
+            );
+        }
+        let mut builder = reqwest::Client::builder()
+            .no_proxy()
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .retry(reqwest::retry::never())
+            .redirect(reqwest::redirect::Policy::none());
+        if request.timeout_seconds > 0 {
+            let timeout = Duration::from_secs(request.timeout_seconds);
+            if Instant::now().checked_add(timeout).is_none() {
+                return Err(AdminError::invalid("超时秒数超出系统支持范围"));
+            }
+            builder = builder.timeout(timeout);
+        }
+        if let Some(proxy) = proxy {
+            builder = builder.proxy(
+                reqwest::Proxy::all(proxy.expose_url())
+                    .map_err(|_| AdminError::invalid("代理地址不合法"))?,
+            );
+        }
+        let client = (self.build_client)(builder).map_err(AdminError::invalid)?;
+        let outbound = client
+            .request(method, url)
+            .headers(headers)
+            .body(request.body.clone())
+            .build()
+            .map_err(|_| invalid())?;
+        request.url = outbound.url().to_string();
+        request.headers = outbound
+            .headers()
+            .iter()
+            .map(|(name, value)| HttpProbeHeader {
+                name: name.to_string(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect();
+        let started = Instant::now();
+        let mut exchange = HttpProbeExchange {
+            request,
+            status_code: None,
+            http_version: None,
+            response_headers: Vec::new(),
+            response_body: Vec::new(),
+            elapsed_ms: 0,
+            error: None,
+        };
+        match client.execute(outbound).await {
+            Ok(mut response) => {
+                exchange.status_code = Some(response.status().as_u16());
+                exchange.http_version = Some(format!("{:?}", response.version()));
+                exchange.response_headers = response
+                    .headers()
+                    .iter()
+                    .map(|(name, value)| HttpProbeHeader {
+                        name: name.to_string(),
+                        value: value.as_bytes().to_vec(),
+                    })
+                    .collect();
+                loop {
+                    match response.chunk().await {
+                        Ok(Some(bytes)) => exchange.response_body.extend_from_slice(&bytes),
+                        Ok(None) => break,
+                        Err(error) => {
+                            exchange.error = Some(
+                                if error.is_timeout() {
+                                    "响应读取超时，正文不完整"
+                                } else {
+                                    "响应读取失败，正文不完整"
+                                }
+                                .to_owned(),
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                // reqwest 的错误文本可能携带 URL 凭据，不能直接返回或记录。
+                exchange.error = Some(
+                    if error.is_timeout() {
+                        "请求超时"
+                    } else {
+                        "请求发送失败，请检查 URL、证书、代理和 HTTP 报头"
+                    }
+                    .to_owned(),
+                );
+            }
+        }
+        exchange.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        Ok(exchange)
+    }
+
     async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult {
         let started = Instant::now();
         let timeout_limit = Duration::from_secs(15);

@@ -62,5 +62,14 @@ pub struct ProxyImportReservation {
 
 #[async_trait]
 pub trait ProxyProbe: Send + Sync {
+    /// 显式管理员请求，不参与出口测试状态或账号调度。
+    async fn send_http(
+        &self,
+        _proxy: Option<&OutboundProxy>,
+        _request: crate::model::proxies::HttpProbeRequest,
+    ) -> Result<crate::model::proxies::HttpProbeExchange, crate::model::AdminError> {
+        Err(crate::model::AdminError::invalid("当前实例不支持自由探测"))
+    }
+
     async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult;
 }

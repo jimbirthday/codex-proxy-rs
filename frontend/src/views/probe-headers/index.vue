@@ -380,6 +380,9 @@ onScopeDispose(() => {
       description="限时采集 Codex State 手动探测与自动轮换的请求头和响应头"
     >
       <template #actions>
+        <BaseButton variant="ghost" @click="router.push('/free-probe')">
+          自由探测
+        </BaseButton>
         <BaseIconButton variant="ghost" size="md" label="刷新探测报头" :loading="refreshing" @click="refresh">
           <template #loading>
             <RefreshCw class="size-4 animate-spin motion-reduce:animate-none" />

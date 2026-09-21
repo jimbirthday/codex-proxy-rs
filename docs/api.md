@@ -436,6 +436,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
+| `POST` | `/api/admin/accounts/free-probe` | 自定义 HTTP 请求 | 任意 HTTP(S) 地址、方法、报头与正文，独立选择账号及出口，返回完整交换字节 |
 | `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
 | `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
 | `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，从已保存代理中每轮手动最多处理 3 个候选（后台自动续采最多 1 个），取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
@@ -584,6 +585,28 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 - `error`、`providerErrorCode`、`providerErrorType`、`upstreamStatus`、`upstreamContentType` 和
   `upstreamBody` 是实际捕获的原始诊断字段；缺失时为 `null`，不会由本地猜测或翻译。
 
+### 自由 HTTP 探测
+
+`POST /api/admin/accounts/free-probe` 仅允许管理员调用，每次显式发送一个 HTTP 请求，不使用 State 探测的模型、域名、冷却或请求预算限制。
+请求字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `method`、`url` | HTTP 方法和完整 HTTP(S) 地址，保留查询参数，可访问内网地址 |
+| `headers` | `{ name, valueBase64 }` 数组，支持重复名称、空值及非 UTF-8 报头字节 |
+| `bodyBase64` | 任意请求正文的 Base64，空字符串表示空正文 |
+| `accountId` | 可选账号，支持 OpenAI OAuth、API Key 和 xAI，不参与普通调度选号 |
+| `useAccountHeaders` | 为 `true` 时补入所选账号的认证报头，同名自定义报头优先；账号凭据会发送到指定 URL |
+| `proxyId`、`proxyUrl` | 可选已保存代理或临时代理地址，两者互斥，都不提供表示直连，不继承账号绑定代理 |
+| `timeoutSeconds` | 请求及响应读取的超时秒数，`0` 表示不设置超时 |
+
+返回 `method`、`url`、`requestHeaders`、`requestBodyBase64`、`statusCode`、`httpVersion`、`responseHeaders`、`responseBodyBase64`、`elapsedMs`、`error`。
+两侧报头均为 `{ name, valueBase64 }` 数组，包含认证等敏感值，不遮盖、不写入交换历史；响应使用 `Cache-Control: no-store`。
+审计仅记录 `http_probe.send` 动作，不记录请求地址、报头或正文。发送或读取失败通过 `error` 说明，已经收到的状态码、报头和部分正文仍然返回。
+上游非 2xx 同样返回交换详情，重定向不自动跟随，压缩正文不自动解压，不按 State 的 292 字节规则过滤，也不更新 State 缓存、账号健康或代理测试状态。
+页面支持文本、Base64、十六进制及原始正文下载，结果只在当前页面内存中保留。停止等待无法撤回已发送的请求。
+HTTP 客户端负责合法协议编码，报头观测不包含 HTTP/2 伪头、TLS、代理 CONNECT、原始大小写或线上顺序；该接口不额外截断正文，部署层的请求大小与超时配置仍然适用。
+
 ### Codex turn state 探测
 
 OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存态 `current_turn_state`。只有恰好一个、
@@ -631,9 +654,10 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 
 没有成功更新状态时保留旧 state（若仍在 TTL 内）；若本轮收到没有有效新 state 的 312，且最终未取得可应用的新 state，
 则撤销当前账号与模型的旧值，但不撤销探测期间已被其他请求更新的状态。
-每个实例每 45 秒检查本进程具有自动续采资格的账号/模型状态；只有当前 state 已被业务应用过，或业务请求收到 312，且最近 1 小时内发生过上述业务活动的键可进入自动续采。
-探测成功不会延长活跃期，新采集的 state 需要业务应用后才能再次续采。进入 TTL 剩余 5 分钟窗口、已过期或被 312 撤销时，
-在上述限制允许后，只使用与账号当前出口匹配的已保存代理续采；无匹配代理时跳过，不更换出口。排队期间若状态已刷新且无需续采，则跳过。
+每个实例每 45 秒检查最近 1 小时内实际发送过业务请求的账号/模型键，业务请求无需携带 State 或收到新的 State。
+空状态、进入 TTL 剩余 5 分钟窗口、已过期或被 312 撤销的键均可续采，因此重启、新账号、新模型及闲置后的首个业务请求都能重新启用采集。
+手动与自动探测不会延长业务活跃期，替换 State 也不会清除已有业务活跃记录。自动续采直接使用账号当前出口，支持直连与未保存的代理，不更换出口。
+原有冷却、退避与发送预算仍然生效，不能保证首次业务请求已有 State；排队期间若状态已刷新且无需续采，则跳过。
 
 [OpenAI 官方 Codex](https://github.com/openai/codex/blob/7498521d288b9b3b96ffba4eedf089d8d6e06a84/codex-rs/core/src/client.rs#L270-L297)
 将 `x-codex-turn-state` 定义为同一 turn 内的 sticky-routing token，并禁止跨 turn 复用；

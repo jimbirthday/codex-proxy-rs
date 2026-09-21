@@ -34,7 +34,7 @@ pub struct TurnStateProbeSubject {
 pub struct TurnStateProbeTarget {
     pub id: String,
     pub label: String,
-    pub proxy: OutboundProxy,
+    pub proxy: Option<OutboundProxy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

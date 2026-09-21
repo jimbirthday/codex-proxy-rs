@@ -617,7 +617,11 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .then(|| request.turn_state.clone())
             .flatten()
             .map(|state| (active_account.id().clone(), upstream_model.clone(), state));
+        let activity_account_id = active_account.id().clone();
         let mark_turn_state_applied = || {
+            if account_turn_state_enabled && !context.is_diagnostic_required_account() {
+                turn_states.mark_business_activity(&activity_account_id, &upstream_model);
+            }
             if let Some((account_id, model, state)) = applied_turn_state.as_ref() {
                 turn_states.mark_applied(account_id, model, state);
             }

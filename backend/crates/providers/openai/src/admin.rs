@@ -423,7 +423,7 @@ impl OpenAiAdminProvider {
             .into_iter()
             .filter(|target| {
                 trigger != TurnStateSource::AutomaticRenewal
-                    || account.outbound_proxy() == Some(&target.proxy)
+                    || account.outbound_proxy() == target.proxy.as_ref()
             })
             .collect();
         let mut run = match self.turn_states.begin_probe(
@@ -530,17 +530,17 @@ impl OpenAiAdminProvider {
             {
                 break;
             }
-            let client = match build_account_http_client(account.id().as_str(), Some(&target.proxy))
-            {
-                Ok(client) => client,
-                Err(_) => {
-                    failures.push(TurnStateProbeFailure {
-                        target_id: target.id,
-                        kind: TurnStateProbeFailureKind::ProxyConfiguration,
-                    });
-                    continue;
-                }
-            };
+            let client =
+                match build_account_http_client(account.id().as_str(), target.proxy.as_ref()) {
+                    Ok(client) => client,
+                    Err(_) => {
+                        failures.push(TurnStateProbeFailure {
+                            target_id: target.id,
+                            kind: TurnStateProbeFailureKind::ProxyConfiguration,
+                        });
+                        continue;
+                    }
+                };
             let permit = loop {
                 if trigger == TurnStateSource::AutomaticRenewal
                     && !self.turn_state_probe_due(account_id, model)
@@ -836,6 +836,44 @@ impl ProviderAdmin for OpenAiAdminProvider {
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         self.probe_turn_state_impl(account_id, model, targets, trigger)
             .await
+    }
+
+    async fn http_probe_headers(
+        &self,
+        account_id: &ProviderAccountId,
+    ) -> Result<Vec<gateway_admin::model::proxies::HttpProbeHeader>, ProviderAdminError> {
+        let account = self.account(account_id).await?;
+        let credential = crate::credential::CodexCredentialRepository::new(self.accounts.clone())
+            .load_runtime_credential(&account)
+            .await
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired))?;
+        let authorization = credential
+            .authentication
+            .authorization_header()
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::CredentialRefreshRequired))?;
+        let mut headers = vec![gateway_admin::model::proxies::HttpProbeHeader {
+            name: "authorization".to_owned(),
+            value: authorization.expose_secret().as_bytes().to_vec(),
+        }];
+        if let Some(id) = account.upstream_account_id() {
+            headers.push(gateway_admin::model::proxies::HttpProbeHeader {
+                name: "chatgpt-account-id".to_owned(),
+                value: id.as_bytes().to_vec(),
+            });
+        }
+        if !credential.cookies.is_empty() {
+            headers.push(gateway_admin::model::proxies::HttpProbeHeader {
+                name: "cookie".to_owned(),
+                value: credential
+                    .cookies
+                    .iter()
+                    .map(|cookie| format!("{}={}", cookie.name, cookie.value.expose_secret()))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+                    .into_bytes(),
+            });
+        }
+        Ok(headers)
     }
 
     fn turn_state_snapshot(

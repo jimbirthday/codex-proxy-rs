@@ -65,7 +65,7 @@ struct ModelProxyKey {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ProxyPreference {
     id: String,
-    proxy: OutboundProxy,
+    proxy: Option<OutboundProxy>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,7 +93,6 @@ struct Entry {
     failure_count: u64,
     failure_backoff_until: Option<Instant>,
     next_allowed_at: Option<Instant>,
-    automatic_eligible: bool,
     last_business_activity_at: Option<Instant>,
     touched_at: SystemTime,
     schedule_touched_at: Instant,
@@ -122,7 +121,6 @@ impl Entry {
             failure_count: 0,
             failure_backoff_until: None,
             next_allowed_at: None,
-            automatic_eligible: false,
             last_business_activity_at: None,
             touched_at: now,
             schedule_touched_at: schedule_now,
@@ -156,20 +154,20 @@ struct RunningProbe {
     id: u64,
     subject: TurnStateKey,
     credential_revision: CredentialRevision,
-    candidates: HashMap<String, OutboundProxy>,
+    candidates: HashMap<String, Option<OutboundProxy>>,
     base_positions: HashMap<String, usize>,
     started: HashSet<String>,
 }
 
 struct ProxySchedule {
-    proxy: OutboundProxy,
+    proxy: Option<OutboundProxy>,
     failure_count: u64,
     cooldown_until: Option<Instant>,
     touched_at: Instant,
 }
 
 impl ProxySchedule {
-    fn new(proxy: OutboundProxy, now: Instant) -> Self {
+    fn new(proxy: Option<OutboundProxy>, now: Instant) -> Self {
         Self {
             proxy,
             failure_count: 0,
@@ -314,6 +312,26 @@ impl TurnStateStore {
         state
     }
 
+    /// 记录实际发送的业务请求；空缓存也必须能重新获得续采资格。
+    pub(crate) fn mark_business_activity(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+    ) {
+        let now = SystemTime::now();
+        let schedule_now = Instant::now();
+        let mut schedule = self.schedule.lock().expect("turn state mutex poisoned");
+        let mut entries = self.entries.lock().expect("turn state mutex poisoned");
+        let key = TurnStateKey::new(account_id, model);
+        if !ensure_entry(&mut entries, &mut schedule, &key, now, schedule_now) {
+            return;
+        }
+        let entry = entries.get_mut(&key).expect("entry was ensured");
+        entry.last_business_activity_at = Some(schedule_now);
+        entry.touched_at = now;
+        entry.schedule_touched_at = schedule_now;
+    }
+
     pub(crate) fn mark_applied(
         &self,
         account_id: &ProviderAccountId,
@@ -336,7 +354,6 @@ impl TurnStateStore {
             return false;
         }
         entry.first_applied_at.get_or_insert(now);
-        entry.automatic_eligible = true;
         entry.last_business_activity_at = Some(schedule_now);
         entry.touched_at = now;
         entry.schedule_touched_at = schedule_now;
@@ -909,6 +926,7 @@ impl TurnStateStore {
                 if entry.state.is_none()
                     && latest_probe.is_none()
                     && entry.invalidation_reason.is_none()
+                    && entry.last_business_activity_at.is_none()
                 {
                     return None;
                 }
@@ -977,11 +995,10 @@ impl TurnStateStore {
 }
 
 fn automatic_due(entry: &Entry, now: SystemTime, schedule_now: Instant) -> bool {
-    entry.automatic_eligible
-        && entry
-            .last_business_activity_at
-            .is_some_and(|at| at + BUSINESS_ACTIVITY_WINDOW > schedule_now)
-        && (entry.expires_at.is_some_and(|at| at <= now + RENEW_BEFORE)
+    entry
+        .last_business_activity_at
+        .is_some_and(|at| at + BUSINESS_ACTIVITY_WINDOW > schedule_now)
+        && (entry.expires_at.is_none_or(|at| at <= now + RENEW_BEFORE)
             || entry.invalidation_reason.is_some())
 }
 
@@ -1013,7 +1030,6 @@ fn write_state(
     entry.expires_at = Some(expires_at);
     if changed {
         entry.first_applied_at = None;
-        entry.automatic_eligible = false;
         entry.source = Some(source);
     }
     entry.invalidated_at = None;
@@ -1043,7 +1059,6 @@ fn invalidate_entry(
     entry.invalidated_at = Some(Utc::now());
     entry.invalidation_reason = Some(reason.to_owned());
     entry.version = version;
-    entry.automatic_eligible |= automatic_eligible;
     if automatic_eligible {
         entry.last_business_activity_at = Some(schedule_now);
     }
@@ -1341,7 +1356,7 @@ fn ordered_candidates(
     let mut seen = HashSet::new();
     for target in targets
         .iter()
-        .filter(|target| Some(&target.proxy) == bound_proxy)
+        .filter(|target| target.proxy.as_ref() == bound_proxy)
     {
         if seen.insert(target.id.as_str()) {
             result.push(target.clone());

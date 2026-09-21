@@ -315,6 +315,22 @@ impl FakeProviderAdmin {
 
 #[async_trait]
 impl ProviderAdmin for FakeProviderAdmin {
+    async fn http_probe_headers(
+        &self,
+        _account_id: &ProviderAccountId,
+    ) -> Result<Vec<gateway_admin::model::proxies::HttpProbeHeader>, ProviderAdminError> {
+        Ok(vec![
+            gateway_admin::model::proxies::HttpProbeHeader {
+                name: "authorization".to_owned(),
+                value: b"Bearer synthetic-default".to_vec(),
+            },
+            gateway_admin::model::proxies::HttpProbeHeader {
+                name: "chatgpt-account-id".to_owned(),
+                value: b"synthetic-account".to_vec(),
+            },
+        ])
+    }
+
     fn provider_kind(&self) -> &ProviderKind {
         &self.kind
     }
@@ -3383,12 +3399,12 @@ async fn turn_state_renewal_should_recheck_due_subject_before_probing() {
 }
 
 #[tokio::test]
-async fn turn_state_renewal_should_use_automatic_trigger_for_a_still_due_subject() {
+async fn turn_state_renewal_should_use_current_egress_without_saved_proxies() {
     let provider = FakeProviderAdmin::new("openai", events());
     let subject = turn_state_subject();
     provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject]]);
-    let proxies = (0..4).map(turn_state_proxy).collect::<Vec<_>>();
-    let target_ids = vec!["proxy-002".to_owned()];
+    let proxies = Vec::new();
+    let target_ids = vec!["account-egress".to_owned()];
     let mut bundle = turn_state_bundle(provider.clone(), proxies).await;
 
     run_turn_state_cycle(&mut bundle).await;
@@ -3419,4 +3435,79 @@ pub(super) fn import_settings() -> gateway_admin::model::accounts::AccountImport
                 .expect("group ID"),
         ],
     }
+}
+
+struct EchoHttpProbe;
+
+#[async_trait]
+impl gateway_admin::ports::proxy::ProxyProbe for EchoHttpProbe {
+    async fn test(&self, _proxy: &OutboundProxy) -> gateway_admin::model::proxies::ProxyTestResult {
+        panic!("free probe must not update proxy test state")
+    }
+
+    async fn send_http(
+        &self,
+        proxy: Option<&OutboundProxy>,
+        request: gateway_admin::model::proxies::HttpProbeRequest,
+    ) -> Result<gateway_admin::model::proxies::HttpProbeExchange, AdminError> {
+        assert_eq!(proxy, Some(&turn_state_proxy(7).proxy));
+        Ok(gateway_admin::model::proxies::HttpProbeExchange {
+            request,
+            status_code: Some(201),
+            http_version: None,
+            response_headers: Vec::new(),
+            response_body: b"synthetic response".to_vec(),
+            elapsed_ms: 1,
+            error: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn free_probe_keeps_custom_duplicate_credentials_and_uses_independent_proxy() {
+    use gateway_admin::model::proxies::{
+        AccountProxySelection, FreeProbeCommand, HttpProbeHeader, HttpProbeRequest,
+    };
+    let services = super::AdminHarness::new()
+        .accounts(FakeAccountStore::new("openai", events()))
+        .settings(Arc::new(StaticSettingsStore))
+        .provider(FakeProviderAdmin::new("openai", events()))
+        .proxies(TurnStateTestProxyStore::new(vec![turn_state_proxy(7)]))
+        .http_probe(Arc::new(EchoHttpProbe))
+        .build()
+        .await;
+    let exchange = services
+        .accounts()
+        .free_probe(
+            &context("req_free_probe"),
+            FreeProbeCommand {
+                account_id: Some(ProviderAccountId::new("acct_test").unwrap()),
+                use_account_headers: true,
+                proxy: AccountProxySelection::Saved("proxy-007".to_owned()),
+                request: HttpProbeRequest {
+                    method: "POST".to_owned(),
+                    url: "http://localhost/custom".to_owned(),
+                    headers: vec![
+                        HttpProbeHeader {
+                            name: "Authorization".to_owned(),
+                            value: b"custom-one".to_vec(),
+                        },
+                        HttpProbeHeader {
+                            name: "authorization".to_owned(),
+                            value: Vec::new(),
+                        },
+                    ],
+                    body: vec![255, 0],
+                    timeout_seconds: 3,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(exchange.status_code, Some(201));
+    assert_eq!(exchange.request.body, [255, 0]);
+    assert_eq!(exchange.request.headers.len(), 3);
+    assert_eq!(exchange.request.headers[0].value, b"custom-one");
+    assert!(exchange.request.headers[1].value.is_empty());
+    assert_eq!(exchange.request.headers[2].name, "chatgpt-account-id");
 }

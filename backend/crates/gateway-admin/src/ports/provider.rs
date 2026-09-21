@@ -167,6 +167,14 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 仅供经过管理员审计的自由探测注入凭据，不可写入普通日志。
+    async fn http_probe_headers(
+        &self,
+        _account_id: &ProviderAccountId,
+    ) -> Result<Vec<crate::model::proxies::HttpProbeHeader>, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 返回账号当前 turn state 的非敏感运行态投影。
     fn turn_state_snapshot(
         &self,

@@ -63,6 +63,14 @@ pub(crate) const TURN_STATE_RENEWAL_INTERVAL: std::time::Duration =
 /// 统一账号页消费的服务。
 #[async_trait]
 pub trait AccountsService: Send + Sync {
+    async fn free_probe(
+        &self,
+        _context: &MutationContext,
+        _command: crate::model::proxies::FreeProbeCommand,
+    ) -> Result<crate::model::proxies::HttpProbeExchange, AdminError> {
+        Err(AdminError::invalid("当前实例不支持自由探测"))
+    }
+
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
 
     async fn export(
@@ -226,15 +234,17 @@ pub(crate) struct DefaultAccountsService {
     probe: Arc<dyn AccountProbe>,
     proxies: Arc<dyn ProxyStore>,
     turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureStore>,
+    http_probe: Arc<dyn crate::ports::proxy::ProxyProbe>,
     auth: Arc<dyn AuthStore>,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
 }
 
-/// 探测报头诊断同时依赖短期存储与管理员审计，作为一个能力边界注入。
-pub(crate) struct TurnStateCaptureDependencies {
+/// 账号诊断依赖 HTTP 执行、可选采集存储与管理员审计，集中注入。
+pub(crate) struct AccountDiagnosticsDependencies {
     pub(crate) store: Arc<dyn TurnStateProbeCaptureStore>,
     pub(crate) auth: Arc<dyn AuthStore>,
+    pub(crate) http_probe: Arc<dyn crate::ports::proxy::ProxyProbe>,
 }
 
 impl DefaultAccountsService {
@@ -246,7 +256,7 @@ impl DefaultAccountsService {
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
         proxies: Arc<dyn ProxyStore>,
-        turn_state_capture: TurnStateCaptureDependencies,
+        diagnostics: AccountDiagnosticsDependencies,
     ) -> Self {
         Self {
             accounts,
@@ -255,8 +265,9 @@ impl DefaultAccountsService {
             snapshot,
             probe,
             proxies,
-            turn_state_probe_capture: turn_state_capture.store,
-            auth: turn_state_capture.auth,
+            turn_state_probe_capture: diagnostics.store,
+            auth: diagnostics.auth,
+            http_probe: diagnostics.http_probe,
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -273,10 +284,11 @@ impl DefaultAccountsService {
         )
     }
 
-    async fn append_turn_state_capture_audit(
+    async fn append_probe_audit(
         &self,
         context: &MutationContext,
         action: &str,
+        entity_kind: &str,
         entity_ref: &str,
         changed_fields: Vec<String>,
     ) -> Result<(), AdminError> {
@@ -301,7 +313,7 @@ impl DefaultAccountsService {
                 actor_ref,
                 request_id: Some(context.request_id.clone()),
                 action: action.to_owned(),
-                entity_kind: "turn_state_probe_capture".to_owned(),
+                entity_kind: entity_kind.to_owned(),
                 entity_ref: entity_ref.to_owned(),
                 config_revision: None,
                 changed_fields,
@@ -329,7 +341,7 @@ impl DefaultAccountsService {
             targets.extend(result.items.into_iter().map(|proxy| TurnStateProbeTarget {
                 id: proxy.id,
                 label: proxy.name,
-                proxy: proxy.proxy,
+                proxy: Some(proxy.proxy),
             }));
             if count < 200 {
                 return if targets.is_empty() {
@@ -379,11 +391,21 @@ impl DefaultAccountsService {
         source: TurnStateSource,
     ) -> Result<TurnStateProbeResult, AdminError> {
         let (item, provider) = self.provider_for_account(&account_id).await?;
-        let mut targets = self.turn_state_probe_targets().await?;
-        if source == TurnStateSource::AutomaticRenewal {
-            // 自动续采只走业务当前出口；直连或未保存的出口不借用其他代理预热。
-            targets.retain(|target| item.account.outbound_proxy.as_ref() == Some(&target.proxy));
-        }
+        let targets = if source == TurnStateSource::AutomaticRenewal {
+            // 直接使用业务出口快照，不依赖代理目录；直连同样可以恢复空状态。
+            vec![TurnStateProbeTarget {
+                id: "account-egress".to_owned(),
+                label: if item.account.outbound_proxy.is_some() {
+                    "账号当前代理"
+                } else {
+                    "直连"
+                }
+                .to_owned(),
+                proxy: item.account.outbound_proxy.clone(),
+            }]
+        } else {
+            self.turn_state_probe_targets().await?
+        };
         provider
             .probe_turn_state(&account_id, &model, targets, source)
             .await
@@ -559,6 +581,59 @@ impl DefaultAccountsService {
 
 #[async_trait]
 impl AccountsService for DefaultAccountsService {
+    async fn free_probe(
+        &self,
+        context: &MutationContext,
+        mut command: crate::model::proxies::FreeProbeCommand,
+    ) -> Result<crate::model::proxies::HttpProbeExchange, AdminError> {
+        use crate::model::proxies::AccountProxySelection;
+        // 审计只保存动作，不包含 URL 查询参数、报头或正文中的敏感值。
+        self.append_probe_audit(
+            context,
+            "http_probe.send",
+            "http_probe",
+            "manual",
+            Vec::new(),
+        )
+        .await?;
+        if let Some(account_id) = &command.account_id {
+            let (_, provider) = self.provider_for_account(account_id).await?;
+            if command.use_account_headers {
+                let defaults = provider
+                    .http_probe_headers(account_id)
+                    .await
+                    .map_err(|error| map_provider_error(error, "HTTP probe credentials"))?;
+                for header in defaults {
+                    // 用户提供的同名报头（包括空值和重复值）优先，不能被账号模板覆盖。
+                    if !command
+                        .request
+                        .headers
+                        .iter()
+                        .any(|value| value.name.eq_ignore_ascii_case(&header.name))
+                    {
+                        command.request.headers.push(header);
+                    }
+                }
+            }
+        } else if command.use_account_headers {
+            return Err(AdminError::invalid("使用账号报头时必须选择账号"));
+        }
+        let proxy = match command.proxy {
+            AccountProxySelection::Direct => None,
+            AccountProxySelection::Url(proxy) => Some(proxy),
+            AccountProxySelection::Saved(id) => Some(
+                self.proxies
+                    .get(&id)
+                    .await
+                    .map_err(|error| map_store_error(error, "HTTP probe proxy"))?
+                    .proxy,
+            ),
+        };
+        self.http_probe
+            .send_http(proxy.as_ref(), command.request)
+            .await
+    }
+
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError> {
         let runtime = self
             .account_runtime
@@ -1195,9 +1270,10 @@ impl AccountsService for DefaultAccountsService {
                 "采集时长仅支持 15 分钟、1 小时或 6 小时",
             ));
         }
-        self.append_turn_state_capture_audit(
+        self.append_probe_audit(
             context,
             "turn_state_probe_capture.start",
+            "turn_state_probe_capture",
             "runtime",
             vec!["enabled_until".to_owned()],
         )
@@ -1211,9 +1287,10 @@ impl AccountsService for DefaultAccountsService {
     ) -> Result<TurnStateCaptureStatus, AdminError> {
         // 停止敏感采集优先于审计可用性，避免审计故障使采集继续运行。
         let status = self.turn_state_probe_capture.stop();
-        self.append_turn_state_capture_audit(
+        self.append_probe_audit(
             context,
             "turn_state_probe_capture.stop",
+            "turn_state_probe_capture",
             "runtime",
             vec!["enabled_until".to_owned()],
         )
@@ -1248,9 +1325,10 @@ impl AccountsService for DefaultAccountsService {
         id: &str,
     ) -> Result<TurnStateProbeExchangeDetail, AdminError> {
         let detail = self.turn_state_probe_exchange_detail(id).await?;
-        self.append_turn_state_capture_audit(
+        self.append_probe_audit(
             context,
             "turn_state_probe_capture.reveal",
+            "turn_state_probe_capture",
             id,
             vec!["request_headers".to_owned(), "response_headers".to_owned()],
         )

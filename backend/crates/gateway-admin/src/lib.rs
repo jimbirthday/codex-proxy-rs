@@ -358,7 +358,8 @@ pub async fn initialize(
         snapshot.clone(),
         probe.clone(),
         store.proxies(),
-        use_case::accounts::TurnStateCaptureDependencies {
+        use_case::accounts::AccountDiagnosticsDependencies {
+            http_probe: proxy_probe.clone(),
             store: store.turn_state_probe_capture(),
             auth: store.auth(),
         },

@@ -73,6 +73,7 @@ const MAX_ACCOUNT_GROUP_BATCH: usize = 1000;
 const MAX_AVATAR_VERSION_BYTES: usize = 32;
 
 mod credentials;
+mod free_probe;
 mod handlers;
 mod import_tasks;
 mod presenter;

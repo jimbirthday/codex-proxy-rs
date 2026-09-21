@@ -109,3 +109,37 @@ pub struct ProxyMutation {
     pub config_revision: Revision,
     pub record: ProxyRecord,
 }
+
+/// 仅在管理员显式探测的请求生命周期内持有原始字节，不实现 Debug。
+#[derive(Clone)]
+pub struct HttpProbeHeader {
+    pub name: String,
+    pub value: Vec<u8>,
+}
+
+pub struct HttpProbeRequest {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<HttpProbeHeader>,
+    pub body: Vec<u8>,
+    /// 零表示不设置超时，由管理员主动取消。
+    pub timeout_seconds: u64,
+}
+
+pub struct HttpProbeExchange {
+    pub request: HttpProbeRequest,
+    pub status_code: Option<u16>,
+    pub http_version: Option<String>,
+    pub response_headers: Vec<HttpProbeHeader>,
+    pub response_body: Vec<u8>,
+    pub elapsed_ms: u64,
+    /// 读取失败仍返回已收到的报头和正文，并明确标明不完整。
+    pub error: Option<String>,
+}
+
+pub struct FreeProbeCommand {
+    pub account_id: Option<gateway_core::account::ProviderAccountId>,
+    pub use_account_headers: bool,
+    pub proxy: AccountProxySelection,
+    pub request: HttpProbeRequest,
+}

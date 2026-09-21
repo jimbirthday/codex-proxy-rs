@@ -100,11 +100,20 @@ pub(super) struct AdminHarness {
     backup: BackupStorePorts,
     providers: Vec<Arc<dyn ProviderAdmin>>,
     probe: Arc<dyn AccountProbe>,
+    http_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     system: Arc<dyn SystemOperations>,
     client_key_verifier: Arc<dyn ClientKeyVerifier>,
 }
 
 impl AdminHarness {
+    pub(super) fn http_probe(
+        mut self,
+        probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
+    ) -> Self {
+        self.http_probe = probe;
+        self
+    }
+
     pub(super) fn new() -> Self {
         let unavailable = Arc::new(UnavailableStore);
         Self {
@@ -125,6 +134,7 @@ impl AdminHarness {
                 Arc::new(UnavailableProvider::new("xai")),
             ],
             probe: Arc::new(UnavailableProbe),
+            http_probe: Arc::new(proxies::TestProxies::default()),
             system: Arc::new(UnavailableSystem),
             client_key_verifier: Arc::new(UnavailableClientKeyVerifier),
         }
@@ -247,7 +257,7 @@ impl AdminHarness {
                 providers: self.providers,
                 snapshot: Arc::new(NoopSnapshot),
                 account_probe: self.probe,
-                proxy_probe: Arc::new(proxies::TestProxies::default()),
+                proxy_probe: self.http_probe,
                 client_distribution: Arc::new(NoopClientDistribution),
                 system: self.system,
                 client_key_verifier: self.client_key_verifier,

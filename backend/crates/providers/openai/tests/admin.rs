@@ -859,12 +859,12 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
                 TurnStateProbeTarget {
                     id: "saved-egress-a".to_owned(),
                     label: "已保存出口 A".to_owned(),
-                    proxy: proxy.clone(),
+                    proxy: Some(proxy.clone()),
                 },
                 TurnStateProbeTarget {
                     id: "saved-egress-b".to_owned(),
                     label: "已保存出口 B".to_owned(),
-                    proxy,
+                    proxy: Some(proxy),
                 },
             ],
             TurnStateSource::ManualProbe,
@@ -1454,6 +1454,60 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
 }
 
 #[tokio::test]
+async fn turn_state_cold_business_request_enables_direct_recovery_without_upstream_state() {
+    let base = MockServer::start().await;
+    mount_turn_state_sequence(
+        &base,
+        Arc::new(Notify::new()),
+        vec![
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
+            probe_response(200, Some('r')),
+        ],
+    )
+    .await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_cold_recovery"]).await;
+    let account = store.account("acct_cold_recovery").expect("account");
+    let model = upstream_model("gpt-5.4");
+    let admin = bundle.admin_provider();
+    assert!(admin.due_turn_state_subjects().is_empty());
+    drain_turn_state_business(
+        &bundle,
+        account.id().as_str(),
+        model.as_str(),
+        "req_cold_recovery",
+        true,
+    )
+    .await;
+    assert_eq!(admin.due_turn_state_subjects().len(), 1);
+    let result = admin
+        .probe_turn_state(
+            account.id(),
+            &model,
+            vec![TurnStateProbeTarget {
+                id: "direct".to_owned(),
+                label: "直连".to_owned(),
+                proxy: None,
+            }],
+            TurnStateSource::AutomaticRenewal,
+        )
+        .await
+        .expect("cold recovery");
+    assert_eq!(result.active_target_id.as_deref(), Some("direct"));
+    assert!(
+        admin
+            .turn_state_snapshot(account.id(), &model)
+            .expect("snapshot")
+            .state_expires_at
+            .is_some()
+    );
+    let requests = base.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 2);
+    assert!(!requests[0].headers.contains_key("x-codex-turn-state"));
+}
+
+#[tokio::test]
 async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
     let base = MockServer::start().await;
     let business_seen = Arc::new(Notify::new());
@@ -1464,7 +1518,9 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(COMPLETED_SESSION_SSE),
-            probe_response(312, None),
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(COMPLETED_SESSION_SSE),
             probe_response(312, None),
         ],
     )
@@ -1534,7 +1590,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
         account.id().as_str(),
         model.as_str(),
         "req_activity_resume",
-        false,
+        true,
     )
     .await;
     assert_eq!(admin.due_turn_state_subjects().len(), 1);
@@ -1549,7 +1605,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
         .await
         .expect("unbound renewal");
     assert!(skipped.attempts.is_empty());
-    store.set_egress(account.id().as_str(), Some(target.proxy.clone()), None);
+    store.set_egress(account.id().as_str(), target.proxy.clone(), None);
     let renewed = admin
         .probe_turn_state(
             account.id(),
@@ -1572,8 +1628,8 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
         .expect("invalidate unused replacement");
     tokio::time::advance(Duration::from_secs(300)).await;
     assert!(
-        admin.due_turn_state_subjects().is_empty(),
-        "replacement needs business application"
+        !admin.due_turn_state_subjects().is_empty(),
+        "recent business activity survives state replacement"
     );
     store.set_egress(account.id().as_str(), None, None);
     drain_turn_state_business(
@@ -1620,7 +1676,7 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
         )
         .await
         .expect("seed preferred a");
-    store.set_egress(account.id().as_str(), Some(b.proxy.clone()), None);
+    store.set_egress(account.id().as_str(), b.proxy.clone(), None);
     tokio::time::advance(Duration::from_secs(10)).await;
     let result = admin
         .probe_turn_state(
@@ -3023,7 +3079,9 @@ async fn turn_state_probe_network_failure_cools_the_account_proxy() {
     let target = TurnStateProbeTarget {
         id: "broken".to_owned(),
         label: "断开连接的本地出口".to_owned(),
-        proxy: OutboundProxy::parse(&format!("http://{address}")).expect("broken localhost proxy"),
+        proxy: Some(
+            OutboundProxy::parse(&format!("http://{address}")).expect("broken localhost proxy"),
+        ),
     };
     let _clock = PausedTimeGuard::new();
     let probe_bundle = Arc::clone(&bundle);
@@ -4608,7 +4666,7 @@ fn probe_target(id: &str, server: &MockServer) -> TurnStateProbeTarget {
     TurnStateProbeTarget {
         id: id.to_owned(),
         label: format!("测试出口 {id}"),
-        proxy: OutboundProxy::parse(&server.uri()).expect("localhost proxy"),
+        proxy: Some(OutboundProxy::parse(&server.uri()).expect("localhost proxy")),
     }
 }
 

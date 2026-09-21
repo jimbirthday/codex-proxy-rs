@@ -63,6 +63,7 @@ const navItems = [
   { label: '概览', icon: LayoutDashboard, path: '/' },
   { label: '账号管理', icon: Users, path: '/accounts' },
   { label: '状态探测', icon: Radar, path: '/turn-state' },
+  { label: '自由探测', icon: FileSearch, path: '/free-probe' },
   { label: '探测报头', icon: FileSearch, path: '/probe-headers' },
   { label: '代理管理', icon: Network, path: '/proxies' },
   { label: '分组管理', icon: FolderTree, path: '/groups' },

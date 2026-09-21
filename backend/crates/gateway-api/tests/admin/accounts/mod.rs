@@ -1,3 +1,4 @@
+mod free_probe;
 mod handlers;
 mod import_tasks;
 mod presenter;

@@ -35,6 +35,7 @@ fn source_tree_should_match_frozen_machine_manifest() {
     let mut expected = vec![
         "src/admin/account_groups.rs",
         "src/admin/accounts/credentials.rs",
+        "src/admin/accounts/free_probe.rs",
         "src/admin/accounts/handlers.rs",
         "src/admin/accounts/import_tasks.rs",
         "src/admin/accounts/mod.rs",
@@ -96,6 +97,7 @@ fn test_tree_should_match_frozen_rust_mirror() {
     actual.sort();
     let mut expected = vec![
         "tests/admin/account_groups.rs",
+        "tests/admin/accounts/free_probe.rs",
         "tests/admin/accounts/handlers.rs",
         "tests/admin/accounts/import_tasks.rs",
         "tests/admin/accounts/mod.rs",
