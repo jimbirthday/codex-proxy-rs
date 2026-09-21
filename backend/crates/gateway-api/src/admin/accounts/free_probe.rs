@@ -1,7 +1,8 @@
-//! 自由 HTTP 探测的管理员敏感合同；原始交换只在本次响应中返回。
+//! 自由 HTTP 探测的管理员敏感合同；通过事件流交付交换进度，正文由所属管理员下载。
 
 use gateway_admin::model::proxies::{
-    AccountProxySelection, FreeProbeCommand, HttpProbeExchange, HttpProbeHeader, HttpProbeRequest,
+    AccountProxySelection, FreeProbeCommand, HttpProbeEvent, HttpProbeExchange, HttpProbeHeader,
+    HttpProbeRequest,
 };
 use gateway_core::account::OutboundProxy;
 
@@ -40,7 +41,7 @@ struct ProbeExchange {
     status_code: Option<u16>,
     http_version: Option<String>,
     response_headers: Vec<ProbeHeader>,
-    response_body_base64: String,
+    automatic_request_headers: Vec<String>,
     elapsed_ms: u64,
     error: Option<String>,
 }
@@ -109,7 +110,7 @@ impl From<HttpProbeExchange> for ProbeExchange {
             status_code: value.status_code,
             http_version: value.http_version,
             response_headers: encode_headers(value.response_headers),
-            response_body_base64: STANDARD_BASE64.encode(value.response_body),
+            automatic_request_headers: value.automatic_request_headers,
             elapsed_ms: value.elapsed_ms,
             error: value.error,
         }
@@ -122,6 +123,7 @@ where
 {
     Router::new()
         .route("/api/admin/accounts/free-probe", post(send::<S>))
+        .route("/api/admin/accounts/free-probe/body", get(download::<S>))
         .layer(axum::extract::DefaultBodyLimit::disable())
 }
 
@@ -133,17 +135,110 @@ async fn send<S>(
 where
     S: SessionState + Send + Sync,
 {
-    let exchange = state
+    let command = request.into_command()?;
+    let accounts = state.admin_services().accounts_handle();
+    let context = auth.context().mutation_context();
+    // 立即建立事件流，准备和上游请求的生命周期随响应流一起取消。
+    let stream = futures::stream::once(async move {
+        match accounts.free_probe(&context, command).await {
+            Ok(session) => {
+                let prepared = probe_event("prepared", serde_json::json!({ "id": session.id }));
+                futures::stream::iter([prepared])
+                    .chain(session.events.map(encode_probe_event))
+                    .boxed()
+            }
+            Err(error) => futures::stream::iter([probe_event(
+                "error",
+                serde_json::json!({ "message": error.to_string() }),
+            )])
+            .boxed(),
+        }
+    })
+    .flatten();
+    let stream =
+        futures::stream::iter([probe_event("connecting", serde_json::json!({}))]).chain(stream);
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (HeaderName::from_static("x-accel-buffering"), "no"),
+        ],
+        Sse::new(stream).keep_alive(KeepAlive::default()),
+    ))
+}
+
+fn encode_probe_event(event: HttpProbeEvent) -> Result<Event, Infallible> {
+    match event {
+        HttpProbeEvent::Headers(exchange) => probe_event(
+            "headers",
+            serde_json::to_value(ProbeExchange::from(*exchange)).expect("probe metadata"),
+        ),
+        HttpProbeEvent::Progress {
+            received_bytes,
+            preview,
+        } => probe_event(
+            "progress",
+            serde_json::json!({
+                "receivedBytes": received_bytes,
+                "previewBase64": STANDARD_BASE64.encode(preview),
+            }),
+        ),
+        HttpProbeEvent::Complete { elapsed_ms, error } => probe_event(
+            "complete",
+            serde_json::json!({ "elapsedMs": elapsed_ms, "error": error }),
+        ),
+    }
+}
+
+fn probe_event(name: &str, data: Value) -> Result<Event, Infallible> {
+    Ok(Event::default().event(name).data(data.to_string()))
+}
+
+#[derive(Deserialize)]
+struct BodyQuery {
+    id: String,
+}
+
+async fn download<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<BodyQuery>,
+) -> Result<Response, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let body = state
         .admin_services()
         .accounts()
-        .free_probe(&auth.context().mutation_context(), request.into_command()?)
+        .free_probe_body(&auth.context().mutation_context(), &query.id)
         .await
         .map_err(map_service_error)?;
+    // 下载本次点击时已持久化的字节快照，运行中或取消后的部分正文同样可取回。
+    let length = body.byte_length();
+    let stream = futures::stream::try_unfold((body, 0_u64), move |(body, offset)| async move {
+        if offset >= length {
+            return Ok(None);
+        }
+        let bytes = body
+            .read(offset, (length - offset).min(64 * 1024) as usize)
+            .await
+            .map_err(|_| std::io::Error::other("读取探测正文失败"))?;
+        if bytes.is_empty() {
+            return Err(std::io::Error::other("探测正文提前结束"));
+        }
+        let next = offset + bytes.len() as u64;
+        Ok(Some((bytes, (body, next))))
+    });
     Ok((
-        [(header::CACHE_CONTROL, "no-store")],
-        AdminResponse::new(
-            StatusCode::OK,
-            AdminEnvelope::ok(ProbeExchange::from(exchange)),
-        ),
-    ))
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+            (header::CONTENT_LENGTH, length.to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                "attachment; filename=\"response-body.bin\"".to_owned(),
+            ),
+            (header::CACHE_CONTROL, "no-store".to_owned()),
+        ],
+        Body::from_stream(stream),
+    )
+        .into_response())
 }

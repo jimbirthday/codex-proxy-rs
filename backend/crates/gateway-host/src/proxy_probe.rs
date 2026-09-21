@@ -7,9 +7,170 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::StreamExt as _;
+use gateway_admin::model::{
+    AdminError,
+    proxies::{HttpProbeEvent, HttpProbeExchange, HttpProbeSession},
+};
+use gateway_admin::ports::proxy::HttpProbeBody;
 use gateway_admin::{model::proxies::ProxyTestResult, ports::proxy::ProxyProbe};
 use gateway_core::account::OutboundProxy;
 use serde::Deserialize;
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _};
+
+struct ProbeBodyFile {
+    file: tokio::sync::Mutex<tokio::fs::File>,
+    length: std::sync::atomic::AtomicU64,
+    finished: std::sync::Mutex<Option<Instant>>,
+}
+
+#[async_trait]
+impl HttpProbeBody for ProbeBodyFile {
+    fn byte_length(&self) -> u64 {
+        self.length.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn finished_at(&self) -> Option<Instant> {
+        *self.finished.lock().expect("probe finish mutex")
+    }
+
+    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, AdminError> {
+        let length = length
+            .min(64 * 1024)
+            .min(self.byte_length().saturating_sub(offset).min(64 * 1024) as usize);
+        let mut bytes = vec![0; length];
+        let mut file = self.file.lock().await;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(|_| AdminError::internal("读取探测正文失败"))?;
+        file.read_exact(&mut bytes)
+            .await
+            .map_err(|_| AdminError::internal("读取探测正文失败"))?;
+        Ok(bytes)
+    }
+}
+
+impl ProbeBodyFile {
+    async fn append(&self, bytes: &[u8]) -> Result<u64, AdminError> {
+        let mut file = self.file.lock().await;
+        file.seek(std::io::SeekFrom::End(0))
+            .await
+            .map_err(|_| AdminError::internal("保存探测正文失败"))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|_| AdminError::internal("保存探测正文失败，请检查临时磁盘空间"))?;
+        file.flush()
+            .await
+            .map_err(|_| AdminError::internal("保存探测正文失败，请检查临时磁盘空间"))?;
+        Ok(self
+            .length
+            .fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Release)
+            + bytes.len() as u64)
+    }
+}
+
+/// 事件流被取消或断开时同样终结正文生命周期，不能留下一份永不过期的运行记录。
+struct ProbeWriteGuard(Arc<ProbeBodyFile>);
+impl Drop for ProbeWriteGuard {
+    fn drop(&mut self) {
+        *self.0.finished.lock().expect("probe finish mutex") = Some(Instant::now());
+    }
+}
+
+struct ProbeStreamState {
+    outbound: Option<(reqwest::Client, reqwest::Request)>,
+    exchange: Option<HttpProbeExchange>,
+    response: Option<reqwest::Response>,
+    body: Arc<ProbeBodyFile>,
+    guard: Option<ProbeWriteGuard>,
+    started: Instant,
+    preview_bytes: usize,
+    error: Option<String>,
+    done: bool,
+}
+
+impl ProbeStreamState {
+    async fn next(mut self) -> Option<(HttpProbeEvent, Self)> {
+        if self.done {
+            return None;
+        }
+        if let Some((client, outbound)) = self.outbound.take() {
+            let mut exchange = self.exchange.take().expect("initial exchange");
+            match client.execute(outbound).await {
+                Ok(response) => {
+                    exchange.status_code = Some(response.status().as_u16());
+                    exchange.http_version = Some(format!("{:?}", response.version()));
+                    exchange.response_headers = response
+                        .headers()
+                        .iter()
+                        .map(
+                            |(name, value)| gateway_admin::model::proxies::HttpProbeHeader {
+                                name: name.to_string(),
+                                value: value.as_bytes().to_vec(),
+                            },
+                        )
+                        .collect();
+                    self.response = Some(response);
+                }
+                Err(error) => {
+                    self.error = Some(
+                        if error.is_timeout() {
+                            "请求超时"
+                        } else {
+                            "请求发送失败，请检查 URL、证书、代理和 HTTP 报头"
+                        }
+                        .to_owned(),
+                    );
+                }
+            }
+            exchange.elapsed_ms =
+                u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            exchange.error = self.error.clone();
+            return Some((HttpProbeEvent::Headers(Box::new(exchange)), self));
+        }
+        if let Some(response) = self.response.as_mut() {
+            match response.chunk().await {
+                Ok(Some(bytes)) => match self.body.append(&bytes).await {
+                    Ok(received_bytes) => {
+                        let count = bytes
+                            .len()
+                            .min((64 * 1024_usize).saturating_sub(self.preview_bytes));
+                        self.preview_bytes += count;
+                        return Some((
+                            HttpProbeEvent::Progress {
+                                received_bytes,
+                                preview: bytes[..count].to_vec(),
+                            },
+                            self,
+                        ));
+                    }
+                    Err(error) => self.error = Some(error.to_string()),
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    self.error = Some(
+                        if error.is_timeout() {
+                            "响应读取超时，正文不完整"
+                        } else {
+                            "响应读取失败，正文不完整"
+                        }
+                        .to_owned(),
+                    )
+                }
+            }
+        }
+        self.response = None;
+        self.done = true;
+        drop(self.guard.take());
+        Some((
+            HttpProbeEvent::Complete {
+                elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error: self.error.take(),
+            },
+            self,
+        ))
+    }
+}
 
 enum ProbeStrategy {
     Single(String),
@@ -122,12 +283,8 @@ impl ProxyProbe for HttpProxyProbe {
         &self,
         proxy: Option<&OutboundProxy>,
         mut request: gateway_admin::model::proxies::HttpProbeRequest,
-    ) -> Result<gateway_admin::model::proxies::HttpProbeExchange, gateway_admin::model::AdminError>
-    {
-        use gateway_admin::model::{
-            AdminError,
-            proxies::{HttpProbeExchange, HttpProbeHeader},
-        };
+    ) -> Result<HttpProbeSession, AdminError> {
+        use gateway_admin::model::{AdminError, proxies::HttpProbeHeader};
         use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
         let invalid = || AdminError::invalid("请求方法、URL 或报头不符合 HTTP 格式");
         let method =
@@ -145,8 +302,10 @@ impl ProxyProbe for HttpProxyProbe {
                 )
                 .map_err(|_| invalid())?;
         }
-        // 显式补齐 HTTP 客户端通常自动生成的字段，使交换详情可以检查实际发送值。
+        let mut automatic_request_headers = Vec::new();
+        // 标记自动生成字段，复用后继续随 URL 和正文变化；手填覆盖始终保持原值。
         if !headers.contains_key("host") {
+            automatic_request_headers.push("host".to_owned());
             let host = match url.port() {
                 Some(port) => format!("{}:{port}", url.host().expect("validated host")),
                 None => url.host().expect("validated host").to_string(),
@@ -154,9 +313,11 @@ impl ProxyProbe for HttpProxyProbe {
             headers.insert("host", HeaderValue::from_str(&host).map_err(|_| invalid())?);
         }
         if !headers.contains_key("accept") {
+            automatic_request_headers.push("accept".to_owned());
             headers.insert("accept", HeaderValue::from_static("*/*"));
         }
         if !headers.contains_key("content-length") && !headers.contains_key("transfer-encoding") {
+            automatic_request_headers.push("content-length".to_owned());
             headers.insert(
                 "content-length",
                 HeaderValue::from_str(&request.body.len().to_string()).map_err(|_| invalid())?,
@@ -199,60 +360,39 @@ impl ProxyProbe for HttpProxyProbe {
                 value: value.as_bytes().to_vec(),
             })
             .collect();
-        let started = Instant::now();
-        let mut exchange = HttpProbeExchange {
-            request,
-            status_code: None,
-            http_version: None,
-            response_headers: Vec::new(),
-            response_body: Vec::new(),
-            elapsed_ms: 0,
+        // 匿名临时文件权限由 tempfile 收紧，最后一个句柄释放时由操作系统删除。
+        let file = tokio::task::spawn_blocking(tempfile::tempfile)
+            .await
+            .map_err(|_| AdminError::internal("创建探测临时文件失败"))?
+            .map_err(|_| AdminError::internal("创建探测临时文件失败"))?;
+        let body = Arc::new(ProbeBodyFile {
+            file: tokio::sync::Mutex::new(tokio::fs::File::from_std(file)),
+            length: std::sync::atomic::AtomicU64::new(0),
+            finished: std::sync::Mutex::new(None),
+        });
+        let stream_state = ProbeStreamState {
+            outbound: Some((client, outbound)),
+            exchange: Some(HttpProbeExchange {
+                request,
+                status_code: None,
+                http_version: None,
+                response_headers: Vec::new(),
+                automatic_request_headers,
+                elapsed_ms: 0,
+                error: None,
+            }),
+            response: None,
+            body: Arc::clone(&body),
+            guard: Some(ProbeWriteGuard(Arc::clone(&body))),
+            started: Instant::now(),
+            preview_bytes: 0,
             error: None,
+            done: false,
         };
-        match client.execute(outbound).await {
-            Ok(mut response) => {
-                exchange.status_code = Some(response.status().as_u16());
-                exchange.http_version = Some(format!("{:?}", response.version()));
-                exchange.response_headers = response
-                    .headers()
-                    .iter()
-                    .map(|(name, value)| HttpProbeHeader {
-                        name: name.to_string(),
-                        value: value.as_bytes().to_vec(),
-                    })
-                    .collect();
-                loop {
-                    match response.chunk().await {
-                        Ok(Some(bytes)) => exchange.response_body.extend_from_slice(&bytes),
-                        Ok(None) => break,
-                        Err(error) => {
-                            exchange.error = Some(
-                                if error.is_timeout() {
-                                    "响应读取超时，正文不完整"
-                                } else {
-                                    "响应读取失败，正文不完整"
-                                }
-                                .to_owned(),
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(error) => {
-                // reqwest 的错误文本可能携带 URL 凭据，不能直接返回或记录。
-                exchange.error = Some(
-                    if error.is_timeout() {
-                        "请求超时"
-                    } else {
-                        "请求发送失败，请检查 URL、证书、代理和 HTTP 报头"
-                    }
-                    .to_owned(),
-                );
-            }
-        }
-        exchange.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        Ok(exchange)
+        Ok(HttpProbeSession {
+            events: futures::stream::unfold(stream_state, ProbeStreamState::next).boxed(),
+            body,
+        })
     }
 
     async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult {

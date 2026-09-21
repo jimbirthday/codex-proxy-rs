@@ -4,7 +4,7 @@ import type { FreeProbeExchange, ProbeHeader } from '@/api/modules/free-probe'
 import { Plus, Trash2 } from '@lucide/vue'
 import { computed, onMounted, onScopeDispose, ref, shallowRef } from 'vue'
 import { getAccounts, getProxies } from '@/api'
-import { sendFreeProbe } from '@/api/modules/free-probe'
+import { probeBodyUrl, sendFreeProbe } from '@/api/modules/free-probe'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseCheckbox from '@/components/base/BaseCheckbox.vue'
@@ -35,6 +35,9 @@ const catalogError = shallowRef('')
 const busy = shallowRef(false)
 const error = shallowRef('')
 const result = shallowRef<FreeProbeExchange | null>(null)
+const bodyId = shallowRef('')
+const receivedBytes = shallowRef(0)
+let preview = ''
 const side = shallowRef('response')
 const view = shallowRef('text')
 const copyText = useCopyText()
@@ -125,6 +128,9 @@ async function send() {
     return
   error.value = ''
   result.value = null
+  bodyId.value = ''
+  receivedBytes.value = 0
+  preview = ''
   const timeoutSeconds = Number(timeout.value)
   if (!Number.isSafeInteger(timeoutSeconds) || timeoutSeconds < 0 || timeout.value.trim() === '') {
     error.value = '超时秒数必须是非负整数'
@@ -133,7 +139,7 @@ async function send() {
   controller = new AbortController()
   busy.value = true
   try {
-    result.value = await sendFreeProbe({
+    await sendFreeProbe({
       accountId: accountId.value || null,
       useAccountHeaders: Boolean(accountId.value) && useAccountHeaders.value,
       proxyId: proxyId.value && proxyId.value !== 'custom' ? proxyId.value : null,
@@ -146,10 +152,25 @@ async function send() {
       })),
       bodyBase64: encode(body.value, bodyEncoding.value),
       timeoutSeconds,
+    }, (event) => {
+      if (event.type === 'prepared') {
+        bodyId.value = event.id
+      }
+      else if (event.type === 'headers') {
+        result.value = event.exchange
+      }
+      else if (event.type === 'progress' && result.value) {
+        receivedBytes.value = event.receivedBytes
+        preview += atob(event.previewBase64)
+        result.value = { ...result.value, responseBodyBase64: btoa(preview) }
+      }
+      else if (event.type === 'complete' && result.value) {
+        result.value = { ...result.value, elapsedMs: event.elapsedMs, error: event.error }
+      }
     }, { signal: controller.signal, silent: true })
   }
   catch (cause) {
-    error.value = controller.signal.aborted ? '已停止等待，本次请求可能已发送到上游' : errorMessage(cause, '探测失败，请检查请求和 Base64 格式')
+    error.value = controller.signal.aborted ? '已停止探测，已接收的正文可下载；已发出的请求无法撤回' : errorMessage(cause, '探测失败，请检查请求和 Base64 格式')
   }
   finally {
     busy.value = false
@@ -159,7 +180,7 @@ async function send() {
 function reuseHeaders() {
   if (!result.value)
     return
-  headers.value = result.value.requestHeaders.map(header => ({
+  headers.value = result.value.requestHeaders.filter(header => !result.value!.automaticRequestHeaders.includes(header.name.toLowerCase())).map(header => ({
     id: nextHeaderId++,
     enabled: true,
     name: header.name,
@@ -170,6 +191,13 @@ function reuseHeaders() {
 }
 
 function downloadBody() {
+  if (side.value === 'response') {
+    const link = document.createElement('a')
+    link.href = probeBodyUrl(bodyId.value)
+    link.download = 'response-body.bin'
+    link.click()
+    return
+  }
   const href = URL.createObjectURL(new Blob([bytes(displayedBody.value)], { type: 'application/octet-stream' }))
   const link = document.createElement('a')
   link.href = href
@@ -246,8 +274,8 @@ onScopeDispose(() => {
           <BaseTextarea v-model="body" :rows="7" class="font-mono" placeholder="任意正文，二进制内容可使用 Base64" :disabled="busy" />
         </FormItem>
         <div v-if="busy" class="flex items-center gap-3 text-cp-sm" aria-live="polite">
-          正在等待响应<BaseButton variant="ghost" @click="controller?.abort()">
-            停止等待
+          正在探测 · 已接收 {{ receivedBytes }} B<BaseButton variant="ghost" @click="controller?.abort()">
+            停止探测
           </BaseButton>
         </div>
         <p v-if="error" class="m-0 text-cp-sm text-cp-error" role="alert">
@@ -257,7 +285,7 @@ onScopeDispose(() => {
     </BaseCard>
     <BaseCard v-if="result" padding="compact" title="交换结果">
       <template #actions>
-        <BaseButton variant="ghost" @click="reuseHeaders">
+        <BaseButton variant="ghost" :disabled="busy" @click="reuseHeaders">
           载入实际请求头继续编辑
         </BaseButton>
       </template>
@@ -290,16 +318,19 @@ onScopeDispose(() => {
         </div>
         <div class="flex flex-wrap items-center justify-between gap-2">
           <h2 class="m-0 text-cp-sm font-heavy">
-            正文 · {{ bytes(displayedBody).length }} B
+            正文 · {{ side === 'response' ? receivedBytes : bytes(displayedBody).length }} B
           </h2>
           <div class="flex gap-2">
             <BaseButton variant="ghost" @click="copyText(display(displayedBody), { successText: '已复制正文', emptyErrorText: '空正文' })">
-              复制正文
+              复制预览
             </BaseButton><BaseButton variant="ghost" @click="downloadBody">
               下载原始字节
             </BaseButton>
           </div>
         </div>
+        <p v-if="side === 'response'" class="m-0 text-cp-xs text-cp-text-secondary">
+          预览前 64 KiB，下载可获取全部已接收字节 · 临时保留最近 32 次，结束后 30 分钟过期
+        </p>
         <pre class="cp-scrollbar m-0 max-h-[600px] overflow-auto rounded-cp bg-cp-fill-quaternary p-3 font-mono text-cp-xs whitespace-pre-wrap break-all">{{ display(displayedBody) || '空正文' }}</pre>
       </div>
     </BaseCard>

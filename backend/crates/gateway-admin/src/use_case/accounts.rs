@@ -58,7 +58,7 @@ use super::{
 
 const CONNECTION_TEST_INPUT: &str = "Reply with exactly OK.";
 pub(crate) const TURN_STATE_RENEWAL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_secs(45);
+    std::time::Duration::from_secs(10);
 
 /// 统一账号页消费的服务。
 #[async_trait]
@@ -67,8 +67,16 @@ pub trait AccountsService: Send + Sync {
         &self,
         _context: &MutationContext,
         _command: crate::model::proxies::FreeProbeCommand,
-    ) -> Result<crate::model::proxies::HttpProbeExchange, AdminError> {
+    ) -> Result<crate::model::proxies::FreeProbeSession, AdminError> {
         Err(AdminError::invalid("当前实例不支持自由探测"))
+    }
+
+    async fn free_probe_body(
+        &self,
+        _context: &MutationContext,
+        _id: &str,
+    ) -> Result<Arc<dyn crate::ports::proxy::HttpProbeBody>, AdminError> {
+        Err(AdminError::not_found("探测正文不存在或已过期"))
     }
 
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError>;
@@ -235,9 +243,25 @@ pub(crate) struct DefaultAccountsService {
     proxies: Arc<dyn ProxyStore>,
     turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureStore>,
     http_probe: Arc<dyn crate::ports::proxy::ProxyProbe>,
+    http_probe_records: std::sync::Mutex<BTreeMap<String, HttpProbeRecord>>,
     auth: Arc<dyn AuthStore>,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
+}
+
+struct HttpProbeRecord {
+    owner: MutationActor,
+    body: Arc<dyn crate::ports::proxy::HttpProbeBody>,
+}
+
+fn prune_probe_records(records: &mut BTreeMap<String, HttpProbeRecord>) {
+    let now = std::time::Instant::now();
+    records.retain(|_, record| {
+        record
+            .body
+            .finished_at()
+            .is_none_or(|at| now.duration_since(at) < std::time::Duration::from_secs(30 * 60))
+    });
 }
 
 /// 账号诊断依赖 HTTP 执行、可选采集存储与管理员审计，集中注入。
@@ -268,6 +292,7 @@ impl DefaultAccountsService {
             turn_state_probe_capture: diagnostics.store,
             auth: diagnostics.auth,
             http_probe: diagnostics.http_probe,
+            http_probe_records: std::sync::Mutex::new(BTreeMap::new()),
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -355,6 +380,8 @@ impl DefaultAccountsService {
     }
 
     pub(crate) async fn renew_due_turn_states(&self) {
+        // 与账号诊断生命周期一同清理临时正文，不让无人访问的记录长期占用磁盘。
+        prune_probe_records(&mut self.http_probe_records.lock().expect("probe records mutex"));
         futures::stream::iter(self.providers.due_turn_state_subjects())
             .for_each_concurrent(Some(2), |subject| async move {
                 // 排队期间业务响应可能已刷新 state；调用前重新核对，减少无效探测。
@@ -390,22 +417,9 @@ impl DefaultAccountsService {
         model: UpstreamModelId,
         source: TurnStateSource,
     ) -> Result<TurnStateProbeResult, AdminError> {
-        let (item, provider) = self.provider_for_account(&account_id).await?;
-        let targets = if source == TurnStateSource::AutomaticRenewal {
-            // 直接使用业务出口快照，不依赖代理目录；直连同样可以恢复空状态。
-            vec![TurnStateProbeTarget {
-                id: "account-egress".to_owned(),
-                label: if item.account.outbound_proxy.is_some() {
-                    "账号当前代理"
-                } else {
-                    "直连"
-                }
-                .to_owned(),
-                proxy: item.account.outbound_proxy.clone(),
-            }]
-        } else {
-            self.turn_state_probe_targets().await?
-        };
+        let (_, provider) = self.provider_for_account(&account_id).await?;
+        // 手动与自动传递同一完整目录，候选 ID 与配置共同维持冷却和成功偏好。
+        let targets = self.turn_state_probe_targets().await?;
         provider
             .probe_turn_state(&account_id, &model, targets, source)
             .await
@@ -585,7 +599,7 @@ impl AccountsService for DefaultAccountsService {
         &self,
         context: &MutationContext,
         mut command: crate::model::proxies::FreeProbeCommand,
-    ) -> Result<crate::model::proxies::HttpProbeExchange, AdminError> {
+    ) -> Result<crate::model::proxies::FreeProbeSession, AdminError> {
         use crate::model::proxies::AccountProxySelection;
         // 审计只保存动作，不包含 URL 查询参数、报头或正文中的敏感值。
         self.append_probe_audit(
@@ -629,9 +643,53 @@ impl AccountsService for DefaultAccountsService {
                     .proxy,
             ),
         };
-        self.http_probe
+        let session = self
+            .http_probe
             .send_http(proxy.as_ref(), command.request)
-            .await
+            .await?;
+        let id = Uuid::now_v7().to_string();
+        let mut records = self.http_probe_records.lock().expect("probe records mutex");
+        prune_probe_records(&mut records);
+        // 保留最近 32 份诊断正文，运行中的请求不会被新请求挤掉。
+        if records.len() >= 32 {
+            let oldest = records
+                .iter()
+                .filter_map(|(id, record)| record.body.finished_at().map(|at| (id.clone(), at)))
+                .min_by_key(|(_, at)| *at)
+                .map(|(id, _)| id);
+            if let Some(oldest) = oldest {
+                records.remove(&oldest);
+            } else {
+                return Err(AdminError::unavailable(
+                    "同时运行的探测过多，请先停止部分请求",
+                ));
+            }
+        }
+        records.insert(
+            id.clone(),
+            HttpProbeRecord {
+                owner: context.actor.clone(),
+                body: session.body,
+            },
+        );
+        Ok(crate::model::proxies::FreeProbeSession {
+            id,
+            events: session.events,
+        })
+    }
+
+    async fn free_probe_body(
+        &self,
+        context: &MutationContext,
+        id: &str,
+    ) -> Result<Arc<dyn crate::ports::proxy::HttpProbeBody>, AdminError> {
+        let mut records = self.http_probe_records.lock().expect("probe records mutex");
+        prune_probe_records(&mut records);
+        records
+            .get(id)
+            .filter(|record| record.owner == context.actor)
+            .map(|record| Arc::clone(&record.body))
+            .ok_or_else(|| AdminError::not_found("探测正文不存在或已过期"))
     }
 
     async fn list(&self, query: AccountListQuery) -> Result<AccountDirectoryPage, AdminError> {

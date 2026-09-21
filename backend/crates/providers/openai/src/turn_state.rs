@@ -24,7 +24,7 @@ use tokio::{
 const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
 const RENEW_BEFORE: Duration = Duration::from_secs(5 * 60);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
-const PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(5 * 60);
+const PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(60);
 const PROBE_BUDGET_LIMIT: usize = 3;
 const BUSINESS_ACTIVITY_WINDOW: Duration = Duration::from_secs(60 * 60);
 const TURN_STATE_BYTES: usize = 292;
@@ -1569,7 +1569,7 @@ fn clear_proxy_cooldowns(
 
 fn backoff_delay(failure_count: u64, account_id: &[u8], model: Option<&[u8]>) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(4) as u32;
-    let base = (120_u64.saturating_mul(1_u64 << exponent)).min(1_800);
+    let base = (15_u64.saturating_mul(1_u64 << exponent)).min(120);
     let mut seed = 0_u64;
     for byte in account_id {
         seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
@@ -1581,13 +1581,13 @@ fn backoff_delay(failure_count: u64, account_id: &[u8], model: Option<&[u8]>) ->
             seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
         }
     }
-    let jitter = seed.wrapping_add(failure_count.wrapping_mul(17)) % 31;
-    Duration::from_secs(base.saturating_add(jitter).min(1_800))
+    let jitter = seed.wrapping_add(failure_count.wrapping_mul(17)) % 6;
+    Duration::from_secs(base.saturating_add(jitter).min(120))
 }
 
 fn proxy_failure_delay(failure_count: u64) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(3) as u32;
-    Duration::from_secs((300_u64.saturating_mul(1_u64 << exponent)).min(1_800))
+    Duration::from_secs((30_u64.saturating_mul(1_u64 << exponent)).min(120))
 }
 
 fn later(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {

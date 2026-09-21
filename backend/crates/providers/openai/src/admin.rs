@@ -408,8 +408,7 @@ impl OpenAiAdminProvider {
         trigger: TurnStateSource,
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         let attempt_limit = match trigger {
-            TurnStateSource::AutomaticRenewal => 1,
-            TurnStateSource::ManualProbe => 3,
+            TurnStateSource::AutomaticRenewal | TurnStateSource::ManualProbe => 3,
             TurnStateSource::UpstreamResponse => {
                 return Err(provider_admin_error(ProviderAdminErrorKind::Invalid));
             }
@@ -419,13 +418,15 @@ impl OpenAiAdminProvider {
         if account.authentication_kind() != crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH {
             return Err(provider_admin_error(ProviderAdminErrorKind::Unsupported));
         }
-        let targets = targets
+        // State 采集必须显式使用代理，Provider 边界也拒绝直连候选。
+        let targets: Vec<_> = targets
             .into_iter()
-            .filter(|target| {
-                trigger != TurnStateSource::AutomaticRenewal
-                    || account.outbound_proxy() == target.proxy.as_ref()
-            })
+            .filter(|target| target.proxy.is_some())
             .collect();
+        if targets.is_empty() {
+            return Err(provider_admin_error(ProviderAdminErrorKind::Invalid)
+                .with_public_message("State 探测必须选择代理"));
+        }
         let mut run = match self.turn_states.begin_probe(
             account_id,
             model,

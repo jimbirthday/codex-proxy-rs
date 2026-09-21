@@ -186,9 +186,10 @@ async fn free_probe_preserves_binary_body_duplicate_headers_and_error_responses(
         .send_http(None, request)
         .await
         .unwrap();
+    let (exchange, response_body, _) = collect_probe(exchange).await;
     assert_eq!(exchange.status_code, Some(418));
     assert!(exchange.error.is_none());
-    assert_eq!(exchange.response_body, [0, 255, 128, 10]);
+    assert_eq!(response_body, [0, 255, 128, 10]);
     assert_eq!(
         exchange
             .response_headers
@@ -242,8 +243,9 @@ async fn free_probe_uses_selected_proxy_and_returns_redirect_without_following()
         )
         .await
         .unwrap();
+    let (exchange, response_body, _) = collect_probe(exchange).await;
     assert_eq!(exchange.status_code, Some(302));
-    assert_eq!(exchange.response_body, b"redirect body");
+    assert_eq!(response_body, b"redirect body");
     assert!(exchange.error.is_none());
 }
 
@@ -276,9 +278,10 @@ async fn free_probe_read_timeout_preserves_response_headers_and_partial_body() {
         )
         .await
         .unwrap();
+    let (exchange, response_body, _) = collect_probe(exchange).await;
     server.abort();
     assert_eq!(exchange.status_code, Some(200));
-    assert_eq!(exchange.response_body, b"partial");
+    assert_eq!(response_body, b"partial");
     assert!(
         exchange
             .response_headers
@@ -286,4 +289,124 @@ async fn free_probe_read_timeout_preserves_response_headers_and_partial_body() {
             .any(|header| header.name == "x-observed" && header.value == b"yes")
     );
     assert_eq!(exchange.error.as_deref(), Some("响应读取超时，正文不完整"));
+}
+
+async fn collect_probe(
+    mut session: gateway_admin::model::proxies::HttpProbeSession,
+) -> (
+    gateway_admin::model::proxies::HttpProbeExchange,
+    Vec<u8>,
+    Vec<u8>,
+) {
+    use futures::StreamExt as _;
+    use gateway_admin::model::proxies::HttpProbeEvent;
+    let mut exchange = None;
+    let mut preview = Vec::new();
+    while let Some(event) = session.events.next().await {
+        match event {
+            HttpProbeEvent::Headers(value) => exchange = Some(*value),
+            HttpProbeEvent::Progress { preview: chunk, .. } => preview.extend(chunk),
+            HttpProbeEvent::Complete { elapsed_ms, error } => {
+                let value = exchange.as_mut().unwrap();
+                value.elapsed_ms = elapsed_ms;
+                value.error = error;
+            }
+        }
+    }
+    assert!(session.body.finished_at().is_some());
+    let mut body = Vec::new();
+    while (body.len() as u64) < session.body.byte_length() {
+        body.extend(session.body.read(body.len() as u64, 65536).await.unwrap());
+    }
+    (exchange.unwrap(), body, preview)
+}
+
+#[tokio::test]
+async fn free_probe_large_response_keeps_full_file_and_bounded_preview() {
+    use gateway_admin::model::proxies::{HttpProbeHeader, HttpProbeRequest};
+    let server = MockServer::start().await;
+    let body = vec![171_u8; 512 * 1024];
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+        .mount(&server)
+        .await;
+    let session = HttpProxyProbe::default()
+        .send_http(
+            None,
+            HttpProbeRequest {
+                method: "POST".to_owned(),
+                url: server.uri(),
+                headers: vec![HttpProbeHeader {
+                    name: "Host".to_owned(),
+                    value: b"custom.invalid".to_vec(),
+                }],
+                body: vec![1, 2],
+                timeout_seconds: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let (exchange, full, preview) = collect_probe(session).await;
+    assert_eq!(full, body);
+    assert_eq!(preview, body[..65536]);
+    assert!(
+        !exchange
+            .automatic_request_headers
+            .iter()
+            .any(|name| name == "host")
+    );
+    assert!(
+        exchange
+            .automatic_request_headers
+            .iter()
+            .any(|name| name == "content-length")
+    );
+}
+
+#[tokio::test]
+async fn free_probe_dropping_stream_closes_upstream_and_retains_partial_body() {
+    use futures::StreamExt as _;
+    use gateway_admin::model::proxies::{HttpProbeEvent, HttpProbeRequest};
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\npartial")
+            .await
+            .unwrap();
+        assert_eq!(socket.read(&mut request).await.unwrap(), 0);
+    });
+    let mut session = HttpProxyProbe::default()
+        .send_http(
+            None,
+            HttpProbeRequest {
+                method: "GET".to_owned(),
+                url: format!("http://{address}/"),
+                headers: Vec::new(),
+                body: Vec::new(),
+                timeout_seconds: 0,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.events.next().await,
+        Some(HttpProbeEvent::Headers(_))
+    ));
+    assert!(matches!(
+        session.events.next().await,
+        Some(HttpProbeEvent::Progress { .. })
+    ));
+    drop(session.events);
+    tokio::time::timeout(std::time::Duration::from_secs(2), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(session.body.finished_at().is_some());
+    assert_eq!(session.body.read(0, 65536).await.unwrap(), b"partial");
 }

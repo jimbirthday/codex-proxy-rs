@@ -95,3 +95,31 @@ export default async function request<T = unknown>(config: RequestConfig): Promi
     throw error
   }
 }
+
+// 沿用同一会话与错误处理，fetch 适配器允许调用方增量读取并取消响应。
+export async function requestStream(config: RequestConfig): Promise<ReadableStream<Uint8Array>> {
+  const generation = sessionGeneration
+  try {
+    const response = await http.request<ReadableStream<Uint8Array>>({
+      ...config,
+      adapter: 'fetch',
+      responseType: 'stream',
+    })
+    return response.data
+  }
+  catch (error) {
+    if (axios.isAxiosError(error)) {
+      if (error.response?.data instanceof ReadableStream) {
+        const text = await new Response(error.response.data).text()
+        try {
+          error.response.data = JSON.parse(text)
+        }
+        catch {
+          error.response.data = text
+        }
+      }
+      return rejectRequest(normalizeApiError(error), config, generation)
+    }
+    throw error
+  }
+}

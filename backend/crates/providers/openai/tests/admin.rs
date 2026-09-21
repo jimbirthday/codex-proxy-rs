@@ -1363,7 +1363,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             .is_err()
     );
     // 三次请求消耗账号预算；键退避结束也不能绕过跨模型的滚动窗口。
-    tokio::time::advance(Duration::from_secs(279) - delay).await;
+    tokio::time::advance(Duration::from_secs(39) - delay).await;
     assert!(
         bundle
             .admin_provider()
@@ -1416,7 +1416,10 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             .probe_turn_state(
                 &automatic_account,
                 &automatic_model,
-                targets,
+                targets
+                    .into_iter()
+                    .filter(|target| target.id == "d")
+                    .collect(),
                 TurnStateSource::AutomaticRenewal,
             )
             .await
@@ -1445,7 +1448,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
     );
     assert!(bundle.admin_provider().due_turn_state_subjects().is_empty());
     let automatic_backoff = turn_state_backoff("acct_probe_budget", Some("gpt-5.4"), 1);
-    let due_after = automatic_backoff;
+    let due_after = automatic_backoff.max(Duration::from_secs(30));
     tokio::time::advance(due_after - Duration::from_secs(1)).await;
     assert!(bundle.admin_provider().due_turn_state_subjects().is_empty());
     assert_eq!(proxy_count.load(Ordering::SeqCst), 5);
@@ -1454,19 +1457,29 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
 }
 
 #[tokio::test]
-async fn turn_state_cold_business_request_enables_direct_recovery_without_upstream_state() {
+async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_second_proxy() {
     let base = MockServer::start().await;
-    mount_turn_state_sequence(
-        &base,
-        Arc::new(Notify::new()),
-        vec![
+    Mock::given(method("POST"))
+        .respond_with(
             ResponseTemplate::new(200)
                 .insert_header("content-type", "text/event-stream")
                 .set_body_string(COMPLETED_SESSION_SSE),
-            probe_response(200, Some('r')),
-        ],
-    )
-    .await;
+        )
+        .expect(1)
+        .mount(&base)
+        .await;
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(probe_response(407, None))
+        .expect(1)
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(probe_response(200, Some('r')))
+        .expect(1)
+        .mount(&second)
+        .await;
     let (bundle, store) = turn_state_fixture(&base, &["acct_cold_recovery"]).await;
     let account = store.account("acct_cold_recovery").expect("account");
     let model = upstream_model("gpt-5.4");
@@ -1481,30 +1494,44 @@ async fn turn_state_cold_business_request_enables_direct_recovery_without_upstre
     )
     .await;
     assert_eq!(admin.due_turn_state_subjects().len(), 1);
+    let direct = TurnStateProbeTarget {
+        id: "direct".to_owned(),
+        label: "直连".to_owned(),
+        proxy: None,
+    };
+    let rejected = admin
+        .probe_turn_state(
+            account.id(),
+            &model,
+            vec![direct.clone()],
+            TurnStateSource::AutomaticRenewal,
+        )
+        .await;
+    assert!(rejected.is_err());
     let result = admin
         .probe_turn_state(
             account.id(),
             &model,
-            vec![TurnStateProbeTarget {
-                id: "direct".to_owned(),
-                label: "直连".to_owned(),
-                proxy: None,
-            }],
+            vec![
+                direct,
+                probe_target("a", &first),
+                probe_target("b", &second),
+            ],
             TurnStateSource::AutomaticRenewal,
         )
         .await
         .expect("cold recovery");
-    assert_eq!(result.active_target_id.as_deref(), Some("direct"));
+    assert_eq!(result.active_target_id.as_deref(), Some("b"));
+    assert_eq!(result.attempts.len(), 2);
+    assert_eq!(result.attempts[0].target_id, "a");
     assert!(
         admin
             .turn_state_snapshot(account.id(), &model)
-            .expect("snapshot")
+            .unwrap()
             .state_expires_at
             .is_some()
     );
-    let requests = base.received_requests().await.expect("requests");
-    assert_eq!(requests.len(), 2);
-    assert!(!requests[0].headers.contains_key("x-codex-turn-state"));
+    assert_eq!(base.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -1594,18 +1621,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
     )
     .await;
     assert_eq!(admin.due_turn_state_subjects().len(), 1);
-    // 无匹配出口不能用别的 IP 续采；随后绑定当前候选再恢复。
-    let skipped = admin
-        .probe_turn_state(
-            account.id(),
-            &model,
-            vec![target.clone()],
-            TurnStateSource::AutomaticRenewal,
-        )
-        .await
-        .expect("unbound renewal");
-    assert!(skipped.attempts.is_empty());
-    store.set_egress(account.id().as_str(), target.proxy.clone(), None);
+    // 账号仍为直连业务出口时，续采也只能通过独立代理恢复。
     let renewed = admin
         .probe_turn_state(
             account.id(),
@@ -1880,7 +1896,7 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
         .account("acct_auto_configuration")
         .expect("automatic configuration account");
     let model = upstream_model("gpt-auto-config");
-    let targets = probe_targets(&valid_proxy, &["a", "b", "c"]);
+    let targets = probe_targets(&valid_proxy, &["a", "b", "c", "d"]);
     let _clock = PausedTimeGuard::new();
     drain_turn_state_business(
         &bundle,
@@ -1951,9 +1967,9 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
         )
         .await
         .expect("untried automatic candidate");
-    assert_eq!(second.active_target_id.as_deref(), Some("b"));
+    assert_eq!(second.active_target_id.as_deref(), Some("d"));
     assert_eq!(second.attempts.len(), 1);
-    assert_eq!(second.attempts[0].target_id, "b");
+    assert_eq!(second.attempts[0].target_id, "d");
     assert_eq!(valid_count.load(Ordering::SeqCst), 1);
     assert_eq!(
         bundle
@@ -2257,7 +2273,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
     let target = probe_target("cooldown", &proxy);
     let _clock = PausedTimeGuard::new();
 
-    for (round, cooldown) in [300_u64, 600, 1_200, 1_800].into_iter().enumerate() {
+    for (round, cooldown) in [30_u64, 60, 120, 120].into_iter().enumerate() {
         let result = bundle
             .admin_provider()
             .probe_turn_state(
@@ -2336,7 +2352,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
         .await
         .expect("post-success 407");
     assert_eq!(reset_failure.attempts[0].status_code, Some(407));
-    tokio::time::advance(Duration::from_secs(299)).await;
+    tokio::time::advance(Duration::from_secs(29)).await;
     assert!(
         bundle
             .admin_provider()
@@ -2573,7 +2589,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             .expect("auth result");
         assert_eq!(result.attempts.len(), 1);
         assert_eq!(result.attempts[0].status_code, Some(status));
-        tokio::time::advance(Duration::from_secs(45)).await;
+        tokio::time::advance(Duration::from_secs(10)).await;
         assert!(
             bundle
                 .admin_provider()
@@ -2710,7 +2726,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
     assert_eq!(rate_count.load(Ordering::SeqCst), 3);
     tokio::time::advance(Duration::from_secs(1)).await;
     tokio::time::advance(
-        Duration::from_secs(300).saturating_sub(account_delay * 2 + Duration::from_secs(10)),
+        Duration::from_secs(60).saturating_sub(account_delay * 2 + Duration::from_secs(10)),
     )
     .await;
     let reset_recovered = bundle
@@ -4744,7 +4760,7 @@ impl Drop for PausedTimeGuard {
 
 fn turn_state_backoff(account_id: &str, model: Option<&str>, failure_count: u64) -> Duration {
     let exponent = failure_count.saturating_sub(1).min(4) as u32;
-    let base = (120_u64.saturating_mul(1_u64 << exponent)).min(1_800);
+    let base = (15_u64.saturating_mul(1_u64 << exponent)).min(120);
     let mut seed = 0_u64;
     for byte in account_id.as_bytes() {
         seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
@@ -4755,8 +4771,8 @@ fn turn_state_backoff(account_id: &str, model: Option<&str>, failure_count: u64)
             seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
         }
     }
-    let jitter = seed.wrapping_add(failure_count.wrapping_mul(17)) % 31;
-    Duration::from_secs(base.saturating_add(jitter).min(1_800))
+    let jitter = seed.wrapping_add(failure_count.wrapping_mul(17)) % 6;
+    Duration::from_secs(base.saturating_add(jitter).min(120))
 }
 
 async fn drain_turn_state_business(

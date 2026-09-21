@@ -3293,7 +3293,7 @@ async fn run_turn_state_cycle(bundle: &mut gateway_admin::AdminBundle) {
     else {
         panic!("turn state renewal must be scheduled");
     };
-    assert_eq!(schedule.interval(), std::time::Duration::from_secs(45));
+    assert_eq!(schedule.interval(), std::time::Duration::from_secs(10));
     assert!(lease.is_none());
     task.run_cycle(WorkerCycleContext::new(
         registration.id,
@@ -3399,12 +3399,12 @@ async fn turn_state_renewal_should_recheck_due_subject_before_probing() {
 }
 
 #[tokio::test]
-async fn turn_state_renewal_should_use_current_egress_without_saved_proxies() {
+async fn turn_state_renewal_should_forward_saved_proxy_directory() {
     let provider = FakeProviderAdmin::new("openai", events());
     let subject = turn_state_subject();
     provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject]]);
-    let proxies = Vec::new();
-    let target_ids = vec!["account-egress".to_owned()];
+    let proxies = vec![turn_state_proxy(0), turn_state_proxy(1)];
+    let target_ids = vec!["proxy-000".to_owned(), "proxy-001".to_owned()];
     let mut bundle = turn_state_bundle(provider.clone(), proxies).await;
 
     run_turn_state_cycle(&mut bundle).await;
@@ -3449,16 +3449,24 @@ impl gateway_admin::ports::proxy::ProxyProbe for EchoHttpProbe {
         &self,
         proxy: Option<&OutboundProxy>,
         request: gateway_admin::model::proxies::HttpProbeRequest,
-    ) -> Result<gateway_admin::model::proxies::HttpProbeExchange, AdminError> {
+    ) -> Result<gateway_admin::model::proxies::HttpProbeSession, AdminError> {
         assert_eq!(proxy, Some(&turn_state_proxy(7).proxy));
-        Ok(gateway_admin::model::proxies::HttpProbeExchange {
+        let exchange = gateway_admin::model::proxies::HttpProbeExchange {
             request,
             status_code: Some(201),
             http_version: None,
             response_headers: Vec::new(),
-            response_body: b"synthetic response".to_vec(),
+            automatic_request_headers: Vec::new(),
             elapsed_ms: 1,
             error: None,
+        };
+        use futures::StreamExt as _;
+        Ok(gateway_admin::model::proxies::HttpProbeSession {
+            events: futures::stream::iter([
+                gateway_admin::model::proxies::HttpProbeEvent::Headers(Box::new(exchange)),
+            ])
+            .boxed(),
+            body: Arc::new(EmptyProbeBody),
         })
     }
 }
@@ -3504,10 +3512,58 @@ async fn free_probe_keeps_custom_duplicate_credentials_and_uses_independent_prox
         )
         .await
         .unwrap();
+    use futures::StreamExt as _;
+    let body = services
+        .accounts()
+        .free_probe_body(&context("download"), &exchange.id)
+        .await
+        .unwrap();
+    assert_eq!(body.byte_length(), 0);
+    let mut other = context("other");
+    other.actor = gateway_admin::model::MutationActor::AdminSession {
+        admin_user_id: "other-admin".to_owned(),
+    };
+    assert!(
+        services
+            .accounts()
+            .free_probe_body(&other, &exchange.id)
+            .await
+            .is_err()
+    );
+    let mut events = exchange.events;
+    let gateway_admin::model::proxies::HttpProbeEvent::Headers(exchange) =
+        events.next().await.unwrap()
+    else {
+        panic!("headers")
+    };
     assert_eq!(exchange.status_code, Some(201));
     assert_eq!(exchange.request.body, [255, 0]);
     assert_eq!(exchange.request.headers.len(), 3);
     assert_eq!(exchange.request.headers[0].value, b"custom-one");
     assert!(exchange.request.headers[1].value.is_empty());
     assert_eq!(exchange.request.headers[2].name, "chatgpt-account-id");
+}
+
+struct EmptyProbeBody;
+#[async_trait]
+impl gateway_admin::ports::proxy::HttpProbeBody for EmptyProbeBody {
+    fn byte_length(&self) -> u64 {
+        0
+    }
+    fn finished_at(&self) -> Option<std::time::Instant> {
+        Some(std::time::Instant::now())
+    }
+    async fn read(&self, _: u64, _: usize) -> Result<Vec<u8>, AdminError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn automatic_turn_state_probe_requires_saved_proxies() {
+    let provider = FakeProviderAdmin::new("openai", events());
+    let subject = turn_state_subject();
+    provider.set_due_turn_state_subjects(vec![vec![subject.clone()], vec![subject]]);
+    let mut bundle = turn_state_bundle(provider.clone(), Vec::new()).await;
+    run_turn_state_cycle(&mut bundle).await;
+    assert!(provider.turn_state_probe_calls().is_empty());
 }

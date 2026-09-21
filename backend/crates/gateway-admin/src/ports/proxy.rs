@@ -67,9 +67,17 @@ pub trait ProxyProbe: Send + Sync {
         &self,
         _proxy: Option<&OutboundProxy>,
         _request: crate::model::proxies::HttpProbeRequest,
-    ) -> Result<crate::model::proxies::HttpProbeExchange, crate::model::AdminError> {
+    ) -> Result<crate::model::proxies::HttpProbeSession, crate::model::AdminError> {
         Err(crate::model::AdminError::invalid("当前实例不支持自由探测"))
     }
 
     async fn test(&self, proxy: &OutboundProxy) -> ProxyTestResult;
+}
+
+/// 临时正文只通过有界读取暴露，不将文件路径交给控制面或浏览器。
+#[async_trait]
+pub trait HttpProbeBody: Send + Sync {
+    fn byte_length(&self) -> u64;
+    fn finished_at(&self) -> Option<std::time::Instant>;
+    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, crate::model::AdminError>;
 }

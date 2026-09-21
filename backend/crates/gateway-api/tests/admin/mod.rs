@@ -111,19 +111,24 @@ impl AdminTestFixture {
     }
 
     pub async fn with_system(system: Arc<dyn SystemOperations>) -> Self {
-        Self::with_dependencies(system, None).await
+        Self::with_dependencies(system, None, Arc::new(proxies::SuccessfulProbe)).await
     }
 
     pub async fn with_key_verifier(
         verifier: Arc<dyn ClientKeyVerifier>,
         system: Arc<dyn SystemOperations>,
     ) -> Self {
-        Self::with_dependencies(system, Some(verifier)).await
+        Self::with_dependencies(system, Some(verifier), Arc::new(proxies::SuccessfulProbe)).await
+    }
+
+    pub async fn with_http_probe(probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>) -> Self {
+        Self::with_dependencies(Arc::new(UnusedSystem), None, probe).await
     }
 
     async fn with_dependencies(
         system: Arc<dyn SystemOperations>,
         verifier: Option<Arc<dyn ClientKeyVerifier>>,
+        proxy_probe: Arc<dyn gateway_admin::ports::proxy::ProxyProbe>,
     ) -> Self {
         let api_key = Arc::new(Mutex::new(None));
         let auth = Arc::new(MemoryAuthStore::new(api_key.clone()));
@@ -180,7 +185,7 @@ impl AdminTestFixture {
                 providers,
                 snapshot: Arc::new(NoopSnapshot),
                 account_probe: Arc::new(NoopProbe),
-                proxy_probe: Arc::new(proxies::SuccessfulProbe),
+                proxy_probe,
                 client_distribution: Arc::new(StaticClientDistribution),
                 system,
                 client_key_verifier: verifier.unwrap_or_else(|| Arc::new(UnusedClientKeyVerifier)),

@@ -131,7 +131,7 @@ pub struct HttpProbeExchange {
     pub status_code: Option<u16>,
     pub http_version: Option<String>,
     pub response_headers: Vec<HttpProbeHeader>,
-    pub response_body: Vec<u8>,
+    pub automatic_request_headers: Vec<String>,
     pub elapsed_ms: u64,
     /// 读取失败仍返回已收到的报头和正文，并明确标明不完整。
     pub error: Option<String>,
@@ -142,4 +142,29 @@ pub struct FreeProbeCommand {
     pub use_account_headers: bool,
     pub proxy: AccountProxySelection,
     pub request: HttpProbeRequest,
+}
+
+/// 探测响应按事件交付，完整正文由临时文件端口承载，预览最多 64 KiB。
+pub enum HttpProbeEvent {
+    Headers(Box<HttpProbeExchange>),
+    Progress {
+        received_bytes: u64,
+        preview: Vec<u8>,
+    },
+    Complete {
+        elapsed_ms: u64,
+        error: Option<String>,
+    },
+}
+
+pub type HttpProbeEvents = futures::stream::BoxStream<'static, HttpProbeEvent>;
+
+pub struct HttpProbeSession {
+    pub events: HttpProbeEvents,
+    pub body: std::sync::Arc<dyn crate::ports::proxy::HttpProbeBody>,
+}
+
+pub struct FreeProbeSession {
+    pub id: String,
+    pub events: HttpProbeEvents,
 }
