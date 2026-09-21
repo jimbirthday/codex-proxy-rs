@@ -488,6 +488,7 @@ pub struct AdminStorePorts {
     observability: Arc<dyn ObservabilityStore>,
     settings: Arc<dyn SettingsStore>,
     backup: BackupStorePorts,
+    turn_state_probe_capture: Arc<dyn super::turn_state_capture::TurnStateProbeCaptureStore>,
 }
 
 impl AdminStorePorts {
@@ -507,7 +508,19 @@ impl AdminStorePorts {
             observability,
             settings,
             backup,
+            turn_state_probe_capture: Arc::new(
+                super::turn_state_capture::DisabledTurnStateProbeCapture,
+            ),
         }
+    }
+
+    #[must_use]
+    pub fn with_turn_state_probe_capture(
+        mut self,
+        capture: Arc<dyn super::turn_state_capture::TurnStateProbeCaptureStore>,
+    ) -> Self {
+        self.turn_state_probe_capture = capture;
+        self
     }
 
     #[must_use]
@@ -553,5 +566,12 @@ impl AdminStorePorts {
     #[must_use]
     pub fn backup(&self) -> BackupStorePorts {
         self.backup.clone()
+    }
+
+    #[must_use]
+    pub fn turn_state_probe_capture(
+        &self,
+    ) -> Arc<dyn super::turn_state_capture::TurnStateProbeCaptureStore> {
+        self.turn_state_probe_capture.clone()
     }
 }

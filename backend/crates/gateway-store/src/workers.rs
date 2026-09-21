@@ -8,6 +8,7 @@ pub(crate) fn store_worker_contributions(
     client_key_usage_writer: postgres::PgClientApiKeyUsageWriter,
     admission_release_writer: redis::ClientAdmissionReleaseWriter,
     circuit_feedback_writer: redis::ProviderCircuitFeedbackWriter,
+    turn_state_probe_capture_writer: postgres::TurnStateProbeCaptureWriter,
     retention: Arc<postgres::PgRetentionRepository>,
 ) -> StoreResult<Vec<WorkerContribution>> {
     let stale_id = WorkerId::try_new(WorkerKind::StaleModelRequestRecovery, "postgres")
@@ -23,6 +24,9 @@ pub(crate) fn store_worker_contributions(
         .map_err(worker_definition_error)?;
     let circuit_flush_id = WorkerId::try_new(WorkerKind::OpsFlush, "redis_circuit")
         .map_err(worker_definition_error)?;
+    let turn_state_capture_flush_id =
+        WorkerId::try_new(WorkerKind::OpsFlush, "postgres_turn_state_capture")
+            .map_err(worker_definition_error)?;
     let ops_flush_restart =
         DaemonRestartPolicy::try_new(Duration::from_secs(1), Duration::from_secs(60))
             .map_err(worker_definition_error)?;
@@ -73,6 +77,16 @@ pub(crate) fn store_worker_contributions(
                 WorkerRunnable::Daemon {
                     restart: ops_flush_restart,
                     task: Box::new(circuit_feedback_writer),
+                },
+            )
+            .map_err(worker_definition_error)?,
+        ),
+        WorkerContribution::Registration(
+            WorkerRegistration::try_new(
+                turn_state_capture_flush_id,
+                WorkerRunnable::Daemon {
+                    restart: ops_flush_restart,
+                    task: Box::new(turn_state_probe_capture_writer),
                 },
             )
             .map_err(worker_definition_error)?,
@@ -165,6 +179,7 @@ impl ScheduledTask for RetentionTask {
                 model_requests = report.model_requests,
                 ops_events = report.ops_events,
                 admin_audit_events = report.admin_audit_events,
+                turn_state_probe_exchanges = report.turn_state_probe_exchanges,
                 batches = report.batches,
                 budget_exhausted = report.budget_exhausted,
                 elapsed_milliseconds =

@@ -470,6 +470,8 @@ Release 必须提供当前 OS/架构的 `codex-proxy-rs_<version>_<os>_<arch>.ta
   `.runtime/logs` 因此属于敏感数据，必须按现有普通日志的访问控制和加密备份策略处理。
 - S3/R2 存储、Cron 计划、保留策略与备份记录都保存在 PostgreSQL（`backup_settings` /
   `backup_records`），备份记录行在删除成功后硬删除，操作历史进入 `admin_audit_events`。
+- 内置逻辑备份保留 `turn_state_probe_exchanges` 表结构但排除其 24 小时敏感诊断数据；直接备份 PostgreSQL
+  数据卷或使用其他物理备份方案时仍会包含这些原始探测报头，应按凭据数据实施访问控制与生命周期清理。
 - 手工备份的 `expiresInDays` 在创建时生成独立 `expires_at`；计划备份按当前 `retentionDays` 生成
   `expires_at`，并同时受 `retentionCount` 清理规则约束。到期只进入删除流程，不构成在线恢复点。
 

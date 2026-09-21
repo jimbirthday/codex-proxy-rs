@@ -31,6 +31,11 @@ export const routes: RouteRecordRaw[] = [
         component: () => import('@/views/turn-state/index.vue'),
       },
       {
+        path: 'probe-headers',
+        name: 'probe-headers',
+        component: () => import('@/views/probe-headers/index.vue'),
+      },
+      {
         path: 'proxies',
         name: 'proxies',
         component: () => import('@/views/proxies/index.vue'),

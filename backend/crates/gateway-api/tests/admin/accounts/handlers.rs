@@ -148,6 +148,62 @@ async fn turn_state_routes_require_admin_and_a_valid_account_id() {
 }
 
 #[tokio::test]
+async fn turn_state_capture_routes_require_admin_and_validate_diagnostic_inputs() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+
+    let response = admin::router::<AdminTestState>()
+        .with_state(fixture.state())
+        .oneshot(
+            Request::builder()
+                .uri("/api/admin/accounts/turn-state/capture")
+                .header("x-request-id", "req_capture_unauthorized")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+    for (method, uri, body) in [
+        (
+            "POST",
+            "/api/admin/accounts/turn-state/capture/start",
+            r#"{"durationMinutes":30}"#,
+        ),
+        ("GET", "/api/admin/accounts/turn-state/exchanges?page=0", ""),
+        (
+            "GET",
+            "/api/admin/accounts/turn-state/exchanges/detail?id=not-a-uuid",
+            "",
+        ),
+        (
+            "POST",
+            "/api/admin/accounts/turn-state/exchanges/reveal?id=not-a-uuid",
+            "",
+        ),
+    ] {
+        let response = admin::router::<AdminTestState>()
+            .with_state(fixture.state())
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::COOKIE, "cpr_session=valid-session")
+                    .header("content-type", "application/json")
+                    .header("x-request-id", "req_capture_invalid")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{method} {uri}");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+}
+
+#[tokio::test]
 async fn quota_forecast_requires_admin_and_valid_account_query() {
     let fixture = AdminTestFixture::new().await;
     fixture.auth.insert_session("valid-session");

@@ -32,7 +32,13 @@ use gateway_admin::model::turn_state::{
     TurnStateOverviewEntry, TurnStateProbeAttempt, TurnStateProbeResult, TurnStateProbeSubject,
     TurnStateProbeTarget, TurnStateSnapshot, TurnStateSource,
 };
-use gateway_admin::ports::provider::{ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind};
+use gateway_admin::model::turn_state_capture::{
+    TurnStateProbeExchangeCapture, TurnStateProbeHeader,
+};
+use gateway_admin::ports::{
+    provider::{ProviderAdmin, ProviderAdminError, ProviderAdminErrorKind},
+    turn_state_capture::TurnStateProbeCaptureSink,
+};
 use gateway_core::account::{
     CredentialCasUpdateParts, CredentialRevision, LoadedCredential, NewProviderAccount,
     OpaqueProviderData, PlaintextCredential, ProviderAccount, ProviderAccountId,
@@ -100,44 +106,157 @@ enum TurnStateProbeIoResult {
     ReadFailed,
 }
 
+impl TurnStateProbeIoResult {
+    fn outcome(&self, response_received: bool) -> &'static str {
+        match self {
+            Self::Response { state: Some(_), .. } => "state_acquired",
+            Self::Response { status: 312, .. } => "upstream_312",
+            Self::Response { .. } => "response_without_state",
+            Self::ConnectionFailed => "connection_failed",
+            Self::TimedOut if response_received => "response_read_timed_out",
+            Self::TimedOut => "timed_out",
+            Self::ReadFailed => "response_read_failed",
+        }
+    }
+}
+
+struct TurnStateProbeIoExchange {
+    result: TurnStateProbeIoResult,
+    status_code: Option<u16>,
+    request_headers: Vec<TurnStateProbeHeader>,
+    response_headers: Vec<TurnStateProbeHeader>,
+    http_version: Option<String>,
+}
+
+fn captured_headers(headers: &reqwest::header::HeaderMap) -> Vec<TurnStateProbeHeader> {
+    headers
+        .iter()
+        .map(|(name, value)| TurnStateProbeHeader {
+            name: name.as_str().to_owned(),
+            value: value.as_bytes().to_vec(),
+        })
+        .collect()
+}
+
 async fn send_turn_state_probe_request(
     client: &reqwest::Client,
     url: &str,
-    headers: reqwest::header::HeaderMap,
+    mut headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
-) -> TurnStateProbeIoResult {
-    let response = match client
-        .post(url)
-        .headers(headers)
-        .header(reqwest::header::CONTENT_ENCODING, "zstd")
-        .body(body)
-        .send()
-        .await
-    {
-        Ok(response) => response,
-        Err(error) if error.is_timeout() => return TurnStateProbeIoResult::TimedOut,
-        Err(_) => return TurnStateProbeIoResult::ConnectionFailed,
+    capture_headers: bool,
+) -> TurnStateProbeIoExchange {
+    headers.insert(
+        reqwest::header::CONTENT_ENCODING,
+        reqwest::header::HeaderValue::from_static("zstd"),
+    );
+    let request = match client.post(url).headers(headers).body(body).build() {
+        Ok(request) => request,
+        Err(_) => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::ConnectionFailed,
+                status_code: None,
+                request_headers: Vec::new(),
+                response_headers: Vec::new(),
+                http_version: None,
+            };
+        }
+    };
+    let request_headers = if capture_headers {
+        captured_headers(request.headers())
+    } else {
+        Vec::new()
+    };
+    let deadline = tokio::time::Instant::now() + TURN_STATE_PROBE_TIMEOUT;
+    let response = match tokio::time::timeout_at(deadline, client.execute(request)).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) if error.is_timeout() => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::TimedOut,
+                status_code: None,
+                request_headers,
+                response_headers: Vec::new(),
+                http_version: None,
+            };
+        }
+        Ok(Err(_)) => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::ConnectionFailed,
+                status_code: None,
+                request_headers,
+                response_headers: Vec::new(),
+                http_version: None,
+            };
+        }
+        Err(_) => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::TimedOut,
+                status_code: None,
+                request_headers,
+                response_headers: Vec::new(),
+                http_version: None,
+            };
+        }
     };
     let status = response.status().as_u16();
+    let response_headers = if capture_headers {
+        captured_headers(response.headers())
+    } else {
+        Vec::new()
+    };
+    let http_version = capture_headers.then(|| format!("{:?}", response.version()));
     // 鉴权、代理认证和账号限流响应优先于任何粘性 state，避免把拒绝误判为成功。
     if matches!(status, 401 | 403 | 407 | 429) {
-        return TurnStateProbeIoResult::Response {
-            status,
-            state: None,
+        return TurnStateProbeIoExchange {
+            result: TurnStateProbeIoResult::Response {
+                status,
+                state: None,
+            },
+            status_code: Some(status),
+            request_headers,
+            response_headers,
+            http_version,
         };
     }
     let header_state = single_turn_state_header(response.headers())
         .filter(|value| TurnStateStore::is_valid_state(value))
         .map(ToOwned::to_owned);
     if header_state.is_some() {
-        return TurnStateProbeIoResult::Response {
-            status,
-            state: header_state,
+        return TurnStateProbeIoExchange {
+            result: TurnStateProbeIoResult::Response {
+                status,
+                state: header_state,
+            },
+            status_code: Some(status),
+            request_headers,
+            response_headers,
+            http_version,
         };
     }
-    let body = match read_capped_response_body(response, MAX_TURN_STATE_PROBE_BODY_BYTES).await {
-        Ok(body) => body,
-        Err(_) => return TurnStateProbeIoResult::ReadFailed,
+    let body = match tokio::time::timeout_at(
+        deadline,
+        read_capped_response_body(response, MAX_TURN_STATE_PROBE_BODY_BYTES),
+    )
+    .await
+    {
+        Ok(Ok(body)) => body,
+        Ok(Err(_)) => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::ReadFailed,
+                status_code: Some(status),
+                request_headers,
+                response_headers,
+                http_version,
+            };
+        }
+        Err(_) => {
+            return TurnStateProbeIoExchange {
+                result: TurnStateProbeIoResult::TimedOut,
+                status_code: Some(status),
+                request_headers,
+                response_headers,
+                http_version,
+            };
+        }
     };
     let json = (!body.limit_exceeded())
         .then(|| serde_json::from_str::<Value>(&body.into_string()).ok())
@@ -156,7 +275,13 @@ async fn send_turn_state_probe_request(
                 .filter(|value| TurnStateStore::is_valid_state(value))
                 .map(ToOwned::to_owned)
         });
-    TurnStateProbeIoResult::Response { status, state }
+    TurnStateProbeIoExchange {
+        result: TurnStateProbeIoResult::Response { status, state },
+        status_code: Some(status),
+        request_headers,
+        response_headers,
+        http_version,
+    }
 }
 
 fn empty_turn_state_probe_result(
@@ -191,6 +316,7 @@ pub(crate) struct OpenAiAdminProvider {
     desktop_release: CodexDesktopReleaseStatus,
     base_url: String,
     turn_states: TurnStateStore,
+    turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureSink>,
 }
 
 pub(crate) struct OpenAiAdminServices {
@@ -201,6 +327,7 @@ pub(crate) struct OpenAiAdminServices {
     pub(crate) catalog: Arc<CodexCredentialCatalogService>,
     pub(crate) base_url: String,
     pub(crate) turn_states: TurnStateStore,
+    pub(crate) turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureSink>,
 }
 
 impl OpenAiAdminProvider {
@@ -226,6 +353,7 @@ impl OpenAiAdminProvider {
             desktop_release,
             base_url: services.base_url,
             turn_states: services.turn_states,
+            turn_state_probe_capture: services.turn_state_probe_capture,
         }
     }
 
@@ -438,37 +566,70 @@ impl OpenAiAdminProvider {
             }
             actual_sent += 1;
             let mut request_headers = headers.clone();
-            let Ok(request_id) =
-                reqwest::header::HeaderValue::from_str(&Uuid::now_v7().to_string())
-            else {
+            let request_id = Uuid::now_v7().to_string();
+            let Ok(request_id_header) = reqwest::header::HeaderValue::from_str(&request_id) else {
                 internal_error = true;
                 break;
             };
             request_headers.insert(
                 reqwest::header::HeaderName::from_static("x-client-request-id"),
-                request_id,
+                request_id_header,
             );
             let attempt_started = Instant::now();
-            let io_result = {
+            let attempt_started_at = Utc::now();
+            let capture_enabled = self.turn_state_probe_capture.enabled();
+            let exchange = {
                 let _permit = permit;
-                match tokio::time::timeout(
-                    TURN_STATE_PROBE_TIMEOUT,
-                    send_turn_state_probe_request(&client, &url, request_headers, body.clone()),
+                send_turn_state_probe_request(
+                    &client,
+                    &url,
+                    request_headers,
+                    body.clone(),
+                    capture_enabled,
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => TurnStateProbeIoResult::TimedOut,
-                }
             };
             let latency_ms =
                 u64::try_from(attempt_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let TurnStateProbeIoExchange {
+                result: io_result,
+                status_code,
+                request_headers,
+                response_headers,
+                http_version,
+            } = exchange;
+            let exchange_id = if capture_enabled {
+                let id = Uuid::now_v7().to_string();
+                let capture = TurnStateProbeExchangeCapture {
+                    id: id.clone(),
+                    trigger,
+                    account_id: account_id.as_str().to_owned(),
+                    model: model.as_str().to_owned(),
+                    target_id: target.id.clone(),
+                    target_label: target.label.clone(),
+                    request_id: request_id.clone(),
+                    started_at: attempt_started_at,
+                    finished_at: Utc::now(),
+                    status_code,
+                    http_version,
+                    outcome: io_result.outcome(status_code.is_some()).to_owned(),
+                    latency_ms,
+                    request_headers,
+                    response_headers,
+                };
+                self.turn_state_probe_capture
+                    .try_capture(capture)
+                    .then_some(id)
+            } else {
+                None
+            };
             match io_result {
                 TurnStateProbeIoResult::Response {
                     status,
                     state: Some(state),
                 } => {
                     attempts.push(TurnStateProbeAttempt {
+                        exchange_id,
                         target_id: target.id.clone(),
                         target_label: target.label,
                         success: true,
@@ -498,6 +659,7 @@ impl OpenAiAdminProvider {
                         kind,
                     });
                     attempts.push(TurnStateProbeAttempt {
+                        exchange_id,
                         target_id: target.id,
                         target_label: target.label,
                         success: false,
@@ -523,6 +685,7 @@ impl OpenAiAdminProvider {
                         kind: TurnStateProbeFailureKind::Network,
                     });
                     attempts.push(TurnStateProbeAttempt {
+                        exchange_id,
                         target_id: target.id,
                         target_label: target.label,
                         success: false,
@@ -538,6 +701,7 @@ impl OpenAiAdminProvider {
                         kind: TurnStateProbeFailureKind::Timeout,
                     });
                     attempts.push(TurnStateProbeAttempt {
+                        exchange_id,
                         target_id: target.id,
                         target_label: target.label,
                         success: false,

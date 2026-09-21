@@ -96,6 +96,7 @@ mod turn_state {
             active_target_id: Some("proxy-a".to_owned()),
             state_expires_at: Some(expires_at),
             attempts: vec![TurnStateProbeAttempt {
+                exchange_id: Some("0199-exchange".to_owned()),
                 target_id: "proxy-a".to_owned(),
                 target_label: "出口 A".to_owned(),
                 success: true,
@@ -137,6 +138,7 @@ mod turn_state {
                     "activeTargetId": "proxy-a",
                     "stateExpiresAt": "2026-09-18T13:00:01+00:00",
                     "attempts": [{
+                        "exchangeId": "0199-exchange",
                         "targetId": "proxy-a",
                         "targetLabel": "出口 A",
                         "success": true,

@@ -68,7 +68,12 @@ pub async fn run() -> Result<(), BootstrapError> {
     let mut store = gateway_store::initialize(store).await?;
     host.report_startup_ready("Store");
     let provider_ports = store.provider_ports();
-    let mut openai = provider_openai::initialize(openai, provider_ports.clone()).await?;
+    let mut openai = provider_openai::initialize_with_turn_state_capture(
+        openai,
+        provider_ports.clone(),
+        store.turn_state_probe_capture_sink(),
+    )
+    .await?;
     host.report_startup_ready("OpenAI Provider");
     let mut xai = provider_xai::initialize(provider_ports).await?;
     host.report_startup_ready("xAI Provider");

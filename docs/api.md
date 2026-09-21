@@ -439,6 +439,12 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
 | `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
 | `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，从已保存代理中每轮手动最多处理 3 个候选（后台自动续采最多 1 个），取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
+| `GET` | `/api/admin/accounts/turn-state/capture` | 无 | 返回本进程探测报头采集窗口与异步缓冲统计 |
+| `POST` | `/api/admin/accounts/turn-state/capture/start` | `{ durationMinutes }` | 开启限时采集；`durationMinutes` 仅支持 15、60、360 |
+| `POST` | `/api/admin/accounts/turn-state/capture/stop` | 无 | 停止接收新的探测报头记录 |
+| `GET` | `/api/admin/accounts/turn-state/exchanges` | 分页与筛选参数 | 分页返回手动探测和自动续采的交换摘要，不返回报头原文 |
+| `GET` | `/api/admin/accounts/turn-state/exchanges/detail` | `id` | 返回探测交换详情，敏感报头值默认隐藏 |
+| `POST` | `/api/admin/accounts/turn-state/exchanges/reveal` | query `id` | 经管理员审计后返回该交换的敏感报头原文 |
 | `POST` | `/api/admin/accounts/oauth/start` | `{ provider, name, accountId?, outboundProxyId?, outboundProxyUrl? }` | 创建 OpenAI 或 xAI OAuth flow；`accountId` 表示重新授权 |
 | `POST` | `/api/admin/accounts/oauth/complete` | `{ provider, flowId, callbackUrl, settings? }` | 消费 OAuth callback；首次授权可附带账号设置，重新授权保留原设置 |
 
@@ -584,7 +590,7 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 原始长度为 292 字节且可作为 HTTP HeaderValue 的 `x-codex-turn-state` 才会进入缓存；成功采集后固定保留
 1 小时，读取不会续期。后续 Responses HTTP/SSE 与 WebSocket 请求在账号和模型选择完成后，若客户端没有
 同一 turn 的 state，则通过 `x-codex-turn-state` 请求头注入精确匹配的缓存值。上游返回 312 时只清除当前
-账号与模型的状态；服务重启会清空运行态，不会把 state 写入 PostgreSQL、Redis、审计或日志。
+账号与模型的状态；服务重启会清空运行态，核心 state 缓存不会写入 PostgreSQL、Redis、审计或日志。
 
 管理端从所选账号的实时模型目录取得 `modelId`，不在前后端写死探测模型。
 `GET /api/admin/accounts/turn-state/overview` 只读取当前 Provider 内存中已采集、已探测或已失效的账号/模型键，
@@ -633,6 +639,16 @@ OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存
 将 `x-codex-turn-state` 定义为同一 turn 内的 sticky-routing token，并禁止跨 turn 复用；
 这里的 1 小时 TTL、292/312 和跨 turn 注入属于基于外部运行观察的兼容能力，不是官方公开协议。
 缓存因此严格按账号与实际模型隔离，不假设 state 可跨模型复用；API Key 账号不支持该探测。
+
+管理员可按 15 分钟、1 小时或 6 小时开启本进程的探测报头采集，服务重启后自动关闭。采集只覆盖窗口内
+实际发出的手动探测和自动续采请求，不覆盖普通 Responses 流量；停止采集后，已开始的探测仍可提交记录。
+每个实际请求生成独立 `exchangeId`，成功进入异步缓冲时同时出现在对应 attempt 中。缓冲区满或数据库写入
+失败时丢弃诊断记录，不改变探测结果；状态接口通过入队、写入、丢弃和失败计数说明采集完整性。
+
+交换列表只返回账号、模型、代理、HTTP 状态、耗时和报头摘要。详情保留重复报头与原始字节，API 统一以
+Base64 传输值；认证、Cookie、API Key、token、secret、credential 和 `x-codex-turn-state` 等名称默认隐藏，
+调用 reveal 接口才返回原文并写管理员审计。记录在完成后保留 24 小时，过期后即使尚未物理清理也不可查询。
+采集边界是 reqwest/hyper 可见报头，不包含 HTTP/2 伪头、原始大小写和线上顺序、代理 CONNECT 或 TLS 信息。
 
 ### 后台导入任务
 

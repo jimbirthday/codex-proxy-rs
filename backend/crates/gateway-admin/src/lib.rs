@@ -358,6 +358,10 @@ pub async fn initialize(
         snapshot.clone(),
         probe.clone(),
         store.proxies(),
+        use_case::accounts::TurnStateCaptureDependencies {
+            store: store.turn_state_probe_capture(),
+            auth: store.auth(),
+        },
     ));
     let backup_ports = store.backup();
     let backups = Arc::new(DefaultBackupService::new(

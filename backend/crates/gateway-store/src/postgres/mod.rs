@@ -27,6 +27,7 @@ mod proxies;
 mod retention;
 mod runtime_settings;
 mod snapshot;
+mod turn_state_capture;
 mod usage_facts;
 
 pub use account_groups::*;
@@ -44,6 +45,7 @@ pub use proxies::PgProxyRepository;
 pub use retention::*;
 pub use runtime_settings::*;
 pub use snapshot::*;
+pub use turn_state_capture::*;
 pub(crate) use usage_facts::{
     completed_usage_fact_predicate, push_completed_usage_fact_filter,
     push_unrecovered_request_filter,

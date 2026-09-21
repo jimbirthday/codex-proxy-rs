@@ -30,6 +30,7 @@ mod runtime_settings;
 mod schema_integrity;
 mod snapshot;
 mod snapshots;
+mod turn_state_capture;
 
 static TEST_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
@@ -240,6 +241,7 @@ async fn connect_and_migrate_should_apply_all_migrations_once_and_reopen_cleanly
             "outbound_proxies",
             "provider_accounts",
             "runtime_settings",
+            "turn_state_probe_exchanges",
         ]
     );
     assert_eq!(session_settings, ("codex-proxy-rs".to_owned(), 30, 5, 30));

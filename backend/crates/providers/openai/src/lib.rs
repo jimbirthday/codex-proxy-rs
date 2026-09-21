@@ -8,7 +8,10 @@ mod turn_state;
 
 use std::sync::Arc;
 
-use gateway_admin::ports::provider::ProviderAdmin;
+use gateway_admin::ports::{
+    provider::ProviderAdmin,
+    turn_state_capture::{DisabledTurnStateProbeCapture, TurnStateProbeCaptureSink},
+};
 use gateway_core::account::ProviderAccountStore;
 use gateway_core::engine::provider::Provider;
 use gateway_core::provider_ports::ProviderStorePorts;
@@ -55,6 +58,15 @@ pub struct ProviderBundle {
 pub async fn initialize(
     config: OpenAiConfig,
     ports: ProviderStorePorts,
+) -> Result<ProviderBundle, OpenAiInitializeError> {
+    initialize_with_turn_state_capture(config, ports, Arc::new(DisabledTurnStateProbeCapture)).await
+}
+
+/// 构造带短期探测报头观测能力的 OpenAI Provider。
+pub async fn initialize_with_turn_state_capture(
+    config: OpenAiConfig,
+    ports: ProviderStorePorts,
+    turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureSink>,
 ) -> Result<ProviderBundle, OpenAiInitializeError> {
     let provider_kind =
         ProviderKind::new("openai").map_err(|_| OpenAiInitializeError::InvalidProviderKind)?;
@@ -237,6 +249,7 @@ pub async fn initialize(
             catalog: Arc::clone(&catalog),
             base_url: config.base_url().to_owned(),
             turn_states,
+            turn_state_probe_capture,
         },
         websocket_pool,
         desktop_release_status,

@@ -39,6 +39,7 @@ pub struct TurnStateProbeTarget {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TurnStateProbeAttempt {
+    pub exchange_id: Option<String>,
     pub target_id: String,
     pub target_label: String,
     pub success: bool,

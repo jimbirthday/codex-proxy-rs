@@ -19,6 +19,7 @@ pub struct RetentionReport {
     pub model_requests: u64,
     pub ops_events: u64,
     pub admin_audit_events: u64,
+    pub turn_state_probe_exchanges: u64,
     pub batches: u32,
     pub budget_exhausted: bool,
 }
@@ -164,6 +165,17 @@ impl RetentionRepository for PgRetentionRepository {
                 settings.audit_retention_days,
                 "delete expired admin audit events",
             ),
+            RetentionTarget::new(
+                "delete from turn_state_probe_exchanges
+                 where ctid in (
+                   select ctid from turn_state_probe_exchanges
+                    where expires_at < $1
+                      and $2::bigint >= 0
+                    limit $3
+                 )",
+                0,
+                "delete expired turn state probe exchanges",
+            ),
         ];
         let started_at = Instant::now();
         let mut batches = 0_u32;
@@ -200,6 +212,7 @@ impl RetentionRepository for PgRetentionRepository {
             model_requests: targets[0].deleted,
             ops_events: targets[1].deleted,
             admin_audit_events: targets[2].deleted,
+            turn_state_probe_exchanges: targets[3].deleted,
             batches,
             budget_exhausted: targets.iter().any(|target| !target.complete),
         })

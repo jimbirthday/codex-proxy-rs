@@ -12,15 +12,17 @@ use gateway_core::{
     runtime::SnapshotControl,
     task::{ScheduledTask, WorkerCycleContext, WorkerTaskError},
 };
+use uuid::Uuid;
 
 use crate::{
     model::{
-        AdminError, MutationContext,
+        AdminError, MutationActor, MutationContext,
         accounts::{
             AccountConnectionTestEvent, AccountConnectionTestEventStream, AccountListQuery,
             AccountPageItem, AccountUpdateResult, AccountUsage, AccountUsageWindowQuery,
             AccountsUpdateResult, BatchUpdateAccounts, UpdateAccount,
         },
+        auth::{AdminAuditEvent, AuditActorKind},
         observability::TimeRange,
         provider_credentials::{
             AccountDirectoryItem, AccountDirectoryPage, AccountExportBundle, AccountPersonalInfo,
@@ -36,11 +38,16 @@ use crate::{
             TurnStateOverviewEntry, TurnStateProbeResult, TurnStateProbeTarget, TurnStateSnapshot,
             TurnStateSource,
         },
+        turn_state_capture::{
+            TurnStateCaptureStatus, TurnStateProbeExchangeDetail, TurnStateProbeExchangePage,
+            TurnStateProbeExchangeQuery,
+        },
     },
     ports::{
         provider::ProviderAdminRegistry,
         proxy::ProxyStore,
-        store::{AccountRuntimeStore, AccountStore},
+        store::{AccountRuntimeStore, AccountStore, AuthStore},
+        turn_state_capture::TurnStateProbeCaptureStore,
     },
 };
 
@@ -168,6 +175,47 @@ pub trait AccountsService: Send + Sync {
         account_id: ProviderAccountId,
         model: UpstreamModelId,
     ) -> Result<TurnStateProbeResult, AdminError>;
+
+    async fn turn_state_capture_status(&self) -> Result<TurnStateCaptureStatus, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
+
+    async fn start_turn_state_capture(
+        &self,
+        _context: &MutationContext,
+        _duration: std::time::Duration,
+    ) -> Result<TurnStateCaptureStatus, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
+
+    async fn stop_turn_state_capture(
+        &self,
+        _context: &MutationContext,
+    ) -> Result<TurnStateCaptureStatus, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
+
+    async fn list_turn_state_probe_exchanges(
+        &self,
+        _query: TurnStateProbeExchangeQuery,
+    ) -> Result<TurnStateProbeExchangePage, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
+
+    async fn turn_state_probe_exchange_detail(
+        &self,
+        _id: &str,
+    ) -> Result<TurnStateProbeExchangeDetail, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
+
+    async fn reveal_turn_state_probe_exchange(
+        &self,
+        _context: &MutationContext,
+        _id: &str,
+    ) -> Result<TurnStateProbeExchangeDetail, AdminError> {
+        Err(AdminError::invalid("当前服务不支持探测报头采集"))
+    }
 }
 
 pub(crate) struct DefaultAccountsService {
@@ -177,8 +225,16 @@ pub(crate) struct DefaultAccountsService {
     snapshot: Arc<dyn SnapshotControl>,
     probe: Arc<dyn AccountProbe>,
     proxies: Arc<dyn ProxyStore>,
+    turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureStore>,
+    auth: Arc<dyn AuthStore>,
     reset_credit_locks:
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
+}
+
+/// 探测报头诊断同时依赖短期存储与管理员审计，作为一个能力边界注入。
+pub(crate) struct TurnStateCaptureDependencies {
+    pub(crate) store: Arc<dyn TurnStateProbeCaptureStore>,
+    pub(crate) auth: Arc<dyn AuthStore>,
 }
 
 impl DefaultAccountsService {
@@ -190,6 +246,7 @@ impl DefaultAccountsService {
         snapshot: Arc<dyn SnapshotControl>,
         probe: Arc<dyn AccountProbe>,
         proxies: Arc<dyn ProxyStore>,
+        turn_state_capture: TurnStateCaptureDependencies,
     ) -> Self {
         Self {
             accounts,
@@ -198,6 +255,8 @@ impl DefaultAccountsService {
             snapshot,
             probe,
             proxies,
+            turn_state_probe_capture: turn_state_capture.store,
+            auth: turn_state_capture.auth,
             reset_credit_locks: Arc::new(futures::lock::Mutex::new(BTreeMap::new())),
         }
     }
@@ -212,6 +271,44 @@ impl DefaultAccountsService {
                 .entry(account_id.clone())
                 .or_insert_with(|| Arc::new(futures::lock::Mutex::new(()))),
         )
+    }
+
+    async fn append_turn_state_capture_audit(
+        &self,
+        context: &MutationContext,
+        action: &str,
+        entity_ref: &str,
+        changed_fields: Vec<String>,
+    ) -> Result<(), AdminError> {
+        let (actor_kind, actor_admin_user_id, actor_ref) = match &context.actor {
+            MutationActor::AdminSession { admin_user_id } => (
+                AuditActorKind::AdminSession,
+                Some(admin_user_id.clone()),
+                crate::model::auth::admin_session_actor_ref(admin_user_id),
+            ),
+            MutationActor::AdminApiKey => (
+                AuditActorKind::AdminApiKey,
+                None,
+                "admin_api_key".to_owned(),
+            ),
+            MutationActor::System => (AuditActorKind::System, None, "system".to_owned()),
+        };
+        self.auth
+            .append_audit_event(AdminAuditEvent {
+                id: format!("audit_{}", Uuid::now_v7().simple()),
+                actor_kind,
+                actor_admin_user_id,
+                actor_ref,
+                request_id: Some(context.request_id.clone()),
+                action: action.to_owned(),
+                entity_kind: "turn_state_probe_capture".to_owned(),
+                entity_ref: entity_ref.to_owned(),
+                config_revision: None,
+                changed_fields,
+                occurred_at: Utc::now(),
+            })
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe capture audit"))
     }
 
     async fn turn_state_probe_targets(&self) -> Result<Vec<TurnStateProbeTarget>, AdminError> {
@@ -1082,6 +1179,83 @@ impl AccountsService for DefaultAccountsService {
     ) -> Result<TurnStateProbeResult, AdminError> {
         self.probe_turn_state_with_source(account_id, model, TurnStateSource::ManualProbe)
             .await
+    }
+
+    async fn turn_state_capture_status(&self) -> Result<TurnStateCaptureStatus, AdminError> {
+        Ok(self.turn_state_probe_capture.status())
+    }
+
+    async fn start_turn_state_capture(
+        &self,
+        context: &MutationContext,
+        duration: std::time::Duration,
+    ) -> Result<TurnStateCaptureStatus, AdminError> {
+        if !matches!(duration.as_secs(), 900 | 3_600 | 21_600) {
+            return Err(AdminError::invalid(
+                "采集时长仅支持 15 分钟、1 小时或 6 小时",
+            ));
+        }
+        self.append_turn_state_capture_audit(
+            context,
+            "turn_state_probe_capture.start",
+            "runtime",
+            vec!["enabled_until".to_owned()],
+        )
+        .await?;
+        Ok(self.turn_state_probe_capture.start(duration))
+    }
+
+    async fn stop_turn_state_capture(
+        &self,
+        context: &MutationContext,
+    ) -> Result<TurnStateCaptureStatus, AdminError> {
+        // 停止敏感采集优先于审计可用性，避免审计故障使采集继续运行。
+        let status = self.turn_state_probe_capture.stop();
+        self.append_turn_state_capture_audit(
+            context,
+            "turn_state_probe_capture.stop",
+            "runtime",
+            vec!["enabled_until".to_owned()],
+        )
+        .await?;
+        Ok(status)
+    }
+
+    async fn list_turn_state_probe_exchanges(
+        &self,
+        query: TurnStateProbeExchangeQuery,
+    ) -> Result<TurnStateProbeExchangePage, AdminError> {
+        self.turn_state_probe_capture
+            .list(query)
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe exchanges"))
+    }
+
+    async fn turn_state_probe_exchange_detail(
+        &self,
+        id: &str,
+    ) -> Result<TurnStateProbeExchangeDetail, AdminError> {
+        self.turn_state_probe_capture
+            .detail(id)
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe exchange"))?
+            .ok_or_else(|| AdminError::not_found("探测报头记录不存在或已过期"))
+    }
+
+    async fn reveal_turn_state_probe_exchange(
+        &self,
+        context: &MutationContext,
+        id: &str,
+    ) -> Result<TurnStateProbeExchangeDetail, AdminError> {
+        let detail = self.turn_state_probe_exchange_detail(id).await?;
+        self.append_turn_state_capture_audit(
+            context,
+            "turn_state_probe_capture.reveal",
+            id,
+            vec!["request_headers".to_owned(), "response_headers".to_owned()],
+        )
+        .await?;
+        Ok(detail)
     }
 }
 

@@ -117,14 +117,23 @@ function triggerLabel(trigger: TurnStateProbe['trigger']) {
                 <span class="font-sans font-heavy text-cp-text-quaternary md:hidden">耗时 </span>
                 {{ attempt.latencyMs }} ms
               </span>
-              <span
-                class="inline-flex w-fit items-center gap-1.5 text-cp-xs font-heavy"
-                :class="attempt.stateAcquired ? 'text-cp-success-text' : 'text-cp-error-text'"
-              >
-                <CheckCircle2 v-if="attempt.stateAcquired" class="size-3.5" />
-                <XCircle v-else class="size-3.5" />
-                {{ attemptStatus(attempt) }}
-              </span>
+              <div class="flex min-w-0 flex-col items-start gap-1.5">
+                <span
+                  class="inline-flex w-fit items-center gap-1.5 text-cp-xs font-heavy"
+                  :class="attempt.stateAcquired ? 'text-cp-success-text' : 'text-cp-error-text'"
+                >
+                  <CheckCircle2 v-if="attempt.stateAcquired" class="size-3.5" />
+                  <XCircle v-else class="size-3.5" />
+                  {{ attemptStatus(attempt) }}
+                </span>
+                <RouterLink
+                  v-if="attempt.exchangeId"
+                  class="text-cp-xs font-heavy text-cp-link hover:text-cp-link-hover focus-visible:rounded-cp-sm focus-visible:outline-2 focus-visible:outline-cp-control-outline"
+                  :to="{ path: '/probe-headers', query: { exchangeId: attempt.exchangeId } }"
+                >
+                  查看报头
+                </RouterLink>
+              </div>
             </div>
           </div>
         </div>

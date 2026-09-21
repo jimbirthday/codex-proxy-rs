@@ -19,8 +19,10 @@ use gateway_admin::model::provider_credentials::{
     QuotaLocalUsageAttribution,
 };
 use gateway_admin::model::turn_state::{TurnStateProbeTarget, TurnStateSource};
+use gateway_admin::model::turn_state_capture::TurnStateProbeExchangeCapture;
 use gateway_admin::model::{MutationActor, MutationContext, Revision};
 use gateway_admin::ports::provider::ProviderAdminErrorKind;
+use gateway_admin::ports::turn_state_capture::TurnStateProbeCaptureSink;
 use gateway_core::account::{
     CredentialRevision, CredentialState, OpaqueProviderData, OutboundProxy, ProviderAccount,
     ProviderAccountId, ProviderAccountStore, QuotaAccessChange, QuotaEvidence, QuotaObservation,
@@ -67,6 +69,28 @@ const COMPLETED_SESSION_SSE: &str = concat!(
     "event: response.completed\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_initialized_session\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
 );
+
+#[derive(Default)]
+struct TestTurnStateProbeCapture {
+    captures: Mutex<Vec<TurnStateProbeExchangeCapture>>,
+}
+
+impl TestTurnStateProbeCapture {
+    fn take(&self) -> Vec<TurnStateProbeExchangeCapture> {
+        std::mem::take(&mut *self.captures.lock().expect("capture lock"))
+    }
+}
+
+impl TurnStateProbeCaptureSink for TestTurnStateProbeCapture {
+    fn enabled(&self) -> bool {
+        true
+    }
+
+    fn try_capture(&self, capture: TurnStateProbeExchangeCapture) -> bool {
+        self.captures.lock().expect("capture lock").push(capture);
+        true
+    }
+}
 
 #[tokio::test]
 async fn openai_bundle_exposes_one_core_provider_and_drains_worker_contributions_once() {
@@ -815,9 +839,11 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
         .await;
     let mut config = valid_config();
     config.config.api.base_url = server.uri();
-    let bundle = provider_openai::initialize(
+    let capture = Arc::new(TestTurnStateProbeCapture::default());
+    let bundle = provider_openai::initialize_with_turn_state_capture(
         config.config.clone(),
         provider_ports_with(store, Arc::new(TestOAuthPending::default())),
+        capture.clone(),
     )
     .await
     .expect("OpenAI turn state bundle");
@@ -849,6 +875,22 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
     assert_eq!(result.model, "gpt-5.4");
     assert_eq!(result.attempts.len(), 1);
     assert!(result.attempts.iter().all(|attempt| attempt.state_acquired));
+    assert!(result.attempts[0].exchange_id.is_some());
+    let captures = capture.take();
+    assert_eq!(captures.len(), 1);
+    assert_eq!(captures[0].status_code, Some(200));
+    assert_eq!(captures[0].outcome, "state_acquired");
+    assert!(
+        captures[0].request_headers.iter().any(|header| {
+            header.name == "content-encoding" && header.value.as_slice() == b"zstd"
+        })
+    );
+    assert!(
+        captures[0]
+            .response_headers
+            .iter()
+            .any(|header| { header.name == "x-codex-turn-state" && header.value.len() == 292 })
+    );
     let snapshot = admin
         .turn_state_snapshot(account.id(), &model)
         .expect("turn state snapshot");

@@ -154,6 +154,7 @@ export interface Account {
 }
 
 export interface TurnStateProbeAttempt {
+  exchangeId: string | null
   targetId: string
   targetLabel: string
   success: boolean
@@ -161,6 +162,84 @@ export interface TurnStateProbeAttempt {
   latencyMs: number
   stateAcquired: boolean
   message: string
+}
+
+export interface TurnStateCaptureBuffer {
+  queuedItems: number
+  queuedBytes: number
+  enqueuedTotal: number
+  droppedTotal: number
+  persistedTotal: number
+  writeFailureTotal: number
+}
+
+export interface TurnStateCaptureStatus {
+  enabledUntil: string | null
+  retentionHours: number
+  buffer: TurnStateCaptureBuffer
+}
+
+export interface TurnStateHeaderSummary {
+  count: number
+  present: boolean
+  byteLength: number | null
+  sha256: string | null
+  valid292: boolean
+}
+
+export interface TurnStateProbeExchangeSummary {
+  id: string
+  trigger: 'manual_probe' | 'automatic_renewal'
+  accountId: string
+  model: string
+  targetId: string
+  targetLabel: string
+  requestId: string
+  startedAt: string
+  finishedAt: string
+  statusCode: number | null
+  httpVersion: string | null
+  outcome: string
+  latencyMs: number
+  requestHeaderCount: number
+  responseHeaderCount: number
+  requestHeaderBytes: number
+  responseHeaderBytes: number
+  requestTurnState: TurnStateHeaderSummary
+  responseTurnState: TurnStateHeaderSummary
+}
+
+export interface TurnStateProbeExchangePage {
+  items: TurnStateProbeExchangeSummary[]
+  page: number
+  pageSize: number
+  total: number
+}
+
+export interface TurnStateProbeHeader {
+  name: string
+  valueBase64: string | null
+  byteLength: number
+  sensitive: boolean
+}
+
+export interface TurnStateProbeExchangeDetail {
+  summary: TurnStateProbeExchangeSummary
+  requestHeaders: TurnStateProbeHeader[]
+  responseHeaders: TurnStateProbeHeader[]
+  revealed: boolean
+}
+
+export interface TurnStateProbeExchangeQuery {
+  page?: number
+  pageSize?: number
+  accountId?: string
+  modelId?: string
+  trigger?: '' | 'manual_probe' | 'automatic_renewal'
+  statusCode?: number
+  stateOnly?: boolean
+  start?: string
+  end?: string
 }
 
 export interface TurnStateProbe {
@@ -743,5 +822,54 @@ export function probeAccountTurnState(data: TurnStateRequestParam, options: Requ
     data,
     timeout: 30 * 60 * 1000,
     ...options,
+  })
+}
+
+export function getTurnStateCaptureStatus(options: RequestOptions = {}) {
+  return request<TurnStateCaptureStatus>({
+    url: '/api/admin/accounts/turn-state/capture',
+    method: 'GET',
+    ...options,
+  })
+}
+
+export function startTurnStateCapture(durationMinutes: 15 | 60 | 360) {
+  return request<TurnStateCaptureStatus>({
+    url: '/api/admin/accounts/turn-state/capture/start',
+    method: 'POST',
+    data: { durationMinutes },
+  })
+}
+
+export function stopTurnStateCapture() {
+  return request<TurnStateCaptureStatus>({
+    url: '/api/admin/accounts/turn-state/capture/stop',
+    method: 'POST',
+  })
+}
+
+export function getTurnStateProbeExchanges(params: TurnStateProbeExchangeQuery, options: RequestOptions = {}) {
+  return request<TurnStateProbeExchangePage>({
+    url: '/api/admin/accounts/turn-state/exchanges',
+    method: 'GET',
+    params,
+    ...options,
+  })
+}
+
+export function getTurnStateProbeExchange(id: string, options: RequestOptions = {}) {
+  return request<TurnStateProbeExchangeDetail>({
+    url: '/api/admin/accounts/turn-state/exchanges/detail',
+    method: 'GET',
+    params: { id },
+    ...options,
+  })
+}
+
+export function revealTurnStateProbeExchange(id: string) {
+  return request<TurnStateProbeExchangeDetail>({
+    url: '/api/admin/accounts/turn-state/exchanges/reveal',
+    method: 'POST',
+    params: { id },
   })
 }

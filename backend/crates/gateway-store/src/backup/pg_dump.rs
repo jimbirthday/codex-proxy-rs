@@ -54,6 +54,8 @@ impl DatabaseDumpPort for PgDumpAdapter {
             .arg("--format=custom")
             .arg("--no-owner")
             .arg("--no-privileges")
+            // 探测报头是 24 小时敏感诊断数据，恢复业务库不应延长其生命周期。
+            .arg("--exclude-table-data=turn_state_probe_exchanges")
             .arg("--dbname")
             .arg(&self.database_url)
             .env("PGPASSWORD", &self.database_password)

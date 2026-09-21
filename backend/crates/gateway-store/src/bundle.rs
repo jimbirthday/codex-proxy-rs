@@ -13,6 +13,7 @@ pub struct StoreBundle {
     worker_leader_lease: Arc<dyn WorkerLeaderLeasePort>,
     health_probes: Vec<Arc<dyn HealthProbe>>,
     worker_contributions: Vec<WorkerContribution>,
+    turn_state_probe_capture: Arc<postgres::PgTurnStateProbeCapture>,
 }
 
 impl StoreBundle {
@@ -39,6 +40,13 @@ impl StoreBundle {
     #[must_use]
     pub fn health_probes(&self) -> Vec<Arc<dyn HealthProbe>> {
         self.health_probes.clone()
+    }
+
+    #[must_use]
+    pub fn turn_state_probe_capture_sink(
+        &self,
+    ) -> Arc<dyn gateway_admin::ports::turn_state_capture::TurnStateProbeCaptureSink> {
+        self.turn_state_probe_capture.clone()
     }
 
     pub fn take_worker_contributions(&mut self) -> Vec<WorkerContribution> {
@@ -97,6 +105,9 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         REDIS_NAMESPACE,
     )?);
 
+    let (turn_state_probe_capture, turn_state_probe_capture_writer) =
+        postgres::PgTurnStateProbeCapture::new(pool.clone());
+    let turn_state_probe_capture = Arc::new(turn_state_probe_capture);
     let admin_ports = AdminStorePorts::new(
         AdminAccountStorePorts::new(
             Arc::new(postgres::PgAdminAccountStore::new(
@@ -125,7 +136,8 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
             control_plane: postgres::PgControlPlaneRepository::new(pool.clone()),
         }),
         backup_ports(pool.clone(), &config)?,
-    );
+    )
+    .with_turn_state_probe_capture(turn_state_probe_capture.clone());
 
     let execution_repository = Arc::new(postgres::PgExecutionStore::new(pool.clone()));
     let (execution, execution_writer) =
@@ -206,6 +218,7 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         client_key_usage_writer,
         admission_release_writer,
         circuit_feedback_writer,
+        turn_state_probe_capture_writer,
         retention,
     )?;
     Ok(StoreBundle {
@@ -215,6 +228,7 @@ pub async fn initialize(mut config: StoreConfig) -> StoreResult<StoreBundle> {
         worker_leader_lease,
         health_probes,
         worker_contributions,
+        turn_state_probe_capture,
     })
 }
 

@@ -604,6 +604,138 @@ impl TurnStateRequest {
     }
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateCaptureStartRequest {
+    pub duration_minutes: u32,
+}
+
+impl TurnStateCaptureStartRequest {
+    pub(super) fn duration(&self) -> Result<std::time::Duration, WireValidationError> {
+        match self.duration_minutes {
+            15 | 60 | 360 => Ok(std::time::Duration::from_secs(
+                u64::from(self.duration_minutes) * 60,
+            )),
+            _ => Err(WireValidationError::new("durationMinutes")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateProbeExchangeListQuery {
+    pub page: Option<u32>,
+    pub page_size: Option<u16>,
+    pub account_id: Option<String>,
+    pub model_id: Option<String>,
+    pub trigger: Option<String>,
+    pub status_code: Option<u16>,
+    pub state_only: Option<bool>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+impl TurnStateProbeExchangeListQuery {
+    pub(super) fn into_domain(self) -> Result<TurnStateProbeExchangeQuery, WireValidationError> {
+        let page = self.page.unwrap_or(1);
+        if page == 0 {
+            return Err(WireValidationError::new("page"));
+        }
+        let page_size = PageSize::new(self.page_size.unwrap_or(20))
+            .map_err(|_| WireValidationError::new("pageSize"))?;
+        let account_id = optional_filter(self.account_id, "accountId", 256)?;
+        if let Some(value) = account_id.as_deref() {
+            require_account_id(value, "accountId")?;
+        }
+        let model = optional_filter(self.model_id, "modelId", 256)?;
+        let trigger = match self.trigger.as_deref() {
+            None | Some("") => None,
+            Some("manual_probe") => {
+                Some(gateway_admin::model::turn_state::TurnStateSource::ManualProbe)
+            }
+            Some("automatic_renewal") => {
+                Some(gateway_admin::model::turn_state::TurnStateSource::AutomaticRenewal)
+            }
+            Some(_) => return Err(WireValidationError::new("trigger")),
+        };
+        if self
+            .status_code
+            .is_some_and(|status| !(100..=999).contains(&status))
+        {
+            return Err(WireValidationError::new("statusCode"));
+        }
+        let start = parse_optional_time(self.start, "start")?;
+        let end = parse_optional_time(self.end, "end")?;
+        if start.zip(end).is_some_and(|(start, end)| start >= end) {
+            return Err(WireValidationError::new("end"));
+        }
+        Ok(TurnStateProbeExchangeQuery {
+            page,
+            page_size,
+            account_id,
+            model,
+            trigger,
+            status_code: self.status_code,
+            state_only: self.state_only.unwrap_or(false),
+            start,
+            end,
+        })
+    }
+}
+
+fn optional_filter(
+    value: Option<String>,
+    field: &'static str,
+    max_bytes: usize,
+) -> Result<Option<String>, WireValidationError> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            if value.len() > max_bytes || value.chars().any(char::is_control) {
+                return Err(WireValidationError::new(field));
+            }
+            Ok(Some(value.to_owned()))
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
+fn parse_optional_time(
+    value: Option<String>,
+    field: &'static str,
+) -> Result<Option<DateTime<Utc>>, WireValidationError> {
+    value
+        .map(|value| {
+            DateTime::parse_from_rfc3339(value.trim())
+                .map(|value| value.with_timezone(&Utc))
+                .map_err(|_| WireValidationError::new(field))
+        })
+        .transpose()
+}
+
+fn validate_probe_exchange_id(id: &str) -> Result<(), WireValidationError> {
+    if id.len() > 64 || Uuid::parse_str(id).is_err() || id.chars().any(char::is_control) {
+        return Err(WireValidationError::new("id"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateProbeExchangeIdQuery {
+    pub id: String,
+}
+
+impl TurnStateProbeExchangeIdQuery {
+    pub(super) fn into_id(self) -> Result<String, WireValidationError> {
+        validate_probe_exchange_id(&self.id)?;
+        Ok(self.id)
+    }
+}
+
 /// 主动额度重置卡消费请求。幂等键由 UI 生成并在不确定重试时复用，与官方一致。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1024,6 +1156,7 @@ pub struct TurnStateProbeData {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStateAttemptData {
+    pub exchange_id: Option<String>,
     pub target_id: String,
     pub target_label: String,
     pub success: bool,
@@ -1051,6 +1184,7 @@ impl From<gateway_admin::model::turn_state::TurnStateProbeResult> for TurnStateP
 impl From<gateway_admin::model::turn_state::TurnStateProbeAttempt> for TurnStateAttemptData {
     fn from(value: gateway_admin::model::turn_state::TurnStateProbeAttempt) -> Self {
         Self {
+            exchange_id: value.exchange_id,
             target_id: value.target_id,
             target_label: value.target_label,
             success: value.success,
@@ -1058,6 +1192,185 @@ impl From<gateway_admin::model::turn_state::TurnStateProbeAttempt> for TurnState
             latency_ms: value.latency_ms,
             state_acquired: value.state_acquired,
             message: value.message,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateCaptureBufferData {
+    pub queued_items: usize,
+    pub queued_bytes: usize,
+    pub enqueued_total: u64,
+    pub dropped_total: u64,
+    pub persisted_total: u64,
+    pub write_failure_total: u64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateCaptureStatusData {
+    pub enabled_until: Option<String>,
+    pub retention_hours: u32,
+    pub buffer: TurnStateCaptureBufferData,
+}
+
+impl From<TurnStateCaptureStatus> for TurnStateCaptureStatusData {
+    fn from(value: TurnStateCaptureStatus) -> Self {
+        Self {
+            enabled_until: value.enabled_until.map(|time| time.to_rfc3339()),
+            retention_hours: value.retention_hours,
+            buffer: TurnStateCaptureBufferData {
+                queued_items: value.buffer.queued_items,
+                queued_bytes: value.buffer.queued_bytes,
+                enqueued_total: value.buffer.enqueued_total,
+                dropped_total: value.buffer.dropped_total,
+                persisted_total: value.buffer.persisted_total,
+                write_failure_total: value.buffer.write_failure_total,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateHeaderSummaryData {
+    pub count: u32,
+    pub present: bool,
+    pub byte_length: Option<u32>,
+    pub sha256: Option<String>,
+    pub valid_292: bool,
+}
+
+impl From<TurnStateHeaderSummary> for TurnStateHeaderSummaryData {
+    fn from(value: TurnStateHeaderSummary) -> Self {
+        Self {
+            count: value.count,
+            present: value.present,
+            byte_length: value.byte_length,
+            sha256: value.sha256,
+            valid_292: value.valid_292,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeExchangeSummaryData {
+    pub id: String,
+    pub trigger: &'static str,
+    pub account_id: String,
+    pub model: String,
+    pub target_id: String,
+    pub target_label: String,
+    pub request_id: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub status_code: Option<u16>,
+    pub http_version: Option<String>,
+    pub outcome: String,
+    pub latency_ms: u64,
+    pub request_header_count: u32,
+    pub response_header_count: u32,
+    pub request_header_bytes: u64,
+    pub response_header_bytes: u64,
+    pub request_turn_state: TurnStateHeaderSummaryData,
+    pub response_turn_state: TurnStateHeaderSummaryData,
+}
+
+impl From<TurnStateProbeExchangeSummary> for TurnStateProbeExchangeSummaryData {
+    fn from(value: TurnStateProbeExchangeSummary) -> Self {
+        Self {
+            id: value.id,
+            trigger: value.trigger.as_str(),
+            account_id: value.account_id,
+            model: value.model,
+            target_id: value.target_id,
+            target_label: value.target_label,
+            request_id: value.request_id,
+            started_at: value.started_at.to_rfc3339(),
+            finished_at: value.finished_at.to_rfc3339(),
+            status_code: value.status_code,
+            http_version: value.http_version,
+            outcome: value.outcome,
+            latency_ms: value.latency_ms,
+            request_header_count: value.request_header_count,
+            response_header_count: value.response_header_count,
+            request_header_bytes: value.request_header_bytes,
+            response_header_bytes: value.response_header_bytes,
+            request_turn_state: value.request_turn_state.into(),
+            response_turn_state: value.response_turn_state.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeExchangePageData {
+    pub items: Vec<TurnStateProbeExchangeSummaryData>,
+    pub page: u32,
+    pub page_size: u16,
+    pub total: u64,
+}
+
+impl From<TurnStateProbeExchangePage> for TurnStateProbeExchangePageData {
+    fn from(value: TurnStateProbeExchangePage) -> Self {
+        Self {
+            items: value.items.into_iter().map(Into::into).collect(),
+            page: value.page,
+            page_size: value.page_size,
+            total: value.total,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeHeaderData {
+    pub name: String,
+    pub value_base64: Option<String>,
+    pub byte_length: usize,
+    pub sensitive: bool,
+}
+
+impl TurnStateProbeHeaderData {
+    fn from_header(value: TurnStateProbeHeader, reveal: bool) -> Self {
+        let sensitive = is_sensitive_probe_header(&value.name);
+        let byte_length = value.value.len();
+        let value_base64 = (reveal || !sensitive).then(|| STANDARD_BASE64.encode(value.value));
+        Self {
+            name: value.name,
+            value_base64,
+            byte_length,
+            sensitive,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnStateProbeExchangeDetailData {
+    pub summary: TurnStateProbeExchangeSummaryData,
+    pub request_headers: Vec<TurnStateProbeHeaderData>,
+    pub response_headers: Vec<TurnStateProbeHeaderData>,
+    pub revealed: bool,
+}
+
+impl TurnStateProbeExchangeDetailData {
+    pub(super) fn from_detail(value: TurnStateProbeExchangeDetail, reveal: bool) -> Self {
+        Self {
+            summary: value.summary.into(),
+            request_headers: value
+                .request_headers
+                .into_iter()
+                .map(|header| TurnStateProbeHeaderData::from_header(header, reveal))
+                .collect(),
+            response_headers: value
+                .response_headers
+                .into_iter()
+                .map(|header| TurnStateProbeHeaderData::from_header(header, reveal))
+                .collect(),
+            revealed: reveal,
         }
     }
 }

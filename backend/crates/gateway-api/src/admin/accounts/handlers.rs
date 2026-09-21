@@ -67,6 +67,30 @@ where
             post(probe_account_turn_state::<S>),
         )
         .route(
+            "/api/admin/accounts/turn-state/capture",
+            get(turn_state_capture_status::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/capture/start",
+            post(start_turn_state_capture::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/capture/stop",
+            post(stop_turn_state_capture::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/exchanges",
+            get(list_turn_state_probe_exchanges::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/exchanges/detail",
+            get(turn_state_probe_exchange_detail::<S>),
+        )
+        .route(
+            "/api/admin/accounts/turn-state/exchanges/reveal",
+            post(reveal_turn_state_probe_exchange::<S>),
+        )
+        .route(
             "/api/admin/accounts/oauth/start",
             post(start_account_authorization::<S>),
         )
@@ -683,5 +707,126 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(TurnStateProbeData::from(result)),
+    ))
+}
+
+async fn turn_state_capture_status<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .accounts()
+        .turn_state_capture_status()
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateCaptureStatusData::from(status)),
+    ))
+}
+
+async fn start_turn_state_capture<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<TurnStateCaptureStartRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let duration = request.duration().map_err(map_wire_error)?;
+    let status = state
+        .admin_services()
+        .accounts()
+        .start_turn_state_capture(&auth.context().mutation_context(), duration)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateCaptureStatusData::from(status)),
+    ))
+}
+
+async fn stop_turn_state_capture<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .accounts()
+        .stop_turn_state_capture(&auth.context().mutation_context())
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateCaptureStatusData::from(status)),
+    ))
+}
+
+async fn list_turn_state_probe_exchanges<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<TurnStateProbeExchangeListQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let page = state
+        .admin_services()
+        .accounts()
+        .list_turn_state_probe_exchanges(query.into_domain().map_err(map_wire_error)?)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateProbeExchangePageData::from(page)),
+    ))
+}
+
+async fn turn_state_probe_exchange_detail<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<TurnStateProbeExchangeIdQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = query.into_id().map_err(map_wire_error)?;
+    let detail = state
+        .admin_services()
+        .accounts()
+        .turn_state_probe_exchange_detail(&id)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateProbeExchangeDetailData::from_detail(detail, false)),
+    ))
+}
+
+async fn reveal_turn_state_probe_exchange<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminQuery(query): AdminQuery<TurnStateProbeExchangeIdQuery>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let id = query.into_id().map_err(map_wire_error)?;
+    let detail = state
+        .admin_services()
+        .accounts()
+        .reveal_turn_state_probe_exchange(&auth.context().mutation_context(), &id)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateProbeExchangeDetailData::from_detail(detail, true)),
     ))
 }
