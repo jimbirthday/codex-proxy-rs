@@ -489,6 +489,17 @@ pub(crate) fn scope_request_to_account(
         {
             request.body_mut().remove(*key);
         }
+    } else {
+        // 同账号的透传 turn metadata 也会覆盖重建的请求头，安装身份须同步改写。
+        for (name, value) in &mut request.passthrough_headers {
+            if name == "x-codex-turn-metadata"
+                && let Ok(raw) = value.to_str()
+                && let Some(scoped) = scope_turn_metadata(raw, installation_id, false)
+                && let Ok(scoped) = HeaderValue::from_str(&scoped)
+            {
+                *value = scoped;
+            }
+        }
     }
 
     for key in INSTALLATION_ID_KEYS {

@@ -30,6 +30,8 @@ pub(super) fn is_managed_identity_header(name: &str) -> bool {
             | "chatgpt-project-id"
             | "openai-organization"
             | "openai-project"
+            // 安装身份由当前账号写入 client_metadata，不继承下游安装头。
+            | "x-codex-installation-id"
     )
 }
 

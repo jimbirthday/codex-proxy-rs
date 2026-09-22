@@ -110,6 +110,7 @@ const {
   handleRecover,
   handleRefresh,
   handleRefreshQuota,
+  handleQuotaReset,
 } = useAccountMutations({
   onImportTaskCreated: importTasks.created,
   accounts,
@@ -367,7 +368,7 @@ const {
                 <AccountQuotaPanel
                   :account="row"
                   :refreshing="refreshingQuotaAccountIds.has(row.id)"
-                  @account-updated="void replaceAccount($event)"
+                  @quota-reset="handleQuotaReset"
                   @refresh-quota="handleRefreshQuota"
                 />
                 <AccountUsagePanel

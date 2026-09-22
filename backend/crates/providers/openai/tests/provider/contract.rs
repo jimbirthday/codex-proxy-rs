@@ -1519,6 +1519,340 @@ async fn generate_without_an_eligible_openai_account_fails_before_network_io() {
     assert_eq!(error.send_state(), UpstreamSendState::NotSent);
 }
 
+#[tokio::test]
+async fn quota_snapshot_race_reloads_and_sends_the_request_once() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    let original = store.account("acct_provider_contract").expect("account");
+    let observed_at = SystemTime::now();
+    store
+        .apply_quota_access(QuotaAccessChange {
+            account_id: original.id().clone(),
+            expected_revision: original.revision(),
+            state: QuotaState::allowed(observed_at),
+        })
+        .await
+        .expect("initial quota");
+    store.on_credential_load(Arc::new(move |store, id, count| {
+        Box::pin(async move {
+            if count == 1 {
+                let account = store.account(id.as_str()).expect("account");
+                store
+                    .apply_quota_access(QuotaAccessChange {
+                        account_id: id.clone(),
+                        expected_revision: account.revision(),
+                        state: QuotaState::allowed(observed_at + Duration::from_millis(1)),
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+    }));
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .and(header("authorization", "Bearer at-acct_provider_contract"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(CAPTURE_COMPLETED_SSE, "text/event-stream"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = provider_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        upstream.uri(),
+        Arc::clone(&leases),
+    );
+    let mut stream = provider
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            context("req_quota_snapshot_race", CancellationToken::new()),
+        )
+        .await
+        .expect("concurrent quota observation must not fail prepare");
+    assert_eq!(stream.metadata().provider_account_id(), original.id());
+    assert_eq!(store.credential_loads(), 2);
+    assert_eq!(leases.requests.lock().expect("leases").len(), 1);
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        let event = event.expect("upstream event");
+        completed |= event
+            .wire_event()
+            .is_some_and(|wire| wire.data()["type"] == "response.completed");
+    }
+    assert!(
+        completed,
+        "the successful upstream response must reach the client stream"
+    );
+    upstream.verify().await;
+}
+
+#[tokio::test]
+async fn snapshot_retry_rechecks_account_availability_without_sending() {
+    for change in ["disabled", "revoked", "exhausted"] {
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_provider_contract").await;
+        store.on_credential_load(Arc::new(move |store, id, count| {
+            Box::pin(async move {
+                assert_eq!(count, 1, "an unavailable account cannot be selected again");
+                let account = store.account(id.as_str()).expect("account");
+                match change {
+                    "disabled" => store.set_enabled(id, false).await?,
+                    "revoked" => {
+                        store
+                            .apply_state_change(gateway_core::account::AccountStateChange {
+                                account_id: id.clone(),
+                                expected_revision: account.revision(),
+                                credential_state: CredentialState::Invalid,
+                                observed_at: SystemTime::now(),
+                                error_reason: None,
+                                message: None,
+                            })
+                            .await?
+                    }
+                    "exhausted" => {
+                        store
+                            .apply_quota_access(QuotaAccessChange {
+                                account_id: id.clone(),
+                                expected_revision: account.revision(),
+                                state: QuotaState::exhausted(
+                                    QuotaEvidence::UsageLimitReached,
+                                    SystemTime::now(),
+                                    None,
+                                ),
+                            })
+                            .await?;
+                    }
+                    _ => unreachable!("test case"),
+                }
+                Ok(())
+            })
+        }));
+        let upstream = MockServer::start().await;
+        let leases = Arc::new(TestLeaseCoordinator::default());
+        let provider = provider_with_affinity_and_base_url_and_leases(
+            &store,
+            Arc::new(MemorySessionAffinity::default()),
+            upstream.uri(),
+            Arc::clone(&leases),
+        );
+        let Err(error) = provider
+            .execute(
+                planned_request("openai", http_generate_operation()),
+                context("req_snapshot_unavailable", CancellationToken::new()),
+            )
+            .await
+        else {
+            panic!("{change} account must not produce an upstream stream");
+        };
+        let expected = if change == "exhausted" {
+            ProviderErrorKind::QuotaExhausted
+        } else {
+            ProviderErrorKind::NoEligibleAccount
+        };
+        assert_eq!(error.kind(), expected, "{change}");
+        assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+        assert!(leases.requests.lock().expect("leases").is_empty());
+        assert!(
+            upstream
+                .received_requests()
+                .await
+                .expect("requests")
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
+async fn snapshot_retry_cannot_switch_a_disabled_native_continuation_account() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    create_account(&store, "acct_scope_new").await;
+    store.on_credential_load(Arc::new(|store, id, count| {
+        Box::pin(async move {
+            assert_eq!(id.as_str(), "acct_provider_contract");
+            assert_eq!(count, 1);
+            store.set_enabled(id, false).await
+        })
+    }));
+    let upstream = MockServer::start().await;
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = provider_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        upstream.uri(),
+        Arc::clone(&leases),
+    );
+    let Err(error) = provider
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            pinned_continuation_context(
+                "req_snapshot_pinned",
+                "acct_provider_contract",
+                "client-previous",
+                "upstream-previous",
+                1,
+                ContinuationAttempt::Native,
+            ),
+        )
+        .await
+    else {
+        panic!("native continuation cannot move to the healthy second account");
+    };
+    assert_eq!(error.kind(), ProviderErrorKind::NoEligibleAccount);
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    assert!(leases.requests.lock().expect("leases").is_empty());
+    assert!(
+        upstream
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn repeated_snapshot_conflicts_are_bounded_and_report_the_selection_stage() {
+    let store = Arc::new(MemoryAccountStore::default());
+    create_account(&store, "acct_provider_contract").await;
+    store.on_credential_load(Arc::new(|store, id, count| {
+        Box::pin(async move {
+            assert!(count <= 4, "snapshot conflict retries must be bounded");
+            let account = store.account(id.as_str()).expect("account");
+            let observed_at = account
+                .quota()
+                .observed_at()
+                .unwrap_or_else(SystemTime::now)
+                + Duration::from_millis(1);
+            store
+                .apply_quota_access(QuotaAccessChange {
+                    account_id: id.clone(),
+                    expected_revision: account.revision(),
+                    state: QuotaState::allowed(observed_at),
+                })
+                .await?;
+            Ok(())
+        })
+    }));
+    let upstream = MockServer::start().await;
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = provider_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        upstream.uri(),
+        Arc::clone(&leases),
+    );
+    let Err(error) = provider
+        .execute(
+            planned_request("openai", http_generate_operation()),
+            context("req_snapshot_conflicts", CancellationToken::new()),
+        )
+        .await
+    else {
+        panic!("continuously changing snapshots must not be sent");
+    };
+    assert_eq!(
+        error.kind(),
+        ProviderErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_eq!(error.send_state(), UpstreamSendState::NotSent);
+    let diagnostic = error.diagnostic().expect("selection diagnostic");
+    assert_eq!(diagnostic.stage(), Some("account_selection"));
+    assert_eq!(diagnostic.code(), Some("account_snapshot_conflict"));
+    assert_eq!(store.credential_loads(), 4);
+    assert!(leases.requests.lock().expect("leases").is_empty());
+    assert!(
+        upstream
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn api_websocket_precheck_and_selection_share_the_snapshot_retry_budget() {
+    let upstream = MockServer::start().await;
+    let store = Arc::new(MemoryAccountStore::default());
+    store
+        .seed_api_key(
+            "acct_provider_contract",
+            upstream.uri(),
+            provider_openai::credential::ApiKeyTransport::PreferWebsocket,
+        )
+        .await;
+    store.on_credential_load(Arc::new(|store, id, count| {
+        Box::pin(async move {
+            assert!(
+                count <= 6,
+                "both credential checks must share one retry budget"
+            );
+            // 第 1、4 次在传输预检冲突，第 3、6 次在最终候选校验冲突。
+            if matches!(count, 1 | 3 | 4 | 6) {
+                let account = store.account(id.as_str()).expect("account");
+                let observed_at = account
+                    .quota()
+                    .observed_at()
+                    .unwrap_or_else(SystemTime::now)
+                    + Duration::from_millis(1);
+                store
+                    .apply_quota_access(QuotaAccessChange {
+                        account_id: id.clone(),
+                        expected_revision: account.revision(),
+                        state: QuotaState::allowed(observed_at),
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+    }));
+    let leases = Arc::new(TestLeaseCoordinator::default());
+    let provider = provider_with_affinity_and_base_url_and_leases(
+        &store,
+        Arc::new(MemorySessionAffinity::default()),
+        upstream.uri(),
+        Arc::clone(&leases),
+    );
+    let warmup = Operation::Generate(GenerateRequest::from_protocol_payload(
+        ProtocolPayload::json_object(
+            "openai",
+            json!({"model":"gpt-5.4","input":[],"store":false,"generate":false})
+                .as_object()
+                .expect("object")
+                .clone(),
+        )
+        .expect("warmup"),
+    ));
+    let Err(error) = provider
+        .execute(
+            planned_request("openai", warmup),
+            context("req_api_snapshot_conflicts", CancellationToken::new()),
+        )
+        .await
+    else {
+        panic!("mixed snapshot conflicts must stop before WebSocket connection");
+    };
+    assert_eq!(
+        error.kind(),
+        ProviderErrorKind::ProviderInfrastructureUnavailable
+    );
+    assert_eq!(
+        error.diagnostic().and_then(|diagnostic| diagnostic.code()),
+        Some("account_snapshot_conflict")
+    );
+    assert_eq!(store.credential_loads(), 6);
+    assert!(leases.requests.lock().expect("leases").is_empty());
+    assert!(
+        upstream
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty()
+    );
+}
+
 async fn exhaust_account_quota(store: &Arc<MemoryAccountStore>, account_id: &str) {
     let account = store.account(account_id).expect("test account");
     store
@@ -4238,6 +4572,162 @@ async fn opaque_provider_options_do_not_change_openai_account_selection() {
 }
 
 #[tokio::test]
+async fn http_account_scoping_drops_downstream_installation_header() {
+    for owner in ["acct_scope_same", "acct_scope_old"] {
+        let raw = r#"{"installation_id":"client-installation","future":true}"#;
+        let request = capture_scoped_http_request(
+            "req_installation_http",
+            "acct_scope_same",
+            owner,
+            Map::from_iter([
+                ("model".to_owned(), json!("gpt-5.4")),
+                ("input".to_owned(), json!("hello")),
+                ("installation_id".to_owned(), json!("client-installation")),
+                (
+                    "client_metadata".to_owned(),
+                    json!({
+                        "x-codex-installation-id": "client-installation",
+                        "x-codex-turn-metadata": raw
+                    }),
+                ),
+            ]),
+            Map::from_iter([
+                ("turn_metadata".to_owned(), json!(raw)),
+                (
+                    "opaque_request_headers".to_owned(),
+                    json!([
+                        [
+                            "x-codex-installation-id",
+                            STANDARD.encode(b"client-installation")
+                        ],
+                        ["x-codex-turn-metadata", STANDARD.encode(raw)]
+                    ]),
+                ),
+            ]),
+        )
+        .await;
+        let body = captured_request_body(&request);
+        let installation_id = body["client_metadata"]["x-codex-installation-id"]
+            .as_str()
+            .expect("account installation ID");
+        assert_ne!(installation_id, "client-installation");
+        assert!(uuid::Uuid::parse_str(installation_id).is_ok());
+        assert_eq!(body["installation_id"], installation_id);
+        assert!(captured_header_values(&request, "x-codex-installation-id").is_empty());
+        let headers = captured_header_values(&request, "x-codex-turn-metadata");
+        assert_eq!(headers.len(), 1);
+        for encoded in [
+            std::str::from_utf8(&headers[0]).expect("header metadata"),
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("body metadata"),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Value>(encoded).expect("turn metadata JSON"),
+                json!({"installation_id": installation_id, "future": true}),
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_account_scoping_drops_downstream_installation_header() {
+    for owner in ["acct_scope_same", "acct_scope_old"] {
+        let raw = r#"{"installation_id":"client-installation","future":true}"#;
+        let store = Arc::new(MemoryAccountStore::default());
+        create_account(&store, "acct_scope_same").await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept websocket");
+            let mut received_headers = None;
+            let mut socket =
+                crate::transport::accept_codex_test_websocket_with(socket, |request, _| {
+                    received_headers = Some(request.headers().clone());
+                })
+                .await;
+            let message = socket.next().await.expect("request").expect("valid frame");
+            let body: Value = serde_json::from_str(message.to_text().expect("text")).expect("JSON");
+            socket
+                .send(Message::Text(
+                    json!({
+                        "type": "response.completed",
+                        "response": {"id": "resp_installation", "model": "gpt-5.4", "status": "completed", "output": []}
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("complete response");
+            (received_headers.expect("opening headers"), body)
+        });
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            Map::from_iter([
+                ("model".to_owned(), json!("gpt-5.4")),
+                ("input".to_owned(), json!("hello")),
+                ("installation_id".to_owned(), json!("client-installation")),
+                (
+                    "client_metadata".to_owned(),
+                    json!({
+                        "x-codex-installation-id": "client-installation",
+                        "x-codex-turn-metadata": raw
+                    }),
+                ),
+            ]),
+        )
+        .expect("payload")
+        .with_context(Map::from_iter([
+            ("turn_metadata".to_owned(), json!(raw)),
+            (
+                "opaque_request_headers".to_owned(),
+                json!([
+                    [
+                        "x-codex-installation-id",
+                        STANDARD.encode(b"client-installation")
+                    ],
+                    ["x-codex-turn-metadata", STANDARD.encode(raw)]
+                ]),
+            ),
+        ]));
+        let mut stream = provider_with_base_url(&store, base_url)
+            .execute(
+                planned_request(
+                    "openai",
+                    Operation::Generate(GenerateRequest::from_protocol_payload(payload)),
+                ),
+                context_with_state_owner("req_installation_ws", owner),
+            )
+            .await
+            .expect("provider stream");
+        while let Some(event) = stream.next().await {
+            event.expect("successful websocket response");
+        }
+        let (header, body) = server.await.expect("server");
+        let installation_id = body["client_metadata"]["x-codex-installation-id"]
+            .as_str()
+            .expect("account installation ID");
+        assert_ne!(installation_id, "client-installation");
+        assert!(uuid::Uuid::parse_str(installation_id).is_ok());
+        assert_eq!(body["installation_id"], installation_id);
+        assert!(!header.contains_key("x-codex-installation-id"));
+        for encoded in [
+            header["x-codex-turn-metadata"]
+                .to_str()
+                .expect("header metadata"),
+            body["client_metadata"]["x-codex-turn-metadata"]
+                .as_str()
+                .expect("body metadata"),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Value>(encoded).expect("turn metadata JSON"),
+                json!({"installation_id": installation_id, "future": true}),
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn same_account_scope_preserves_future_protocol_shapes() {
     let request = capture_scoped_http_request(
         "req_scope_same",
@@ -5040,6 +5530,10 @@ async fn account_change_drops_only_account_bound_opaque_headers() {
                 "x-codex-turn-metadata",
                 STANDARD.encode(br#"{"installation_id":"client-installation","safe":true}"#)
             ],
+            [
+                "X-Codex-Turn-Metadata",
+                STANDARD.encode(br#"{"installationId":"second-client-installation","safe":false}"#)
+            ],
             ["x-openai-future", STANDARD.encode(b"keep-on-switch")]
         ]),
     )]);
@@ -5068,6 +5562,21 @@ async fn account_change_drops_only_account_bound_opaque_headers() {
         captured_header_values(&same_account, "x-codex-turn-state"),
         vec![b"turn-first".to_vec(), b"turn-\x80".to_vec()]
     );
+    let body = captured_request_body(&same_account);
+    let installation_id = body["client_metadata"]["x-codex-installation-id"]
+        .as_str()
+        .expect("account installation ID");
+    let metadata = captured_header_values(&same_account, "x-codex-turn-metadata");
+    assert_eq!(metadata.len(), 2);
+    for (raw, expected) in metadata.iter().zip([
+        json!({"installation_id": installation_id, "safe": true}),
+        json!({"installationId": installation_id, "safe": false}),
+    ]) {
+        assert_eq!(
+            serde_json::from_slice::<Value>(raw).expect("turn metadata JSON"),
+            expected,
+        );
+    }
     assert_eq!(
         captured_header_values(&same_account, "x-openai-future"),
         vec![b"keep-on-switch".to_vec()]
@@ -8982,15 +9491,19 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
                 provider_openai::credential::ApiKeyTransport::Http,
             )
             .await;
-        Mock::given(method("GET"))
-            .and(path(format!("{prefix}/models")))
-            .and(header("authorization", "Bearer sk-api-test-only"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"gpt-5.4"}]})),
-            )
-            .expect(1)
-            .mount(&upstream)
-            .await;
+        // 后台发现不协商客户端版本；客户端目录独立请求并按实际版本缓存。
+        for query in [None, Some("client_version=1.0.0")] {
+            Mock::given(method("GET"))
+                .and(path(format!("{prefix}/models")))
+                .and(move |request: &wiremock::Request| request.url.query() == query)
+                .and(header("authorization", "Bearer sk-api-test-only"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"data":[{"id":"gpt-5.4"}]})),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+        }
         Mock::given(method("POST"))
             .and(path(format!("{prefix}/responses")))
             .and(header("authorization", "Bearer sk-api-test-only"))
@@ -9058,19 +9571,37 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
             request.headers["user-agent"],
             wire_profile().snapshot().user_agent()
         );
-        let model_request = requests
+        let model_requests = requests
             .iter()
-            .find(|request| request.method == "GET")
-            .unwrap();
-        assert_eq!(
-            model_request.headers["user-agent"],
-            wire_profile().snapshot().user_agent()
-        );
-        assert_eq!(model_request.headers["originator"], "codex_cli_rs");
-        assert_eq!(model_request.headers["version"], "0.144.0");
+            .filter(|request| request.method == "GET")
+            .collect::<Vec<_>>();
+        assert_eq!(model_requests.len(), 2);
+        for query in [None, Some("client_version=1.0.0")] {
+            let model_request = model_requests
+                .iter()
+                .find(|request| request.url.query() == query)
+                .expect("separate background and client catalog requests");
+            assert_eq!(
+                model_request.headers["authorization"],
+                "Bearer sk-api-test-only"
+            );
+            assert_eq!(
+                model_request.headers["user-agent"],
+                wire_profile().snapshot().user_agent()
+            );
+            assert_eq!(model_request.headers["originator"], "codex_cli_rs");
+            assert_eq!(model_request.headers["version"], "0.144.0");
+            for header in ["cookie", "chatgpt-account-id"] {
+                assert!(
+                    !model_request.headers.contains_key(header),
+                    "unexpected catalog {header}"
+                );
+            }
+        }
         let body: Value = serde_json::from_slice(&request.body).expect("ordinary JSON");
         assert_eq!(body["stream"], true);
         assert_eq!(body["model"], "gpt-5.4");
+        upstream.verify().await;
     }
 }
 
