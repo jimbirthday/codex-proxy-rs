@@ -1,6 +1,7 @@
 //! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
 
 mod verified_probe;
+mod ws_prewarm;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -952,6 +953,49 @@ impl ProviderAdmin for OpenAiAdminProvider {
             false,
         )
         .await
+    }
+
+    async fn websocket_prewarm_probe(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+        proxy: Option<&gateway_core::account::OutboundProxy>,
+        timeout_seconds: u64,
+        body: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<gateway_admin::model::proxies::WebSocketPrewarmResult, ProviderAdminError> {
+        let started = Instant::now();
+        let exchange = self
+            .websocket_prewarm(account_id, model, proxy, timeout_seconds, body)
+            .await?;
+        Ok(gateway_admin::model::proxies::WebSocketPrewarmResult {
+            exchange: gateway_admin::model::proxies::HttpProbeExchange {
+                request: gateway_admin::model::proxies::HttpProbeRequest {
+                    method: exchange.method,
+                    url: exchange.url,
+                    headers: exchange.request_headers,
+                    body: exchange.request_body,
+                    timeout_seconds,
+                },
+                status_code: exchange.status_code,
+                http_version: Some("websocket".to_owned()),
+                response_headers: exchange.response_headers,
+                automatic_request_headers: vec![
+                    "authorization".to_owned(),
+                    "chatgpt-account-id".to_owned(),
+                    "cookie".to_owned(),
+                    "originator".to_owned(),
+                    "user-agent".to_owned(),
+                    "version".to_owned(),
+                    "openai-beta".to_owned(),
+                    "x-openai-internal-codex-responses-lite".to_owned(),
+                ],
+                elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                error: exchange.error,
+                turn_state_length: exchange.turn_state_length,
+                turn_state_stored: exchange.turn_state_stored,
+            },
+            body: exchange.body,
+        })
     }
 
     async fn http_probe_headers(

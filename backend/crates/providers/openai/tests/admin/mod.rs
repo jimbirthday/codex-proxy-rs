@@ -6322,3 +6322,4 @@ fn acquire_only_policy() -> gateway_admin::model::turn_state::TurnStateProbePoli
 }
 
 mod verified_probe;
+mod ws_prewarm;

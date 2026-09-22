@@ -224,7 +224,7 @@ async fn verified_policy_migration_upgrades_once_and_preserves_later_edits() {
     sqlx::query("update runtime_settings set turn_state_probe_policy_json = $1")
         .bind(serde_json::json!({"schemaVersion":2,"manualEnabled":false,"automaticEnabled":false,"mode":"smart","proxyIds":[],"candidateLimit":2,"schedule":{"scanIntervalSeconds":30,"budgetLimit":3},"request":{"inputText":"old"}}))
         .execute(&database.pool).await.unwrap();
-    let migration = include_str!("../../../../migrations/0019_verified_turn_state.sql");
+    let migration = include_str!("../../../../migrations/0020_verified_turn_state.sql");
     sqlx::raw_sql(migration)
         .execute(&database.pool)
         .await

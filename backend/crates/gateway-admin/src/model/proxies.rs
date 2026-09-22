@@ -135,6 +135,10 @@ pub struct HttpProbeExchange {
     pub elapsed_ms: u64,
     /// 读取失败仍返回已收到的报头和正文，并明确标明不完整。
     pub error: Option<String>,
+    /// WebSocket 预热从握手或 metadata 帧观察到的 State 长度；HTTP 探测为 `None`。
+    pub turn_state_length: Option<u16>,
+    /// 合格 State 已写入当前账号与模型的进程内缓存。
+    pub turn_state_stored: bool,
 }
 
 pub struct FreeProbeCommand {
@@ -142,6 +146,16 @@ pub struct FreeProbeCommand {
     pub use_account_headers: bool,
     pub proxy: AccountProxySelection,
     pub request: HttpProbeRequest,
+    pub mode: FreeProbeMode,
+    pub model: Option<String>,
+}
+
+/// 自由探测的发送方式。省略时保持既有 HTTP 合同，页面默认选择 WebSocket 预热。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreeProbeMode {
+    #[default]
+    Http,
+    WebsocketPrewarm,
 }
 
 /// 探测响应按事件交付，完整正文由临时文件端口承载，预览最多 64 KiB。
@@ -162,6 +176,11 @@ pub type HttpProbeEvents = futures::stream::BoxStream<'static, HttpProbeEvent>;
 pub struct HttpProbeSession {
     pub events: HttpProbeEvents,
     pub body: std::sync::Arc<dyn crate::ports::proxy::HttpProbeBody>,
+}
+
+pub struct WebSocketPrewarmResult {
+    pub exchange: HttpProbeExchange,
+    pub body: Vec<u8>,
 }
 
 pub struct FreeProbeSession {

@@ -1,8 +1,8 @@
 //! 自由 HTTP 探测的管理员敏感合同；通过事件流交付交换进度，正文由所属管理员下载。
 
 use gateway_admin::model::proxies::{
-    AccountProxySelection, FreeProbeCommand, HttpProbeEvent, HttpProbeExchange, HttpProbeHeader,
-    HttpProbeRequest,
+    AccountProxySelection, FreeProbeCommand, FreeProbeMode, HttpProbeEvent, HttpProbeExchange,
+    HttpProbeHeader, HttpProbeRequest,
 };
 use gateway_core::account::OutboundProxy;
 
@@ -22,6 +22,17 @@ struct ProbeRequest {
     headers: Vec<ProbeHeader>,
     body_base64: String,
     timeout_seconds: u64,
+    #[serde(default)]
+    mode: ProbeMode,
+    model: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProbeMode {
+    #[default]
+    Http,
+    WebsocketPrewarm,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -44,6 +55,8 @@ struct ProbeExchange {
     automatic_request_headers: Vec<String>,
     elapsed_ms: u64,
     error: Option<String>,
+    turn_state_length: Option<u16>,
+    turn_state_stored: bool,
 }
 
 impl ProbeRequest {
@@ -86,6 +99,11 @@ impl ProbeRequest {
                     .map_err(|_| invalid())?,
                 timeout_seconds: self.timeout_seconds,
             },
+            mode: match self.mode {
+                ProbeMode::Http => FreeProbeMode::Http,
+                ProbeMode::WebsocketPrewarm => FreeProbeMode::WebsocketPrewarm,
+            },
+            model: self.model,
         })
     }
 }
@@ -113,6 +131,8 @@ impl From<HttpProbeExchange> for ProbeExchange {
             automatic_request_headers: value.automatic_request_headers,
             elapsed_ms: value.elapsed_ms,
             error: value.error,
+            turn_state_length: value.turn_state_length,
+            turn_state_stored: value.turn_state_stored,
         }
     }
 }

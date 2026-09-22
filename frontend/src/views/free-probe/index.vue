@@ -17,6 +17,8 @@ import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import { useCopyText } from '@/composables/useCopyText'
 import { errorMessage } from '@/utils/async'
 
+const mode = shallowRef('websocket_prewarm')
+const model = shallowRef('gpt-5.4')
 const method = shallowRef('POST')
 const url = shallowRef('')
 const accountId = shallowRef('')
@@ -139,13 +141,23 @@ async function send() {
   controller = new AbortController()
   busy.value = true
   try {
+    if (mode.value === 'websocket_prewarm' && !accountId.value) {
+      error.value = 'WebSocket 预热必须选择 OpenAI OAuth 账号'
+      return
+    }
+    if (mode.value === 'websocket_prewarm' && !model.value.trim()) {
+      error.value = '请填写预热模型'
+      return
+    }
     await sendFreeProbe({
       accountId: accountId.value || null,
       useAccountHeaders: Boolean(accountId.value) && useAccountHeaders.value,
       proxyId: proxyId.value && proxyId.value !== 'custom' ? proxyId.value : null,
       proxyUrl: proxyId.value === 'custom' ? proxyUrl.value : null,
       method: method.value,
-      url: url.value,
+      url: mode.value === 'websocket_prewarm' ? 'wss://chatgpt.com/backend-api/codex/responses' : url.value,
+      mode: mode.value === 'websocket_prewarm' ? 'websocket_prewarm' : 'http',
+      model: mode.value === 'websocket_prewarm' ? model.value.trim() : null,
       headers: headers.value.filter(header => header.enabled).map(header => ({
         name: header.name,
         valueBase64: encode(header.value, header.encoding),
@@ -215,20 +227,29 @@ onScopeDispose(() => {
 
 <template>
   <div class="grid min-w-0 gap-4">
-    <BasePageHeader title="自由探测" description="自定义 HTTP 请求，查看完整请求与响应" />
+    <BasePageHeader title="自由探测" description="默认用 Responses WebSocket 预热收取 State，也可改发自定义 HTTP" />
     <BaseCard padding="compact">
       <form class="grid gap-4" @submit.prevent="send">
-        <div class="grid gap-3 sm:grid-cols-[120px_1fr_auto] sm:items-end">
-          <FormItem label="方法">
+        <div class="grid gap-3 sm:grid-cols-[220px_1fr_auto] sm:items-end">
+          <FormItem label="探测方式">
+            <BaseSelect v-model="mode" :options="[{ label: 'WebSocket 预热', value: 'websocket_prewarm' }, { label: '自定义 HTTP', value: 'http' }]" aria-label="探测方式" :disabled="busy" />
+          </FormItem>
+          <FormItem v-if="mode === 'websocket_prewarm'" label="模型">
+            <BaseInput v-model="model" aria-label="预热模型" placeholder="gpt-5.4" required :disabled="busy" />
+          </FormItem>
+          <FormItem v-else label="方法">
             <BaseInput v-model="method" aria-label="请求方法" required :disabled="busy" />
           </FormItem>
-          <FormItem label="请求地址">
-            <BaseInput v-model="url" aria-label="请求地址" placeholder="https://example.com/path" required :disabled="busy" />
-          </FormItem>
           <BaseButton type="submit" :loading="busy">
-            发送请求
+            {{ mode === 'websocket_prewarm' ? '开始预热' : '发送请求' }}
           </BaseButton>
         </div>
+        <FormItem v-if="mode === 'http'" label="请求地址">
+          <BaseInput v-model="url" aria-label="请求地址" placeholder="https://example.com/path" required :disabled="busy" />
+        </FormItem>
+        <p v-else class="m-0 text-cp-sm text-cp-text-secondary">
+          在所选出口打开 Responses WebSocket 预热。若上游把模型降到更快模型并给出 312 长度的票，会丢掉这张票，再在同一条连接上用不续接的工具回合重取一次。只有请求模型自己的合格长度才会写入缓存。
+        </p>
         <div class="grid gap-3 md:grid-cols-3">
           <FormItem label="账号">
             <BaseSelect v-model="accountId" :options="accounts" aria-label="探测账号" :disabled="busy || loadingCatalog" />
@@ -236,12 +257,12 @@ onScopeDispose(() => {
           <FormItem label="出口代理">
             <BaseSelect v-model="proxyId" :options="proxies" aria-label="出口代理" :disabled="busy || loadingCatalog" />
           </FormItem>
-          <FormItem label="超时秒数 · 0 表示不限">
+          <FormItem :label="mode === 'websocket_prewarm' ? '超时秒数 · 0 表示 120 秒' : '超时秒数 · 0 表示不限'">
             <BaseInput v-model="timeout" type="number" min="0" aria-label="超时秒数" :disabled="busy" />
           </FormItem>
         </div>
         <BaseInput v-if="proxyId === 'custom'" v-model="proxyUrl" aria-label="自定义代理地址" placeholder="http://user:password@host:port 或 socks5h://host:port" :disabled="busy" />
-        <div v-if="accountId" class="grid gap-2">
+        <div v-if="accountId && mode === 'http'" class="grid gap-2">
           <BaseCheckbox v-model="useAccountHeaders" label="使用账号认证报头，同名自定义报头优先" show-label :disabled="busy" />
           <span v-if="useAccountHeaders" class="text-cp-xs text-cp-text-secondary">所选账号凭据将发送至上方请求地址，并在本次结果中明文显示</span>
         </div>
@@ -250,7 +271,7 @@ onScopeDispose(() => {
             重试加载
           </BaseButton>
         </div>
-        <div class="flex items-center justify-between gap-2">
+        <div v-if="mode === 'http'" class="flex items-center justify-between gap-2">
           <h2 class="m-0 text-cp-sm font-heavy">
             请求头
           </h2>
@@ -258,16 +279,18 @@ onScopeDispose(() => {
             <Plus class="size-4" />添加报头
           </BaseButton>
         </div>
-        <div v-for="(header, index) in headers" :key="header.id" class="grid grid-cols-[24px_1fr_40px] items-center gap-2 md:grid-cols-[24px_minmax(140px,1fr)_minmax(180px,2fr)_140px_40px]">
-          <BaseCheckbox v-model="header.enabled" :label="`启用报头 ${index + 1}`" :disabled="busy" />
-          <BaseInput v-model="header.name" :aria-label="`报头 ${index + 1} 名称`" placeholder="Header-Name" :disabled="busy" />
-          <BaseInput v-model="header.value" class="col-start-2 md:col-auto" :aria-label="`报头 ${index + 1} 值`" placeholder="值，可留空或添加同名报头" :disabled="busy" />
-          <BaseSelect v-model="header.encoding" class="col-start-2 md:col-auto" :options="encodings" :aria-label="`报头 ${index + 1} 编码`" :disabled="busy" />
-          <BaseIconButton class="col-start-3 row-start-1 md:col-auto md:row-auto" :label="`删除报头 ${index + 1}`" :disabled="busy" @click="headers.splice(index, 1)">
-            <Trash2 class="size-4" />
-          </BaseIconButton>
-        </div>
-        <FormItem label="请求体">
+        <template v-if="mode === 'http'">
+          <div v-for="(header, index) in headers" :key="header.id" class="grid grid-cols-[24px_1fr_40px] items-center gap-2 md:grid-cols-[24px_minmax(140px,1fr)_minmax(180px,2fr)_140px_40px]">
+            <BaseCheckbox v-model="header.enabled" :label="`启用报头 ${index + 1}`" :disabled="busy" />
+            <BaseInput v-model="header.name" :aria-label="`报头 ${index + 1} 名称`" placeholder="Header-Name" :disabled="busy" />
+            <BaseInput v-model="header.value" class="col-start-2 md:col-auto" :aria-label="`报头 ${index + 1} 值`" placeholder="值，可留空或添加同名报头" :disabled="busy" />
+            <BaseSelect v-model="header.encoding" class="col-start-2 md:col-auto" :options="encodings" :aria-label="`报头 ${index + 1} 编码`" :disabled="busy" />
+            <BaseIconButton class="col-start-3 row-start-1 md:col-auto md:row-auto" :label="`删除报头 ${index + 1}`" :disabled="busy" @click="headers.splice(index, 1)">
+              <Trash2 class="size-4" />
+            </BaseIconButton>
+          </div>
+        </template>
+        <FormItem :label="mode === 'websocket_prewarm' ? '预热正文 JSON，留空使用默认' : '请求体'">
           <template #extra>
             <BaseSelect id="probe-body-encoding" v-model="bodyEncoding" :options="encodings" aria-label="请求体编码" :disabled="busy" />
           </template>
@@ -295,6 +318,8 @@ onScopeDispose(() => {
         </p>
         <div class="flex flex-wrap items-center gap-3 text-cp-sm" aria-live="polite">
           <strong>{{ result.statusCode ?? '无响应' }}</strong><span>{{ result.httpVersion ?? '' }}</span><span>{{ result.elapsedMs }} ms</span>
+          <span v-if="result.turnStateStored">已写入 State，长度 {{ result.turnStateLength }}</span>
+          <span v-else-if="result.turnStateLength">观察到 State，长度 {{ result.turnStateLength }}，未写入缓存</span>
           <span v-if="result.error" class="text-cp-error">{{ result.error }}</span>
         </div>
         <div class="flex flex-wrap gap-2">

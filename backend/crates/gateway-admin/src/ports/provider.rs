@@ -178,6 +178,19 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    /// 在所选出口上打开 Responses WebSocket，发送官方 `generate=false` 预热并收下 State。
+    async fn websocket_prewarm_probe(
+        &self,
+        _account_id: &ProviderAccountId,
+        _model: &UpstreamModelId,
+        _proxy: Option<&gateway_core::account::OutboundProxy>,
+        _timeout_seconds: u64,
+        _body: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Result<crate::model::proxies::WebSocketPrewarmResult, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported)
+            .with_public_message("当前账号不支持 WebSocket 预热探测"))
+    }
+
     /// 仅供经过管理员审计的自由探测注入凭据，不可写入普通日志。
     async fn http_probe_headers(
         &self,

@@ -259,6 +259,31 @@ pub(crate) struct DefaultAccountsService {
         Arc<futures::lock::Mutex<BTreeMap<ProviderAccountId, Arc<futures::lock::Mutex<()>>>>>,
 }
 
+struct MemoryProbeBody {
+    bytes: Vec<u8>,
+    finished_at: std::time::Instant,
+}
+
+#[async_trait]
+impl crate::ports::proxy::HttpProbeBody for MemoryProbeBody {
+    fn byte_length(&self) -> u64 {
+        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+    }
+
+    fn finished_at(&self) -> Option<std::time::Instant> {
+        Some(self.finished_at)
+    }
+
+    async fn read(&self, offset: u64, length: usize) -> Result<Vec<u8>, AdminError> {
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        if start >= self.bytes.len() {
+            return Ok(Vec::new());
+        }
+        let end = start.saturating_add(length).min(self.bytes.len());
+        Ok(self.bytes[start..end].to_vec())
+    }
+}
+
 struct HttpProbeRecord {
     owner: MutationActor,
     body: Arc<dyn crate::ports::proxy::HttpProbeBody>,
@@ -272,6 +297,98 @@ fn prune_probe_records(records: &mut BTreeMap<String, HttpProbeRecord>) {
             .finished_at()
             .is_none_or(|at| now.duration_since(at) < std::time::Duration::from_secs(30 * 60))
     });
+}
+
+async fn websocket_prewarm_probe(
+    service: &DefaultAccountsService,
+    context: &MutationContext,
+    command: crate::model::proxies::FreeProbeCommand,
+) -> Result<crate::model::proxies::FreeProbeSession, AdminError> {
+    use crate::model::proxies::AccountProxySelection;
+    let account_id = command
+        .account_id
+        .ok_or_else(|| AdminError::invalid("WebSocket 预热必须选择 OpenAI OAuth 账号"))?;
+    let model = gateway_core::routing::UpstreamModelId::new(command.model.unwrap_or_default())
+        .map_err(|_| AdminError::invalid("预热模型不合法"))?;
+    let body = if command.request.body.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(
+                &command.request.body,
+            )
+            .map_err(|_| AdminError::invalid("预热正文必须是 JSON 对象"))?,
+        )
+    };
+    let proxy = match command.proxy {
+        AccountProxySelection::Direct => None,
+        AccountProxySelection::Url(proxy) => Some(proxy),
+        AccountProxySelection::Saved(id) => Some(
+            service
+                .proxies
+                .get(&id)
+                .await
+                .map_err(|error| map_store_error(error, "WebSocket prewarm proxy"))?
+                .proxy,
+        ),
+    };
+    let (_, provider) = service.provider_for_account(&account_id).await?;
+    let result = provider
+        .websocket_prewarm_probe(
+            &account_id,
+            &model,
+            proxy.as_ref(),
+            command.request.timeout_seconds,
+            body,
+        )
+        .await
+        .map_err(|error| {
+            if let Some(message) = error.public_message() {
+                return AdminError::invalid(message);
+            }
+            map_provider_error(error, "WebSocket prewarm")
+        })?;
+    let id = Uuid::now_v7().to_string();
+    let stored = std::sync::Arc::new(MemoryProbeBody {
+        bytes: result.body.clone(),
+        finished_at: std::time::Instant::now(),
+    });
+    let preview = result
+        .body
+        .iter()
+        .take(64 * 1024)
+        .copied()
+        .collect::<Vec<_>>();
+    let received = u64::try_from(result.body.len()).unwrap_or(u64::MAX);
+    let elapsed_ms = result.exchange.elapsed_ms;
+    let error = result.exchange.error.clone();
+    let events = futures::stream::iter([
+        crate::model::proxies::HttpProbeEvent::Headers(Box::new(result.exchange)),
+        crate::model::proxies::HttpProbeEvent::Progress {
+            received_bytes: received,
+            preview,
+        },
+        crate::model::proxies::HttpProbeEvent::Complete { elapsed_ms, error },
+    ])
+    .boxed();
+    let mut records = service
+        .http_probe_records
+        .lock()
+        .expect("probe records mutex");
+    prune_probe_records(&mut records);
+    if records.len() >= 32 {
+        return Err(AdminError::unavailable(
+            "同时运行的探测过多，请先停止部分请求",
+        ));
+    }
+    records.insert(
+        id.clone(),
+        HttpProbeRecord {
+            owner: context.actor.clone(),
+            body: stored,
+        },
+    );
+    Ok(crate::model::proxies::FreeProbeSession { id, events })
 }
 
 /// 账号诊断依赖 HTTP 执行、可选采集存储与管理员审计，集中注入。
@@ -644,12 +761,18 @@ impl AccountsService for DefaultAccountsService {
         // 审计只保存动作，不包含 URL 查询参数、报头或正文中的敏感值。
         self.append_probe_audit(
             context,
-            "http_probe.send",
+            match command.mode {
+                crate::model::proxies::FreeProbeMode::WebsocketPrewarm => "ws_prewarm.send",
+                crate::model::proxies::FreeProbeMode::Http => "http_probe.send",
+            },
             "http_probe",
             "manual",
             Vec::new(),
         )
         .await?;
+        if command.mode == crate::model::proxies::FreeProbeMode::WebsocketPrewarm {
+            return websocket_prewarm_probe(self, context, command).await;
+        }
         if let Some(account_id) = &command.account_id {
             let (_, provider) = self.provider_for_account(account_id).await?;
             if command.use_account_headers {

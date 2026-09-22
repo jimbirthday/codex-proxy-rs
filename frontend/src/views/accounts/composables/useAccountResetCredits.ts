@@ -1,5 +1,5 @@
 import type { AccountResetCredit } from '@/api'
-import { computed, shallowReactive, shallowRef, watch } from 'vue'
+import { computed, readonly, shallowReactive, shallowRef, watch } from 'vue'
 import {
   consumeAccountResetCredit,
   getAccountResetCredits,

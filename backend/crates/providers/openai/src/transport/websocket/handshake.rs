@@ -156,6 +156,12 @@ pub(super) fn websocket_connection_metadata(
     }
 }
 
+pub(crate) async fn connect_responses_websocket(
+    connection: &CodexWebSocketConnection,
+) -> Result<(RawWsStream, WsResponse<Option<Vec<u8>>>), CodexWebSocketExchangeError> {
+    connect_websocket(connection).await
+}
+
 async fn connect_websocket(
     connection: &CodexWebSocketConnection,
 ) -> Result<(RawWsStream, WsResponse<Option<Vec<u8>>>), CodexWebSocketExchangeError> {

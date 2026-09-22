@@ -3482,6 +3482,8 @@ impl gateway_admin::ports::proxy::ProxyProbe for EchoHttpProbe {
             automatic_request_headers: Vec::new(),
             elapsed_ms: 1,
             error: None,
+            turn_state_length: None,
+            turn_state_stored: false,
         };
         use futures::StreamExt as _;
         Ok(gateway_admin::model::proxies::HttpProbeSession {
@@ -3533,6 +3535,8 @@ async fn free_probe_keeps_custom_duplicate_credentials_and_uses_independent_prox
                     body: vec![255, 0],
                     timeout_seconds: 3,
                 },
+                mode: gateway_admin::model::proxies::FreeProbeMode::Http,
+                model: None,
             },
         )
         .await

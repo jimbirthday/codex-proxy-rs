@@ -17,6 +17,8 @@ export interface FreeProbeRequest {
   headers: ProbeHeader[]
   bodyBase64: string
   timeoutSeconds: number
+  mode?: 'http' | 'websocket_prewarm'
+  model?: string | null
 }
 
 export interface FreeProbeExchange {
@@ -31,6 +33,8 @@ export interface FreeProbeExchange {
   responseBodyBase64: string
   elapsedMs: number
   error: string | null
+  turnStateLength: number | null
+  turnStateStored: boolean
 }
 
 export type FreeProbeEvent

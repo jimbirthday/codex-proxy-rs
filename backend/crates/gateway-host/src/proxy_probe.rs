@@ -446,6 +446,8 @@ impl ProxyProbe for HttpProxyProbe {
                 automatic_request_headers,
                 elapsed_ms: 0,
                 error: None,
+                turn_state_length: None,
+                turn_state_stored: false,
             }),
             response: None,
             body: Arc::clone(&body),

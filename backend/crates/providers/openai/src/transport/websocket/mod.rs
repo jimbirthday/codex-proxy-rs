@@ -43,3 +43,4 @@ pub(crate) use self::{
     },
     pool::DEFAULT_STREAM_IDLE_TIMEOUT,
 };
+pub(crate) use handshake::connect_responses_websocket;

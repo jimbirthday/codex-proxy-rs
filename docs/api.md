@@ -440,7 +440,7 @@ config 返回 `{ name, plaintextKey }`，仅读取服务端会话绑定的当前
 | `GET` | `/api/admin/accounts/models` | `accountId` | 优先读取该 Provider + 套餐的模型 cache，缺失时有限实时拉取 |
 | `POST` | `/api/admin/accounts/models/refresh` | `{ accountId }` | 强制拉取最新模型并覆盖 cache |
 | `GET` | `/api/admin/accounts/connection-test` | `accountId`、`modelId` | 通过 SSE 返回实时连接测试事件，不作为业务 Responses 用量记录 |
-| `POST` | `/api/admin/accounts/free-probe` | 自定义 HTTP 请求 | 任意 HTTP(S) 地址、方法、报头与正文，独立选择账号及出口，返回完整交换字节 |
+| `POST` | `/api/admin/accounts/free-probe` | 自定义 HTTP 或 WebSocket 预热 | 默认页面使用 Responses WebSocket `generate=false` 预热并收取 State；`mode=http` 仍发送任意 HTTP(S) 请求 |
 | `GET` | `/api/admin/accounts/turn-state` | `accountId`、`modelId` | 返回账号与上游模型对应 turn state 的来源、采集/首次应用/下次轮换/过期时间、最近 20 次探测和失效原因，不返回 state 原文 |
 | `GET` | `/api/admin/accounts/turn-state/overview` | 无 | 返回本进程已见账号/模型键的脱敏 State 就绪与应用状态、来源、下次轮换时间及最近探测摘要；只读且不访问上游 |
 | `POST` | `/api/admin/accounts/turn-state/probe` | `{ accountId, modelId }` | 使用指定上游模型，按数据库中已保存策略每轮最多处理 1～3 个候选，取得有效 state 后停止；返回触发类型与实际请求结果，未配置代理时拒绝请求 |
@@ -590,9 +590,9 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 - `error`、`providerErrorCode`、`providerErrorType`、`upstreamStatus`、`upstreamContentType` 和
   `upstreamBody` 是实际捕获的原始诊断字段；缺失时为 `null`，不会由本地猜测或翻译。
 
-### 自由 HTTP 探测
+### 自由探测
 
-`POST /api/admin/accounts/free-probe` 仅允许管理员调用，每次显式发送一个 HTTP 请求，不使用 State 探测的模型、域名、冷却或请求预算限制。
+`POST /api/admin/accounts/free-probe` 仅允许管理员调用。`mode` 省略或为 `http` 时，每次显式发送一个 HTTP 请求，不使用 State 探测的模型、域名、冷却或请求预算限制。`mode` 为 `websocket_prewarm` 时，在所选出口打开当前 Provider 基址上的 Responses WebSocket，发送 `generate=false` 且 `store=false` 的 `response.create`。若这次没有合格 State，同一条连接再用完成事件里的 `previous_response_id` 续写一帧，并把已观察到的 State 放进 `client_metadata`。State 来自握手响应头、`response.metadata` 或正文里的 `current_turn_state`。握手另带 Responses Lite 头。
 请求字段：
 
 | 字段 | 含义 |
@@ -603,12 +603,14 @@ OAuth 等待回调期间不持有保护；提交仍拒绝已删除或连接配�
 | `accountId` | 可选账号，支持 OpenAI OAuth、API Key 和 xAI，不参与普通调度选号 |
 | `useAccountHeaders` | 为 `true` 时补入所选账号的认证报头，同名自定义报头优先；账号凭据会发送到指定 URL |
 | `proxyId`、`proxyUrl` | 可选已保存代理或临时代理地址，两者互斥，都不提供表示直连，不继承账号绑定代理 |
-| `timeoutSeconds` | 请求及响应读取的超时秒数，`0` 表示不设置超时 |
+| `timeoutSeconds` | 请求及响应读取的超时秒数。HTTP 模式下 `0` 表示不设置超时；WebSocket 预热把 `0` 当作 120 秒 |
+| `mode` | `http` 或 `websocket_prewarm`；省略时为 `http`。管理端页面默认选择 WebSocket 预热 |
+| `model` | WebSocket 预热使用的上游模型；该模式必须提供 |
 
 返回 `method`、`url`、`requestHeaders`、`requestBodyBase64`、`statusCode`、`httpVersion`、`responseHeaders`、`responseBodyBase64`、`elapsedMs`、`error`。
 两侧报头均为 `{ name, valueBase64 }` 数组，包含认证等敏感值，不遮盖、不写入交换历史；响应使用 `Cache-Control: no-store`。
 审计仅记录 `http_probe.send` 动作，不记录请求地址、报头或正文。发送或读取失败通过 `error` 说明，已经收到的状态码、报头和部分正文仍然返回。
-上游非 2xx 同样返回交换详情，重定向不自动跟随，压缩正文不自动解压，不按 State 的 292 字节规则过滤，也不更新 State 缓存、账号健康或代理测试状态。
+上游非 2xx 同样返回交换详情，重定向不自动跟随，压缩正文不自动解压。HTTP 模式不按 State 长度规则过滤，也不更新 State 缓存、账号健康或代理测试状态。WebSocket 预热把合格长度的 State 写入该账号和模型的进程内缓存，响应增加 `turnStateLength` 与 `turnStateStored`；不合格长度只出现在交换结果里。该模式必须选择 OpenAI OAuth 账号，正文留空时使用默认预热信封，自定义正文必须是 JSON 对象，模型、`generate=false` 和 `store=false` 由服务端写入。
 页面支持文本、Base64、十六进制及原始正文下载，结果只在当前页面内存中保留。停止等待无法撤回已发送的请求。
 HTTP 客户端负责合法协议编码，报头观测不包含 HTTP/2 伪头、TLS、代理 CONNECT、原始大小写或线上顺序；该接口不额外截断正文，部署层的请求大小与超时配置仍然适用。
 
