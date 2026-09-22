@@ -1295,7 +1295,9 @@ async fn accepted_update_should_survive_a_lost_http_response() {
             .send()
             .await
     });
-    tokio::time::timeout(Duration::from_secs(1), accepted.notified())
+    // 超时只用于防止 handler 死锁；是否在下载完成前返回由后续 Running 状态断言证明。
+    // 全 workspace 并发测试时，固定的一秒墙钟预算会把执行器调度抖动误判为失败。
+    tokio::time::timeout(Duration::from_secs(5), accepted.notified())
         .await
         .expect("accepted before slow download finishes");
     client.abort();

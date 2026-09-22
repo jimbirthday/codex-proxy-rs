@@ -21,6 +21,7 @@ pub mod subscription;
 mod time;
 pub(crate) use downstream::normalize_non_codex_request_body;
 pub(crate) use endpoints::valid_upstream_base_url;
+pub(crate) use response_meta::response_header_carry_headers;
 pub mod tls;
 pub mod usage;
 pub mod websocket;

@@ -73,6 +73,7 @@ pub(in crate::transport::websocket) fn stream_websocket_response(
     let response_metadata_updates = Arc::new(Mutex::new(CodexWebSocketResponseMetadataUpdate {
         turn_state: metadata.turn_state.clone(),
         reported_model: None,
+        response_headers: Vec::new(),
     }));
     let response_metadata_updates_for_task = Arc::clone(&response_metadata_updates);
     let (tx, rx) = mpsc::channel(WEBSOCKET_STREAM_BUFFER);
@@ -306,6 +307,13 @@ async fn forward_websocket_response_stream(state: WebSocketStreamForwardState) {
             if pending.turn_state.is_none() {
                 pending.turn_state = Some(turn_state);
             }
+        }
+        if !reduced.response_headers.is_empty() {
+            response_metadata_updates
+                .lock()
+                .await
+                .response_headers
+                .extend(reduced.response_headers);
         }
         if let Some(model) = metadata.response_metadata.effective_model.as_ref() {
             response_metadata_updates.lock().await.reported_model = Some(model.clone());

@@ -72,6 +72,104 @@ async fn unavailable_proxy_never_falls_back_to_direct_connection() {
     drop(unused);
     let result = HttpProxyProbe::new(target.uri()).test(&proxy).await;
     assert!(!result.success);
+    assert_eq!(result.message, "代理 TCP 连接被拒绝，请核对地址和端口");
+}
+
+#[tokio::test]
+async fn socks_probe_preserves_authentication_and_reports_safe_failure_stages() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    // 使用真实 SOCKS 握手触发依赖的错误链，避免只测试提示字符串映射。
+    for (auth_status, connect_status, tls, expected) in [
+        (1, 0, false, "SOCKS5 认证被代理拒绝"),
+        (0, 2, false, "SOCKS5 代理拒绝连接检测目标"),
+        (0, 4, false, "SOCKS5 代理报告目标不可达"),
+        (0, 0, true, "连接被提前关闭"),
+        (0, 0, false, "连接成功"),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 5);
+            let count = socket.read_u8().await.unwrap();
+            let mut methods = vec![0; usize::from(count)];
+            socket.read_exact(&mut methods).await.unwrap();
+            assert!(methods.contains(&2));
+            socket.write_all(&[5, 2]).await.unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), 1);
+            let length = socket.read_u8().await.unwrap();
+            let mut username = vec![0; usize::from(length)];
+            socket.read_exact(&mut username).await.unwrap();
+            let length = socket.read_u8().await.unwrap();
+            let mut password = vec![0; usize::from(length)];
+            socket.read_exact(&mut password).await.unwrap();
+            assert_eq!(username, b"synthetic-zone-resi-session-test");
+            assert_eq!(password, b"synthetic-password");
+            socket.write_all(&[1, auth_status]).await.unwrap();
+            if auth_status != 0 {
+                return;
+            }
+            let mut request = [0; 4];
+            socket.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [5, 1, 0, 3]);
+            let length = socket.read_u8().await.unwrap();
+            let mut domain = vec![0; usize::from(length)];
+            socket.read_exact(&mut domain).await.unwrap();
+            assert_eq!(domain, b"unresolvable.invalid");
+            assert_eq!(socket.read_u16().await.unwrap(), if tls { 443 } else { 80 });
+            socket
+                .write_all(&[5, connect_status, 0, 1, 127, 0, 0, 1, 0, 80])
+                .await
+                .unwrap();
+            if connect_status != 0 {
+                return;
+            }
+            if tls {
+                let mut hello = [0; 1024];
+                let _ = socket.read(&mut hello).await.unwrap();
+                return;
+            }
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                header.push(socket.read_u8().await.unwrap());
+                assert!(header.len() < 8192);
+            }
+            let body = r#"{"ip":"203.0.113.8"}"#;
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let proxy = OutboundProxy::parse(&format!(
+            "socks5h://synthetic-zone-resi-session-test:synthetic-password@{address}"
+        ))
+        .unwrap();
+        let endpoint = if tls {
+            "https://unresolvable.invalid/ip"
+        } else {
+            "http://unresolvable.invalid/ip"
+        };
+        let result = HttpProxyProbe::new(endpoint).test(&proxy).await;
+        server.await.unwrap();
+        assert_eq!(
+            result.success,
+            auth_status == 0 && connect_status == 0 && !tls
+        );
+        assert!(result.message.starts_with(expected), "{}", result.message);
+        for secret in [
+            "synthetic-zone",
+            "synthetic-password",
+            "unresolvable.invalid",
+        ] {
+            assert!(!result.message.contains(secret));
+        }
+    }
 }
 
 #[tokio::test]

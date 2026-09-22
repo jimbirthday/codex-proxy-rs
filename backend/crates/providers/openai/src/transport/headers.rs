@@ -141,6 +141,7 @@ impl CodexBackendClient {
             X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER,
             request.responses_lite.as_deref(),
         );
+        headers.extend(request.admin_headers.clone());
         Ok(headers)
     }
 
@@ -154,6 +155,7 @@ impl CodexBackendClient {
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses_websockets=2026-02-06"),
         );
+        headers.extend(request.admin_headers.clone());
         Ok(headers)
     }
 

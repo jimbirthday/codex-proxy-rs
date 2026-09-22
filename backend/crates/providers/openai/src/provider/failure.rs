@@ -47,6 +47,7 @@ pub(super) struct MappedProviderFailure {
     pub(super) upstream_capacity_failure: bool,
     pub(super) set_cookie_headers: Vec<String>,
     pub(super) rate_limit_headers: Vec<(String, String)>,
+    pub(super) response_header_carry_headers: Vec<(String, Bytes)>,
     pub(super) observation: Option<ProviderResponseObservation>,
     pub(super) capture_response_cookies: bool,
 }
@@ -62,6 +63,7 @@ impl MappedProviderFailure {
             upstream_capacity_failure: false,
             set_cookie_headers: Vec::new(),
             rate_limit_headers: Vec::new(),
+            response_header_carry_headers: Vec::new(),
             observation: None,
             capture_response_cookies: false,
         }
@@ -1262,8 +1264,10 @@ pub(super) fn map_upstream_failure(
             failure.client_error_type.clone(),
         ));
     }
+    let mut response_header_carry_headers = Vec::new();
     if let Some(response) = failure.client_response.take() {
         let response = (*response).into_parts();
+        response_header_carry_headers = response.response_header_carry_headers;
         error = error.with_client_visible_upstream_response(
             ClientVisibleUpstreamResponse::new(
                 response.status,
@@ -1343,6 +1347,7 @@ pub(super) fn map_upstream_failure(
         upstream_capacity_failure: capacity_unavailable,
         set_cookie_headers: failure.set_cookie_headers,
         rate_limit_headers: failure.rate_limit_headers,
+        response_header_carry_headers,
         observation,
         capture_response_cookies: !matches!(
             category,

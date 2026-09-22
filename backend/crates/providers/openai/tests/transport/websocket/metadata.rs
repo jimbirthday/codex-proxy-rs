@@ -77,7 +77,18 @@ async fn reused_websocket_should_keep_response_metadata_scoped_to_each_exchange(
         .await
         .expect("response within timeout")
         .expect("response should complete on the same socket");
-        assert_eq!(response.response_metadata, expected, "exchange {round}");
+        let mut comparable_metadata = response.response_metadata.clone();
+        comparable_metadata.response_header_carry_headers.clear();
+        assert_eq!(comparable_metadata, expected, "exchange {round}");
+        let carried = &response.response_metadata.response_header_carry_headers;
+        assert_eq!(
+            carried
+                .iter()
+                .filter(|(name, _)| name == "x-opening-multi")
+                .map(|(_, value)| value.as_ref())
+                .collect::<Vec<_>>(),
+            vec![b"first".as_slice(), b"second".as_slice()]
+        );
         assert_eq!(response.reported_model, Some(format!("model-{round}")));
         assert!(response.body.contains(&format!("etag-{round}")));
         assert_eq!(response.turn_state, Some(format!("turn-{round}")));

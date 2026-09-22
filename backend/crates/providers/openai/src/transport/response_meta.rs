@@ -19,6 +19,9 @@ pub struct CodexResponseMetadata {
     pub reasoning_included: bool,
     /// 允许交给 Core 的普通响应头；名称和值保持 transport 观察到的顺序与字节。
     pub client_headers: Vec<(String, Bytes)>,
+    /// 仅供同账号响应头续带规则匹配的完整视图，不会交给 Core 或管理端。
+    #[doc(hidden)]
+    pub response_header_carry_headers: Vec<(String, Bytes)>,
 }
 
 impl fmt::Debug for CodexResponseMetadata {
@@ -29,6 +32,10 @@ impl fmt::Debug for CodexResponseMetadata {
             .field("models_etag", &self.models_etag)
             .field("reasoning_included", &self.reasoning_included)
             .field("client_header_count", &self.client_headers.len())
+            .field(
+                "response_header_carry_count",
+                &self.response_header_carry_headers.len(),
+            )
             .finish()
     }
 }
@@ -71,14 +78,32 @@ pub(super) fn rate_limit_headers(headers: &HeaderMap) -> Vec<(String, String)> {
 }
 
 pub(super) fn response_metadata(headers: &HeaderMap) -> CodexResponseMetadata {
-    response_metadata_from_client_headers(client_headers(headers))
+    response_metadata_from_headers(
+        client_headers(headers),
+        response_header_carry_headers(headers),
+    )
+}
+
+/// 提取可供同账号规则匹配的响应头。
+///
+/// 与下游透传不同，管理员可按规则匹配任意响应头；原始值仍只进入账号隔离的进程内运行态。
+pub(crate) fn response_header_carry_headers(headers: &HeaderMap) -> Vec<(String, Bytes)> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                Bytes::copy_from_slice(value.as_bytes()),
+            )
+        })
+        .collect()
 }
 
 /// 提取响应中可交给客户端 adapter 的普通头。
 ///
 /// 账号身份、凭据、cookie、逐跳头和已经由 adapter 重建的 framing 在进入 Core 前剔除；
 /// 其余名称和值保持 HeaderMap 的多值顺序和原始字节。
-pub(super) fn client_headers(headers: &HeaderMap) -> Vec<(String, Bytes)> {
+pub(crate) fn client_headers(headers: &HeaderMap) -> Vec<(String, Bytes)> {
     filter_client_headers(headers.iter().map(|(name, value)| {
         (
             name.as_str().to_owned(),
@@ -91,24 +116,29 @@ pub(super) fn merge_response_metadata(
     metadata: &mut CodexResponseMetadata,
     headers: impl IntoIterator<Item = (String, String)>,
 ) {
-    for (name, value) in filter_client_headers(
-        headers
-            .into_iter()
-            .map(|(name, value)| (name, Bytes::from(value))),
-    ) {
+    let headers = headers
+        .into_iter()
+        .map(|(name, value)| (name, Bytes::from(value)))
+        .collect::<Vec<_>>();
+    metadata
+        .response_header_carry_headers
+        .extend(headers.iter().cloned());
+    for (name, value) in filter_client_headers(headers) {
         observe_typed_response_header(metadata, &name, &value);
         metadata.client_headers.push((name, value));
     }
 }
 
-fn response_metadata_from_client_headers(
+fn response_metadata_from_headers(
     client_headers: Vec<(String, Bytes)>,
+    response_header_carry_headers: Vec<(String, Bytes)>,
 ) -> CodexResponseMetadata {
     let mut metadata = CodexResponseMetadata::default();
     for (name, value) in &client_headers {
         observe_typed_response_header(&mut metadata, name, value);
     }
     metadata.client_headers = client_headers;
+    metadata.response_header_carry_headers = response_header_carry_headers;
     metadata
 }
 

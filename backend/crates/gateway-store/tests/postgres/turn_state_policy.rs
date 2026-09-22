@@ -3,7 +3,11 @@ use gateway_admin::{
     model::{
         MutationActor, MutationContext,
         proxies::NewProxy,
-        turn_state::{TurnStateProbePolicy, TurnStateProxyMode},
+        turn_state::{
+            ResponseHeaderCarryRule, ResponseHeaderCarryScope, ResponseHeaderCarrySource,
+            ResponseHeaderMergeMode, ResponseHeaderMissingBehavior, ResponseHeaderTransform,
+            ResponseHeaderValueSelection, TurnStateProbePolicy, TurnStateProxyMode,
+        },
     },
     ports::{proxy::ProxyStore, store::AdminStoreErrorKind},
 };
@@ -43,6 +47,36 @@ async fn turn_state_policy_persists_switches_and_serializes_proxy_references() {
         mode: TurnStateProxyMode::Fixed,
         proxy_ids: vec![proxy.id.clone()],
         candidate_limit: 1,
+        response_header_carry: gateway_admin::model::turn_state::ResponseHeaderCarryPolicy {
+            rules: vec![ResponseHeaderCarryRule {
+                id: "cookie_bundle".to_owned(),
+                name: "Cookie bundle".to_owned(),
+                enabled: true,
+                capture_enabled: true,
+                injection_enabled: true,
+                clear_on_disable: false,
+                sources: vec![
+                    ResponseHeaderCarrySource::BusinessResponse,
+                    ResponseHeaderCarrySource::TurnStateProbe,
+                ],
+                source_header: "set-cookie".to_owned(),
+                target_header: "cookie".to_owned(),
+                transform: ResponseHeaderTransform::SetCookieToCookie,
+                value_selection: ResponseHeaderValueSelection::All,
+                merge_mode: ResponseHeaderMergeMode::Replace,
+                scope: ResponseHeaderCarryScope::AccountModel,
+                account_ids: Vec::new(),
+                models: Vec::new(),
+                ttl_seconds: 3_600,
+                missing_behavior: ResponseHeaderMissingBehavior::Keep,
+                capture_status_min: 200,
+                capture_status_max: 299,
+                invalidation_statuses: vec![401, 403],
+                max_value_bytes: 8_192,
+                max_values: 16,
+            }],
+        },
+        ..Default::default()
     };
     repository
         .update_turn_state_probe_policy(
@@ -179,5 +213,47 @@ async fn turn_state_policy_concurrent_save_and_delete_cannot_leave_dangling_refe
         assert_eq!(loaded, TurnStateProbePolicy::default());
         assert!(proxies.get(&proxy.id).await.is_err());
     }
+    database.close().await;
+}
+
+#[tokio::test]
+async fn verified_policy_migration_upgrades_once_and_preserves_later_edits() {
+    let Some(database) = TestDatabase::create("verified_policy_upgrade").await else {
+        return;
+    };
+    sqlx::query("update runtime_settings set turn_state_probe_policy_json = $1")
+        .bind(serde_json::json!({"schemaVersion":2,"manualEnabled":false,"automaticEnabled":false,"mode":"smart","proxyIds":[],"candidateLimit":2,"schedule":{"scanIntervalSeconds":30,"budgetLimit":3},"request":{"inputText":"old"}}))
+        .execute(&database.pool).await.unwrap();
+    let migration = include_str!("../../../../migrations/0019_verified_turn_state.sql");
+    sqlx::raw_sql(migration)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    let repository = PgControlPlaneRepository::new(database.pool.clone());
+    let upgraded = repository.load_turn_state_probe_policy().await.unwrap();
+    assert_eq!(
+        upgraded.verification.mode,
+        gateway_admin::model::turn_state::TurnStateVerificationMode::MintAndValidate
+    );
+    assert_eq!(upgraded.verification.reuse_count, 3);
+    assert_eq!(upgraded.schedule.budget_limit, 12);
+    assert_eq!(upgraded.schedule.scan_interval_seconds, 30);
+    assert!(!upgraded.manual_enabled && !upgraded.automatic_enabled);
+    assert_eq!(upgraded.candidate_limit, 2);
+    let mut edited = upgraded.clone();
+    edited.verification.reuse_count = 2;
+    sqlx::query("update runtime_settings set turn_state_probe_policy_json = $1")
+        .bind(serde_json::to_value(&edited).unwrap())
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(migration)
+        .execute(&database.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        repository.load_turn_state_probe_policy().await.unwrap(),
+        edited
+    );
     database.close().await;
 }

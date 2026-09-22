@@ -2,7 +2,7 @@
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::{Duration, SystemTime},
 };
 
@@ -21,19 +21,11 @@ use tokio::{
     time::Instant,
 };
 
-const DEFAULT_TTL: Duration = Duration::from_secs(60 * 60);
-const RENEW_BEFORE: Duration = Duration::from_secs(5 * 60);
-const PROBE_INTERVAL: Duration = Duration::from_secs(10);
-const PROBE_BUDGET_WINDOW: Duration = Duration::from_secs(60);
-const PROBE_BUDGET_LIMIT: usize = 3;
-const BUSINESS_ACTIVITY_WINDOW: Duration = Duration::from_secs(60 * 60);
-const TURN_STATE_BYTES: usize = 292;
 const MAX_ENTRIES: usize = 10_000;
 const MAX_ACCOUNT_RECORDS: usize = 10_000;
 const MAX_ACCOUNT_PROXY_RECORDS: usize = 10_000;
 const MAX_MODEL_PROXY_RECORDS: usize = 10_000;
 const MAX_PROBE_HISTORY: usize = 20;
-const PROBE_REQUEST_CONCURRENCY: usize = 2;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct TurnStateKey {
@@ -75,11 +67,28 @@ pub(crate) struct TurnStateVersion(u64);
 pub(crate) struct TurnStateStore {
     entries: Arc<Mutex<HashMap<TurnStateKey, Entry>>>,
     schedule: Arc<Mutex<Schedule>>,
-    request_slots: Arc<Semaphore>,
+    policy: Arc<RwLock<TurnStateProbePolicy>>,
+    request_slots: Arc<RwLock<Arc<Semaphore>>>,
+}
+
+/// 验证后的请求上下文与 State 在同一条目内发布，读取时不会混合不同代次。
+#[derive(Clone)]
+pub(crate) struct VerifiedProbeBundle {
+    pub(crate) id: String,
+    pub(crate) headers: reqwest::header::HeaderMap,
+    pub(crate) proxy: OutboundProxy,
+    pub(crate) expires_at: SystemTime,
+    pub(crate) policy: TurnStateProbePolicy,
+}
+
+pub(crate) struct AppliedTurnState {
+    pub(crate) state: String,
+    pub(crate) bundle: VerifiedProbeBundle,
 }
 
 struct Entry {
     state: Option<SecretString>,
+    verified: Option<VerifiedProbeBundle>,
     captured_at: Option<SystemTime>,
     first_applied_at: Option<SystemTime>,
     expires_at: Option<SystemTime>,
@@ -108,6 +117,7 @@ impl Entry {
     fn empty(now: SystemTime, schedule_now: Instant, version: TurnStateVersion) -> Self {
         Self {
             state: None,
+            verified: None,
             captured_at: None,
             first_applied_at: None,
             expires_at: None,
@@ -135,6 +145,7 @@ struct Schedule {
     next_version: u64,
     next_generation: u64,
     next_run_id: u64,
+    last_scan_at: Option<Instant>,
 }
 
 struct AccountSchedule {
@@ -157,6 +168,7 @@ struct RunningProbe {
     candidates: HashMap<String, Option<OutboundProxy>>,
     base_positions: HashMap<String, usize>,
     started: HashSet<String>,
+    request_counts: HashMap<String, u8>,
 }
 
 struct ProxySchedule {
@@ -176,9 +188,9 @@ impl ProxySchedule {
         }
     }
 
-    fn fail(&mut self, now: Instant) {
+    fn fail(&mut self, now: Instant, initial: Duration, maximum: Duration) {
         self.failure_count = self.failure_count.saturating_add(1);
-        self.cooldown_until = Some(now + proxy_failure_delay(self.failure_count));
+        self.cooldown_until = Some(now + exponential_delay(self.failure_count, initial, maximum));
         self.touched_at = now;
     }
 
@@ -194,6 +206,10 @@ pub(crate) struct TurnStateProbeCandidates {
     pub(crate) policy: TurnStateProbePolicy,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Ready 携带完整探测运行句柄，其余分支是无数据准入结果"
+)]
 pub(crate) enum TurnStateProbeAdmission {
     Ready(TurnStateProbeRun),
     Busy,
@@ -224,7 +240,10 @@ pub(crate) struct TurnStateProbeRun {
     trigger: TurnStateSource,
     candidates: Vec<TurnStateProbeTarget>,
     all_candidates: Vec<TurnStateProbeTarget>,
+    policy: TurnStateProbePolicy,
+    request_slots: Arc<Semaphore>,
     finished: bool,
+    pub(crate) verified: Option<VerifiedProbeBundle>,
 }
 
 impl TurnStateProbeRun {
@@ -284,6 +303,7 @@ impl TurnStateStore {
     }
 
     pub(crate) fn new() -> Self {
+        let policy = TurnStateProbePolicy::default();
         Self {
             entries: Arc::new(Mutex::new(HashMap::new())),
             schedule: Arc::new(Mutex::new(Schedule {
@@ -293,19 +313,94 @@ impl TurnStateStore {
                 next_version: 0,
                 next_generation: 0,
                 next_run_id: 0,
+                last_scan_at: None,
             })),
-            request_slots: Arc::new(Semaphore::new(PROBE_REQUEST_CONCURRENCY)),
+            request_slots: Arc::new(RwLock::new(Arc::new(Semaphore::new(usize::from(
+                policy.schedule.max_concurrency,
+            ))))),
+            policy: Arc::new(RwLock::new(policy)),
         }
+    }
+
+    pub(crate) fn set_policy(&self, policy: TurnStateProbePolicy) {
+        let (changed, concurrency_changed) = self.policy.read().map_or((true, true), |current| {
+            (
+                *current != policy,
+                current.schedule.max_concurrency != policy.schedule.max_concurrency,
+            )
+        });
+        if !changed {
+            return;
+        }
+        if let Ok(mut current) = self.policy.write() {
+            *current = policy.clone();
+        }
+        // 新规则不能继续把旧验证结果标为就绪，活跃键保留以便自动重新验证。
+        if let Ok(mut schedule) = self.schedule.lock()
+            && let Ok(mut entries) = self.entries.lock()
+        {
+            for entry in entries
+                .values_mut()
+                .filter(|entry| entry.verified.is_some())
+            {
+                let version = allocate_version(&mut schedule);
+                invalidate_entry(
+                    entry,
+                    "policy_changed",
+                    false,
+                    SystemTime::now(),
+                    Instant::now(),
+                    version,
+                );
+            }
+        }
+        if concurrency_changed && let Ok(mut slots) = self.request_slots.write() {
+            *slots = Arc::new(Semaphore::new(usize::from(policy.schedule.max_concurrency)));
+        }
+    }
+
+    pub(crate) fn policy(&self) -> TurnStateProbePolicy {
+        self.policy
+            .read()
+            .map_or_else(|_| TurnStateProbePolicy::default(), |policy| policy.clone())
+    }
+
+    pub(crate) fn business_capture_enabled(&self) -> bool {
+        let policy = self.policy();
+        policy.state.capture_business_responses
+            && policy.verification.mode
+                == gateway_admin::model::turn_state::TurnStateVerificationMode::AcquireOnly
+    }
+
+    pub(crate) fn probe_capture_enabled(&self) -> bool {
+        self.policy().state.capture_probe_responses
+    }
+
+    pub(crate) fn injection_enabled(&self) -> bool {
+        self.policy().state.injection_enabled
     }
 
     pub(crate) fn state(
         &self,
         account_id: &ProviderAccountId,
+        credential_revision: CredentialRevision,
         model: &UpstreamModelId,
     ) -> Option<String> {
         let now = SystemTime::now();
         let schedule_now = Instant::now();
+        let policy = self.policy();
+        let mut schedule = self.schedule.lock().ok()?;
         let mut entries = self.entries.lock().ok()?;
+        if !accept_account_revision(
+            &mut schedule,
+            &mut entries,
+            account_id,
+            credential_revision,
+            schedule_now,
+            &policy,
+        ) {
+            return None;
+        }
         let entry = entries.get_mut(&TurnStateKey::new(account_id, model))?;
         let state = entry
             .current_state(now)
@@ -315,6 +410,32 @@ impl TurnStateStore {
             entry.schedule_touched_at = schedule_now;
         }
         state
+    }
+
+    pub(crate) fn verified_state(
+        &self,
+        account_id: &ProviderAccountId,
+        credential_revision: CredentialRevision,
+        model: &UpstreamModelId,
+    ) -> Option<AppliedTurnState> {
+        let policy = self.policy();
+        let schedule = self.schedule.lock().ok()?;
+        if schedule.accounts.get(account_id)?.credential_revision != credential_revision {
+            return None;
+        }
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(&TurnStateKey::new(account_id, model))?;
+        let bundle = entry.verified.as_ref()?;
+        if bundle.policy != policy || bundle.expires_at <= SystemTime::now() {
+            return None;
+        }
+        Some(AppliedTurnState {
+            state: entry
+                .current_state(SystemTime::now())?
+                .expose_secret()
+                .to_owned(),
+            bundle: bundle.clone(),
+        })
     }
 
     /// 记录实际发送的业务请求；空缓存也必须能重新获得续采资格。
@@ -340,14 +461,25 @@ impl TurnStateStore {
     pub(crate) fn mark_applied(
         &self,
         account_id: &ProviderAccountId,
+        credential_revision: CredentialRevision,
         model: &UpstreamModelId,
         expected_state: &str,
     ) -> bool {
         let now = SystemTime::now();
         let schedule_now = Instant::now();
+        let Ok(schedule) = self.schedule.lock() else {
+            return false;
+        };
         let Ok(mut entries) = self.entries.lock() else {
             return false;
         };
+        if schedule
+            .accounts
+            .get(account_id)
+            .is_none_or(|account| account.credential_revision != credential_revision)
+        {
+            return false;
+        }
         let Some(entry) = entries.get_mut(&TurnStateKey::new(account_id, model)) else {
             return false;
         };
@@ -365,42 +497,125 @@ impl TurnStateStore {
         true
     }
 
-    pub(crate) fn is_valid_state(state: &str) -> bool {
-        state.len() == TURN_STATE_BYTES && reqwest::header::HeaderValue::from_str(state).is_ok()
+    pub(crate) fn accepts_state(&self, state: &str) -> bool {
+        Self::accepts_state_for_policy(&self.policy(), state)
+    }
+
+    fn accepts_state_for_policy(policy: &TurnStateProbePolicy, state: &str) -> bool {
+        policy
+            .state
+            .accepted_lengths
+            .iter()
+            .any(|length| usize::from(*length) == state.len())
+            && reqwest::header::HeaderValue::from_str(state).is_ok()
+    }
+
+    pub(crate) fn state_from_headers(&self, headers: &[(String, bytes::Bytes)]) -> Option<String> {
+        Self::state_from_headers_for_policy(&self.policy(), headers)
+    }
+
+    pub(crate) fn state_from_headers_for_policy(
+        policy: &TurnStateProbePolicy,
+        headers: &[(String, bytes::Bytes)],
+    ) -> Option<String> {
+        policy.state.response_header_names.iter().find_map(|name| {
+            let mut values = headers
+                .iter()
+                .filter(|(candidate, _)| candidate.eq_ignore_ascii_case(name));
+            let (_, value) = values.next()?;
+            if values.next().is_some() {
+                return None;
+            }
+            let value = std::str::from_utf8(value).ok()?;
+            Self::accepts_state_for_policy(policy, value).then(|| value.to_owned())
+        })
+    }
+
+    pub(crate) fn state_from_json(&self, value: &serde_json::Value) -> Option<String> {
+        Self::state_from_json_for_policy(&self.policy(), value)
+    }
+
+    pub(crate) fn state_from_json_for_policy(
+        policy: &TurnStateProbePolicy,
+        value: &serde_json::Value,
+    ) -> Option<String> {
+        policy
+            .state
+            .response_json_pointers
+            .iter()
+            .find_map(|pointer| {
+                let state = value.pointer(pointer)?.as_str()?;
+                Self::accepts_state_for_policy(policy, state).then(|| state.to_owned())
+            })
+    }
+
+    pub(crate) fn invalidates_on_status(&self, status: u16) -> bool {
+        self.policy().state.invalidation_statuses.contains(&status)
+    }
+
+    pub(crate) fn accepts_served_model(
+        &self,
+        requested: &UpstreamModelId,
+        served: Option<&str>,
+    ) -> bool {
+        !self.policy().state.require_served_model_match
+            || served.is_some_and(|served| served == requested.as_str())
     }
 
     pub(crate) fn put(
         &self,
         account_id: &ProviderAccountId,
+        credential_revision: CredentialRevision,
         model: &UpstreamModelId,
         state: String,
         source: TurnStateSource,
     ) -> Option<DateTime<Utc>> {
-        if !Self::is_valid_state(&state) {
+        if !self.accepts_state(&state) {
             return None;
         }
         let now = SystemTime::now();
         let schedule_now = Instant::now();
         let mut schedule = self.schedule.lock().expect("turn state mutex poisoned");
         let mut entries = self.entries.lock().expect("turn state mutex poisoned");
+        let policy = self.policy();
+        if !accept_account_revision(
+            &mut schedule,
+            &mut entries,
+            account_id,
+            credential_revision,
+            schedule_now,
+            &policy,
+        ) {
+            return None;
+        }
         let key = TurnStateKey::new(account_id, model);
         if !ensure_entry(&mut entries, &mut schedule, &key, now, schedule_now) {
             return None;
         }
+        let entry = entries.get_mut(&key).expect("entry was ensured");
+        if policy.verification.mode
+            == gateway_admin::model::turn_state::TurnStateVerificationMode::MintAndValidate
+            && source == TurnStateSource::UpstreamResponse
+        {
+            return entry.expires_at.map(DateTime::<Utc>::from);
+        }
         let version = allocate_version(&mut schedule);
+        let ttl = Duration::from_secs(policy.state.ttl_seconds);
         Some(write_state(
-            entries.get_mut(&key).expect("entry was ensured"),
+            entry,
             state,
             source,
             now,
             schedule_now,
             version,
+            ttl,
         ))
     }
 
     pub(crate) fn invalidate(
         &self,
         account_id: &ProviderAccountId,
+        credential_revision: CredentialRevision,
         model: &UpstreamModelId,
         reason: &str,
     ) {
@@ -408,6 +623,17 @@ impl TurnStateStore {
         let schedule_now = Instant::now();
         let mut schedule = self.schedule.lock().expect("turn state mutex poisoned");
         let mut entries = self.entries.lock().expect("turn state mutex poisoned");
+        let policy = self.policy();
+        if !accept_account_revision(
+            &mut schedule,
+            &mut entries,
+            account_id,
+            credential_revision,
+            schedule_now,
+            &policy,
+        ) {
+            return;
+        }
         let key = TurnStateKey::new(account_id, model);
         if !ensure_entry(&mut entries, &mut schedule, &key, now, schedule_now) {
             return;
@@ -451,6 +677,29 @@ impl TurnStateStore {
         }
     }
 
+    pub(crate) fn clear_runtime(
+        &self,
+        command: &gateway_admin::model::turn_state::TurnStateRuntimeClear,
+    ) {
+        let Ok(mut schedule) = self.schedule.lock() else {
+            return;
+        };
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let _ = allocate_version(&mut schedule);
+        entries.retain(|key, _| {
+            !command
+                .account_id
+                .as_deref()
+                .is_none_or(|account_id| key.account_id.as_str() == account_id)
+                || !command
+                    .model
+                    .as_deref()
+                    .is_none_or(|model| key.model.as_str() == model)
+        });
+    }
+
     pub(crate) fn begin_probe(
         &self,
         account_id: &ProviderAccountId,
@@ -460,6 +709,7 @@ impl TurnStateStore {
         bound_proxy: Option<&OutboundProxy>,
         trigger: TurnStateSource,
     ) -> TurnStateProbeAdmission {
+        self.set_policy(candidates.policy.clone());
         let now = SystemTime::now();
         let schedule_now = Instant::now();
         let subject = TurnStateKey::new(account_id, model);
@@ -476,8 +726,21 @@ impl TurnStateStore {
             return TurnStateProbeAdmission::NoCandidates;
         }
         let mut entries = self.entries.lock().expect("turn state mutex poisoned");
-        if !ensure_account(&mut schedule, account_id, credential_revision, schedule_now) {
+        if !ensure_account(
+            &mut schedule,
+            account_id,
+            credential_revision,
+            schedule_now,
+            &candidates.policy,
+        ) {
             return TurnStateProbeAdmission::CapacityExhausted;
+        }
+        if schedule
+            .accounts
+            .get(account_id)
+            .is_some_and(|account| account.credential_revision > credential_revision)
+        {
+            return TurnStateProbeAdmission::Deferred;
         }
         synchronize_revision(
             &mut schedule,
@@ -506,9 +769,12 @@ impl TurnStateStore {
             .accounts
             .get(account_id)
             .expect("account was ensured");
+        let round_limit = account.last_request_at.map(|at| {
+            at + Duration::from_secs(candidates.policy.schedule.round_min_interval_seconds)
+        });
         let limit = later(
-            later(entry_limit, account.rate_limit_until),
-            budget_recovery(account, schedule_now),
+            later(later(entry_limit, account.rate_limit_until), round_limit),
+            budget_recovery(account, schedule_now, &candidates.policy),
         );
         if limit.is_some_and(|until| until > schedule_now) {
             return TurnStateProbeAdmission::Deferred;
@@ -519,6 +785,7 @@ impl TurnStateStore {
                 entries.get(&subject).expect("entry was ensured"),
                 now,
                 schedule_now,
+                &candidates.policy,
             )
         {
             return TurnStateProbeAdmission::Deferred;
@@ -564,7 +831,8 @@ impl TurnStateStore {
             .expect("account was ensured")
             .generation;
         let expected_version = entries.get(&subject).expect("entry was ensured").version;
-        let candidates = targets
+        let run_policy = candidates.policy;
+        let run_candidates = targets
             .iter()
             .map(|target| (target.id.clone(), target.proxy.clone()))
             .collect();
@@ -581,11 +849,16 @@ impl TurnStateStore {
             id: run_id,
             subject: subject.clone(),
             credential_revision,
-            candidates,
+            candidates: run_candidates,
             base_positions,
             started: HashSet::new(),
+            request_counts: HashMap::new(),
         });
         account.touched_at = schedule_now;
+        let request_slots = self
+            .request_slots
+            .read()
+            .map_or_else(|_| Arc::new(Semaphore::new(1)), |slots| Arc::clone(&slots));
         TurnStateProbeAdmission::Ready(TurnStateProbeRun {
             store: self.clone(),
             subject,
@@ -596,7 +869,10 @@ impl TurnStateStore {
             trigger,
             candidates: available,
             all_candidates: targets,
+            policy: run_policy,
+            request_slots,
             finished: false,
+            verified: None,
         })
     }
 
@@ -623,7 +899,7 @@ impl TurnStateStore {
         }
 
         // 调用方在 permit 外等待并重试；Store 本身不持锁跨 await，也不主动 sleep。
-        let Ok(permit) = self.request_slots.clone().acquire_owned().await else {
+        let Ok(permit) = run.request_slots.clone().acquire_owned().await else {
             return TurnStateProbeRequestAdmission::Rejected;
         };
         let now = Instant::now();
@@ -654,14 +930,14 @@ impl TurnStateStore {
             .get(&target.id)
             .map(|index| (index + 1) % running.base_positions.len().max(1));
         let inserted = running.started.insert(target.id.clone());
-        debug_assert!(inserted, "request admission checked duplicate target");
-        account
-            .recent_requests
-            .retain(|at| *at + PROBE_BUDGET_WINDOW > now);
+        *running.request_counts.entry(target.id.clone()).or_default() += 1;
+        account.recent_requests.retain(|at| {
+            *at + Duration::from_secs(run.policy.schedule.budget_window_seconds) > now
+        });
         account.recent_requests.push_back(now);
         account.last_request_at = Some(now);
         account.touched_at = now;
-        if let Some(next_cursor) = next_cursor {
+        if inserted && let Some(next_cursor) = next_cursor {
             let entry = entries
                 .get_mut(&run.subject)
                 .expect("request admission checked entry");
@@ -714,6 +990,7 @@ impl TurnStateStore {
         let run_candidates = running.candidates.clone();
         let mut entries = self.entries.lock().expect("turn state mutex poisoned");
         let version_matches = current_facts_match
+            && self.policy() == run.policy
             && entries.get(&run.subject).map(|entry| entry.version) == Some(run.expected_version);
         let active_target = requested_active_target_id.as_ref().and_then(|id| {
             run.all_candidates
@@ -725,8 +1002,8 @@ impl TurnStateStore {
                 })
                 .cloned()
         });
-        let valid_state = state.filter(|state| Self::is_valid_state(state));
-        let mut saw_312 = false;
+        let valid_state = state.filter(|state| self.accepts_state(state));
+        let mut invalidating_status = None;
 
         for failure in failures.iter().filter(|_| current_facts_match) {
             let Some(target) = run.all_candidates.iter().find(|target| {
@@ -740,13 +1017,18 @@ impl TurnStateStore {
             {
                 continue;
             }
-            saw_312 |= failure.kind == TurnStateProbeFailureKind::HttpStatus(312);
+            if let TurnStateProbeFailureKind::HttpStatus(status) = failure.kind
+                && run.policy.state.invalidation_statuses.contains(&status)
+            {
+                invalidating_status = Some(status);
+            }
             apply_proxy_failure(
                 &mut schedule,
                 &run.subject,
                 target,
                 failure.kind,
                 schedule_now,
+                &run.policy,
             );
             if failure.kind == TurnStateProbeFailureKind::HttpStatus(429)
                 && started.contains(&failure.target_id)
@@ -764,6 +1046,7 @@ impl TurnStateStore {
                                 account.rate_limit_failures,
                                 run.subject.account_id.as_str().as_bytes(),
                                 None,
+                                &run.policy,
                             ),
                     ),
                 );
@@ -779,10 +1062,28 @@ impl TurnStateStore {
                     let entry = entries
                         .get_mut(&run.subject)
                         .expect("versioned entry exists");
-                    let expires_at =
-                        write_state(entry, state, run.trigger, now, schedule_now, version);
+                    let expires_at = write_state(
+                        entry,
+                        state,
+                        run.trigger,
+                        now,
+                        schedule_now,
+                        version,
+                        Duration::from_secs(run.policy.state.ttl_seconds),
+                    );
+                    if let Some(bundle) = run.verified.take() {
+                        entry.expires_at = Some(
+                            bundle
+                                .expires_at
+                                .min(entry.expires_at.unwrap_or(bundle.expires_at)),
+                        );
+                        entry.verified = Some(bundle);
+                    }
                     result.active_target_id = Some(target.id.clone());
-                    result.state_expires_at = Some(expires_at);
+                    result.state_expires_at = entry
+                        .expires_at
+                        .map(DateTime::<Utc>::from)
+                        .or(Some(expires_at));
                     target.clone()
                 })
         } else {
@@ -804,13 +1105,15 @@ impl TurnStateStore {
             if let Some(entry) = entries.get_mut(&run.subject) {
                 entry.preferred_proxy = Some(preference);
             }
-        } else if saw_312 && version_matches {
+        } else if let Some(status) = invalidating_status
+            && version_matches
+        {
             let version = allocate_version(&mut schedule);
             invalidate_entry(
                 entries
                     .get_mut(&run.subject)
                     .expect("versioned entry exists"),
-                "probe_upstream_312",
+                &format!("probe_upstream_{status}"),
                 false,
                 now,
                 schedule_now,
@@ -831,6 +1134,7 @@ impl TurnStateStore {
                             entry.failure_count,
                             run.subject.account_id.as_str().as_bytes(),
                             Some(run.subject.model.as_str().as_bytes()),
+                            &run.policy,
                         ),
                 );
             }
@@ -865,6 +1169,7 @@ impl TurnStateStore {
         account_id: &ProviderAccountId,
         model: &UpstreamModelId,
     ) -> Option<TurnStateSnapshot> {
+        let renew_before = Duration::from_secs(self.policy().state.renew_before_seconds);
         let entries = self.entries.lock().ok()?;
         let entry = entries.get(&TurnStateKey::new(account_id, model))?;
         let expires_at = entry
@@ -880,7 +1185,7 @@ impl TurnStateStore {
             next_rotation_at: entry
                 .expires_at
                 .filter(|expires_at| *expires_at > SystemTime::now())
-                .map(|expires_at| DateTime::<Utc>::from(expires_at - RENEW_BEFORE)),
+                .map(|expires_at| DateTime::<Utc>::from(expires_at - renew_before)),
             state_source: entry.source,
             probe_history: entry.probe_history.iter().cloned().collect(),
             invalidated_at: entry.invalidated_at,
@@ -889,42 +1194,39 @@ impl TurnStateStore {
     }
 
     pub(crate) fn due_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        let policy = self.policy();
+        if !policy.automatic_enabled {
+            return Vec::new();
+        }
         let Ok(schedule) = self.schedule.lock() else {
             return Vec::new();
         };
         let Ok(entries) = self.entries.lock() else {
             return Vec::new();
         };
-        let schedule_now = Instant::now();
-        let now = SystemTime::now();
-        entries
-            .iter()
-            .filter(|(key, entry)| {
-                let account_ready = schedule
-                    .accounts
-                    .get(&key.account_id)
-                    .is_none_or(|account| {
-                        !account.deleted
-                            && account.running.is_none()
-                            && account
-                                .rate_limit_until
-                                .is_none_or(|until| until <= schedule_now)
-                            && account
-                                .last_request_at
-                                .is_none_or(|at| at + PROBE_INTERVAL <= schedule_now)
-                            && budget_recovery(account, schedule_now).is_none()
-                    });
-                automatic_due(entry, now, schedule_now)
-                    && entry
-                        .next_allowed_at
-                        .is_none_or(|until| until <= schedule_now)
-                    && account_ready
-            })
-            .map(|(key, _)| TurnStateProbeSubject {
-                account_id: key.account_id.clone(),
-                model: key.model.clone(),
-            })
-            .collect()
+        collect_due_subjects(&schedule, &entries, Instant::now(), &policy)
+    }
+
+    /// Worker 使用的扫描入口；普通到期查询不消耗扫描节流窗口。
+    pub(crate) fn claim_due_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        let policy = self.policy();
+        if !policy.automatic_enabled {
+            return Vec::new();
+        }
+        let Ok(mut schedule) = self.schedule.lock() else {
+            return Vec::new();
+        };
+        let Ok(entries) = self.entries.lock() else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        if schedule.last_scan_at.is_some_and(|last| {
+            last + Duration::from_secs(policy.schedule.scan_interval_seconds) > now
+        }) {
+            return Vec::new();
+        }
+        schedule.last_scan_at = Some(now);
+        collect_due_subjects(&schedule, &entries, now, &policy)
     }
 
     pub(crate) fn automatic_due(
@@ -932,14 +1234,18 @@ impl TurnStateStore {
         account_id: &ProviderAccountId,
         model: &UpstreamModelId,
     ) -> bool {
+        let policy = self.policy();
         self.entries.lock().ok().is_some_and(|entries| {
             entries
                 .get(&TurnStateKey::new(account_id, model))
-                .is_some_and(|entry| automatic_due(entry, SystemTime::now(), Instant::now()))
+                .is_some_and(|entry| {
+                    automatic_due(entry, SystemTime::now(), Instant::now(), &policy)
+                })
         })
     }
 
     pub(crate) fn overview(&self) -> Vec<TurnStateOverviewEntry> {
+        let renew_before = Duration::from_secs(self.policy().state.renew_before_seconds);
         let Ok(entries) = self.entries.lock() else {
             return Vec::new();
         };
@@ -979,7 +1285,7 @@ impl TurnStateStore {
                     next_rotation_at: entry
                         .expires_at
                         .filter(|expires_at| *expires_at > now)
-                        .map(|expires_at| DateTime::<Utc>::from(expires_at - RENEW_BEFORE)),
+                        .map(|expires_at| DateTime::<Utc>::from(expires_at - renew_before)),
                     state_source: entry.source,
                     latest_probe_at: latest_probe.map(|probe| probe.finished_at),
                     latest_probe_succeeded: latest_probe
@@ -1019,22 +1325,71 @@ impl TurnStateStore {
     }
 }
 
-fn automatic_due(entry: &Entry, now: SystemTime, schedule_now: Instant) -> bool {
-    entry
-        .last_business_activity_at
-        .is_some_and(|at| at + BUSINESS_ACTIVITY_WINDOW > schedule_now)
-        && (entry.expires_at.is_none_or(|at| at <= now + RENEW_BEFORE)
-            || entry.invalidation_reason.is_some())
+fn collect_due_subjects(
+    schedule: &Schedule,
+    entries: &HashMap<TurnStateKey, Entry>,
+    schedule_now: Instant,
+    policy: &TurnStateProbePolicy,
+) -> Vec<TurnStateProbeSubject> {
+    let now = SystemTime::now();
+    entries
+        .iter()
+        .filter(|(key, entry)| {
+            let account_ready = schedule
+                .accounts
+                .get(&key.account_id)
+                .is_none_or(|account| {
+                    !account.deleted
+                        && account.running.is_none()
+                        && account
+                            .rate_limit_until
+                            .is_none_or(|until| until <= schedule_now)
+                        && account.last_request_at.is_none_or(|at| {
+                            at + Duration::from_secs(policy.schedule.round_min_interval_seconds)
+                                <= schedule_now
+                        })
+                        && budget_recovery(account, schedule_now, policy).is_none()
+                });
+            automatic_due(entry, now, schedule_now, policy)
+                && entry
+                    .next_allowed_at
+                    .is_none_or(|until| until <= schedule_now)
+                && account_ready
+        })
+        .map(|(key, _)| TurnStateProbeSubject {
+            account_id: key.account_id.clone(),
+            model: key.model.clone(),
+        })
+        .collect()
 }
 
-fn budget_recovery(account: &AccountSchedule, now: Instant) -> Option<Instant> {
+fn automatic_due(
+    entry: &Entry,
+    now: SystemTime,
+    schedule_now: Instant,
+    policy: &TurnStateProbePolicy,
+) -> bool {
+    entry.last_business_activity_at.is_some_and(|at| {
+        at + Duration::from_secs(policy.schedule.activity_window_seconds) > schedule_now
+    }) && (entry
+        .expires_at
+        .is_none_or(|at| at <= now + Duration::from_secs(policy.state.renew_before_seconds))
+        || entry.invalidation_reason.is_some())
+}
+
+fn budget_recovery(
+    account: &AccountSchedule,
+    now: Instant,
+    policy: &TurnStateProbePolicy,
+) -> Option<Instant> {
+    let window = Duration::from_secs(policy.schedule.budget_window_seconds);
     let mut recent = account
         .recent_requests
         .iter()
         .copied()
-        .filter(|at| *at + PROBE_BUDGET_WINDOW > now);
+        .filter(|at| *at + window > now);
     let oldest = recent.next()?;
-    (recent.count() + 1 >= PROBE_BUDGET_LIMIT).then_some(oldest + PROBE_BUDGET_WINDOW)
+    (recent.count() + 1 >= usize::from(policy.schedule.budget_limit)).then_some(oldest + window)
 }
 
 fn write_state(
@@ -1044,12 +1399,14 @@ fn write_state(
     now: SystemTime,
     schedule_now: Instant,
     version: TurnStateVersion,
+    ttl: Duration,
 ) -> DateTime<Utc> {
-    let expires_at = now + DEFAULT_TTL;
+    let expires_at = now + ttl;
     let changed = entry
         .state
         .as_ref()
         .is_none_or(|current| current.expose_secret() != state);
+    entry.verified = None;
     entry.state = Some(SecretString::from(state));
     entry.captured_at = Some(now);
     entry.expires_at = Some(expires_at);
@@ -1076,6 +1433,7 @@ fn invalidate_entry(
     schedule_now: Instant,
     version: TurnStateVersion,
 ) {
+    entry.verified = None;
     entry.state = None;
     entry.captured_at = None;
     entry.first_applied_at = None;
@@ -1152,6 +1510,7 @@ fn ensure_account(
     account_id: &ProviderAccountId,
     credential_revision: CredentialRevision,
     now: Instant,
+    policy: &TurnStateProbePolicy,
 ) -> bool {
     if let Some(account) = schedule.accounts.get(account_id) {
         if !account.deleted {
@@ -1186,10 +1545,9 @@ fn ensure_account(
             .iter()
             .filter(|(_, account)| {
                 account.running.is_none()
-                    && account
-                        .recent_requests
-                        .back()
-                        .is_none_or(|at| *at + PROBE_BUDGET_WINDOW <= now)
+                    && account.recent_requests.back().is_none_or(|at| {
+                        *at + Duration::from_secs(policy.schedule.budget_window_seconds) <= now
+                    })
             })
             .min_by_key(|(_, account)| account.touched_at)
             .map(|(id, _)| id.clone());
@@ -1236,10 +1594,11 @@ fn synchronize_revision(
     let changed = schedule
         .accounts
         .get(account_id)
-        .is_some_and(|account| account.credential_revision != revision);
+        .is_some_and(|account| account.credential_revision < revision);
     if !changed {
         return;
     }
+    entries.retain(|key, _| &key.account_id != account_id);
     if let Some(account) = schedule.accounts.get_mut(account_id) {
         // credential 更新不解除正在运行的 gate，也不抹掉已发生的十秒间隔。
         account.credential_revision = revision;
@@ -1248,22 +1607,34 @@ fn synchronize_revision(
         account.preferred_proxy = None;
         account.touched_at = now;
     }
-    for (key, entry) in entries {
-        if &key.account_id == account_id {
-            entry.preferred_proxy = None;
-            entry.candidate_cursor = 0;
-            entry.failure_count = 0;
-            entry.failure_backoff_until = None;
-            entry.next_allowed_at = None;
-            entry.schedule_touched_at = now;
-        }
-    }
     schedule
         .account_proxies
         .retain(|key, _| &key.account_id != account_id);
     schedule
         .model_proxies
         .retain(|key, _| &key.subject.account_id != account_id);
+}
+
+fn accept_account_revision(
+    schedule: &mut Schedule,
+    entries: &mut HashMap<TurnStateKey, Entry>,
+    account_id: &ProviderAccountId,
+    revision: CredentialRevision,
+    now: Instant,
+    policy: &TurnStateProbePolicy,
+) -> bool {
+    if schedule
+        .accounts
+        .get(account_id)
+        .is_some_and(|account| account.credential_revision > revision)
+    {
+        return false;
+    }
+    if !ensure_account(schedule, account_id, revision, now, policy) {
+        return false;
+    }
+    synchronize_revision(schedule, entries, account_id, revision, now);
+    true
 }
 
 fn check_probe_request(
@@ -1289,24 +1660,49 @@ fn check_probe_request(
         || running.subject != run.subject
         || running.credential_revision != run.credential_revision
         || running.candidates.get(&target.id) != Some(&target.proxy)
-        || running.started.contains(&target.id)
+        || (running.started.contains(&target.id)
+            && (run.policy.verification.mode
+                == gateway_admin::model::turn_state::TurnStateVerificationMode::AcquireOnly
+                || running
+                    .request_counts
+                    .get(&target.id)
+                    .copied()
+                    .unwrap_or_default()
+                    > run.policy.verification.reuse_count))
         || entries.get(&run.subject).map(|entry| entry.version) != Some(run.expected_version)
     {
         return ProbeRequestCheck::Rejected;
     }
+    // 首次铸票须有完成整组验证的额度；账号 gate 保证预留期间没有其他探测消耗。
+    let required = if !running.started.contains(&target.id)
+        && run.policy.verification.mode
+            == gateway_admin::model::turn_state::TurnStateVerificationMode::MintAndValidate
+    {
+        usize::from(run.policy.verification.reuse_count) + 1
+    } else {
+        1
+    };
+    let used = account
+        .recent_requests
+        .iter()
+        .filter(|at| **at + Duration::from_secs(run.policy.schedule.budget_window_seconds) > now)
+        .count();
+    if used + required > usize::from(run.policy.schedule.budget_limit) {
+        return ProbeRequestCheck::Rejected;
+    }
     // 预算耗尽就结束本轮，不持有账号 gate 等待下一个滚动窗口。
-    if budget_recovery(account, now).is_some()
+    if budget_recovery(account, now, &run.policy).is_some()
         || account.rate_limit_until.is_some_and(|until| until > now)
         || (run.trigger == TurnStateSource::AutomaticRenewal
             && !entries
                 .get(&run.subject)
-                .is_some_and(|entry| automatic_due(entry, SystemTime::now(), now)))
+                .is_some_and(|entry| automatic_due(entry, SystemTime::now(), now, &run.policy)))
     {
         return ProbeRequestCheck::Rejected;
     }
     if let Some(until) = account
         .last_request_at
-        .map(|at| at + PROBE_INTERVAL)
+        .map(|at| at + Duration::from_millis(run.policy.schedule.request_spacing_milliseconds))
         .filter(|until| *until > now)
     {
         return ProbeRequestCheck::Deferred { until };
@@ -1332,6 +1728,27 @@ fn synchronize_candidates(
         .iter()
         .map(|target| (target.id.as_str(), &target.proxy))
         .collect::<HashMap<_, _>>();
+    for (key, entry) in entries
+        .iter_mut()
+        .filter(|(key, _)| &key.account_id == account_id)
+    {
+        let _ = key;
+        if entry.verified.as_ref().is_some_and(|bundle| {
+            !targets
+                .iter()
+                .any(|target| target.proxy.as_ref() == Some(&bundle.proxy))
+        }) {
+            let version = allocate_version(schedule);
+            invalidate_entry(
+                entry,
+                "proxy_changed",
+                false,
+                SystemTime::now(),
+                Instant::now(),
+                version,
+            );
+        }
+    }
     schedule.account_proxies.retain(|key, record| {
         &key.account_id != account_id
             || current
@@ -1544,6 +1961,7 @@ fn apply_proxy_failure(
     target: &TurnStateProbeTarget,
     kind: TurnStateProbeFailureKind,
     now: Instant,
+    policy: &TurnStateProbePolicy,
 ) {
     if matches!(
         kind,
@@ -1564,14 +1982,22 @@ fn apply_proxy_failure(
             proxy_id: target.id.clone(),
         }) && record.proxy == target.proxy
         {
-            record.fail(now);
+            record.fail(
+                now,
+                Duration::from_secs(policy.schedule.proxy_cooldown_initial_seconds),
+                Duration::from_secs(policy.schedule.proxy_cooldown_max_seconds),
+            );
         }
     } else if let Some(record) = schedule.model_proxies.get_mut(&ModelProxyKey {
         subject: subject.clone(),
         proxy_id: target.id.clone(),
     }) && record.proxy == target.proxy
     {
-        record.fail(now);
+        record.fail(
+            now,
+            Duration::from_secs(policy.schedule.proxy_cooldown_initial_seconds),
+            Duration::from_secs(policy.schedule.proxy_cooldown_max_seconds),
+        );
     }
 }
 
@@ -1597,9 +2023,16 @@ fn clear_proxy_cooldowns(
     }
 }
 
-fn backoff_delay(failure_count: u64, account_id: &[u8], model: Option<&[u8]>) -> Duration {
-    let exponent = failure_count.saturating_sub(1).min(4) as u32;
-    let base = (15_u64.saturating_mul(1_u64 << exponent)).min(120);
+fn backoff_delay(
+    failure_count: u64,
+    account_id: &[u8],
+    model: Option<&[u8]>,
+    policy: &TurnStateProbePolicy,
+) -> Duration {
+    let initial = policy.schedule.retry_initial_seconds;
+    let maximum = policy.schedule.retry_max_seconds;
+    let exponent = failure_count.saturating_sub(1).min(16) as u32;
+    let base = initial.saturating_mul(1_u64 << exponent).min(maximum);
     let mut seed = 0_u64;
     for byte in account_id {
         seed = seed.wrapping_mul(31).wrapping_add(u64::from(*byte));
@@ -1612,12 +2045,12 @@ fn backoff_delay(failure_count: u64, account_id: &[u8], model: Option<&[u8]>) ->
         }
     }
     let jitter = seed.wrapping_add(failure_count.wrapping_mul(17)) % 6;
-    Duration::from_secs(base.saturating_add(jitter).min(120))
+    Duration::from_secs(base.saturating_add(jitter).min(maximum))
 }
 
-fn proxy_failure_delay(failure_count: u64) -> Duration {
-    let exponent = failure_count.saturating_sub(1).min(3) as u32;
-    Duration::from_secs((30_u64.saturating_mul(1_u64 << exponent)).min(120))
+fn exponential_delay(failure_count: u64, initial: Duration, maximum: Duration) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(16) as u32;
+    initial.saturating_mul(1_u32 << exponent).min(maximum)
 }
 
 fn later(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {

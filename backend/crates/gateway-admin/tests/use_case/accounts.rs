@@ -85,7 +85,7 @@ use gateway_core::{
 
 pub(super) type EventLog = Arc<Mutex<Vec<&'static str>>>;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct TurnStateProbeCall {
     account_id: String,
     model: String,
@@ -3606,6 +3606,7 @@ async fn turn_state_policy_saved_switches_control_manual_and_worker_independentl
             mode: TurnStateProxyMode::Fixed,
             proxy_ids: vec!["proxy-001".to_owned()],
             candidate_limit: 1,
+            ..Default::default()
         };
         let mut bundle = super::AdminHarness::new()
             .accounts(FakeAccountStore::new("openai", events()))

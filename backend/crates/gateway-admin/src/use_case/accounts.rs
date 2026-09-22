@@ -192,6 +192,15 @@ pub trait AccountsService: Send + Sync {
         model: UpstreamModelId,
     ) -> Result<TurnStateProbeResult, AdminError>;
 
+    async fn test_turn_state_policy(
+        &self,
+        _account_id: ProviderAccountId,
+        _model: UpstreamModelId,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<TurnStateProbeResult, AdminError> {
+        Err(AdminError::invalid("当前服务不支持策略草稿测试"))
+    }
+
     async fn turn_state_capture_status(&self) -> Result<TurnStateCaptureStatus, AdminError> {
         Err(AdminError::invalid("当前服务不支持探测报头采集"))
     }
@@ -385,8 +394,15 @@ impl DefaultAccountsService {
     pub(crate) async fn renew_due_turn_states(&self) {
         // 与账号诊断生命周期一同清理临时正文，不让无人访问的记录长期占用磁盘。
         prune_probe_records(&mut self.http_probe_records.lock().expect("probe records mutex"));
-        futures::stream::iter(self.providers.due_turn_state_subjects())
-            .for_each_concurrent(Some(2), |subject| async move {
+        let concurrency = self
+            .settings
+            .load_turn_state_probe_policy()
+            .await
+            .ok()
+            .map(|policy| usize::from(policy.schedule.max_concurrency).max(1))
+            .unwrap_or(2);
+        futures::stream::iter(self.providers.claim_due_turn_state_subjects())
+            .for_each_concurrent(Some(concurrency), |subject| async move {
                 // 排队期间业务响应可能已刷新 state；调用前重新核对，减少无效探测。
                 let still_due =
                     self.providers.due_turn_state_subjects().iter().any(|due| {
@@ -1327,6 +1343,21 @@ impl AccountsService for DefaultAccountsService {
 
     async fn turn_state_overview(&self) -> Result<Vec<TurnStateOverviewEntry>, AdminError> {
         Ok(self.providers.turn_state_overview())
+    }
+
+    async fn test_turn_state_policy(
+        &self,
+        account_id: ProviderAccountId,
+        model: UpstreamModelId,
+        policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<TurnStateProbeResult, AdminError> {
+        policy.validate()?;
+        let (_, provider) = self.provider_for_account(&account_id).await?;
+        let targets = self.turn_state_probe_targets().await?;
+        provider
+            .test_turn_state_policy(&account_id, &model, targets, policy)
+            .await
+            .map_err(|error| map_provider_error(error, "Codex turn state draft"))
     }
 
     async fn probe_turn_state(

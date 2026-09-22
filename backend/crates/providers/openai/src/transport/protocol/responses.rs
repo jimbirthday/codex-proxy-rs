@@ -29,6 +29,8 @@ pub struct CodexResponsesRequest {
     body: Map<String, Value>,
     /// API 边界保存、Provider 逐条恢复的普通客户端请求头。
     pub(crate) passthrough_headers: HeaderMap,
+    /// 管理员配置的续带与验证请求头，可覆盖自动生成值。
+    pub(crate) admin_headers: HeaderMap,
     /// 是否由客户端显式提供了 prompt cache key。
     pub explicit_prompt_cache_key: bool,
     /// 客户端会话 ID。
@@ -500,6 +502,7 @@ impl CodexResponsesRequest {
         Self {
             body,
             passthrough_headers: HeaderMap::new(),
+            admin_headers: HeaderMap::new(),
             explicit_prompt_cache_key: false,
             client_conversation_id: None,
             client_session_id: None,

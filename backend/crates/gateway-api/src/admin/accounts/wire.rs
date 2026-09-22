@@ -1489,3 +1489,11 @@ impl From<DomainConnectionTestEvent> for AccountConnectionTestEvent {
         Self { data }
     }
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TurnStateDraftRequest {
+    pub account_id: String,
+    pub model: String,
+    pub policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+}

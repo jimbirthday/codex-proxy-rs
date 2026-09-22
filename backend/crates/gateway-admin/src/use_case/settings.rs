@@ -32,8 +32,19 @@ pub trait SettingsService: Send + Sync {
         &self,
         _context: &MutationContext,
         _policy: crate::model::turn_state::TurnStateProbePolicy,
-    ) -> Result<(), AdminError> {
+    ) -> Result<crate::model::turn_state::TurnStateProbePolicy, AdminError> {
         Err(AdminError::unavailable("无法保存探测策略"))
+    }
+    async fn response_header_carry_status(
+        &self,
+    ) -> Result<crate::model::turn_state::ResponseHeaderCarryStatus, AdminError> {
+        Err(AdminError::unavailable("无法读取响应头续带状态"))
+    }
+    async fn clear_turn_state_runtime(
+        &self,
+        _command: crate::model::turn_state::TurnStateRuntimeClear,
+    ) -> Result<(), AdminError> {
+        Err(AdminError::unavailable("无法清理状态运行态"))
     }
 
     async fn preview_pricing_sync(
@@ -88,6 +99,16 @@ pub(crate) struct DefaultSettingsService {
 }
 
 impl DefaultSettingsService {
+    fn openai_provider(
+        &self,
+    ) -> Result<Arc<dyn crate::ports::provider::ProviderAdmin>, AdminError> {
+        let kind = gateway_core::routing::ProviderKind::new("openai")
+            .map_err(|_| AdminError::internal("OpenAI Provider 类型不合法"))?;
+        self.providers
+            .require(&kind)
+            .map_err(|error| super::map_provider_error(error, "turn state runtime"))
+    }
+
     fn profile_provider(
         &self,
         provider: &str,
@@ -120,20 +141,25 @@ impl SettingsService for DefaultSettingsService {
     async fn turn_state_probe_policy(
         &self,
     ) -> Result<crate::model::turn_state::TurnStateProbePolicy, AdminError> {
-        self.store
+        let policy = self
+            .store
             .load_turn_state_probe_policy()
             .await
-            .map_err(|error| map_store_error(error, "turn state probe policy"))
+            .map_err(|error| map_store_error(error, "turn state probe policy"))?;
+        policy.validate()?;
+        self.openai_provider()?
+            .apply_turn_state_probe_policy(policy.clone());
+        Ok(policy)
     }
     async fn update_turn_state_probe_policy(
         &self,
         context: &MutationContext,
         policy: crate::model::turn_state::TurnStateProbePolicy,
-    ) -> Result<(), AdminError> {
+    ) -> Result<crate::model::turn_state::TurnStateProbePolicy, AdminError> {
         policy.validate()?;
         let revision = self
             .store
-            .update_turn_state_probe_policy(policy, context)
+            .update_turn_state_probe_policy(policy.clone(), context)
             .await
             .map_err(|error| {
                 if error.kind() == crate::ports::store::AdminStoreErrorKind::Invalid {
@@ -142,7 +168,53 @@ impl SettingsService for DefaultSettingsService {
                     map_store_error(error, "turn state probe policy")
                 }
             })?;
-        publish_committed(self.snapshot.as_ref(), revision).await
+        publish_committed(self.snapshot.as_ref(), revision).await?;
+        let saved = self
+            .store
+            .load_turn_state_probe_policy()
+            .await
+            .map_err(|error| map_store_error(error, "turn state probe policy"))?;
+        saved.validate()?;
+        self.openai_provider()?
+            .apply_turn_state_probe_policy(saved.clone());
+        if saved != policy {
+            return Err(AdminError::conflict(
+                "保存结果与提交内容不一致，请重新加载后重试",
+            ));
+        }
+        Ok(saved)
+    }
+
+    async fn response_header_carry_status(
+        &self,
+    ) -> Result<crate::model::turn_state::ResponseHeaderCarryStatus, AdminError> {
+        Ok(self.openai_provider()?.response_header_carry_status())
+    }
+
+    async fn clear_turn_state_runtime(
+        &self,
+        command: crate::model::turn_state::TurnStateRuntimeClear,
+    ) -> Result<(), AdminError> {
+        if !command.response_headers && !command.turn_state {
+            return Err(AdminError::invalid("至少选择一种要清理的运行态"));
+        }
+        if command.rule_id.is_some() && command.turn_state {
+            return Err(AdminError::invalid("规则筛选只适用于响应头续带缓存"));
+        }
+        for value in [
+            command.account_id.as_deref(),
+            command.model.as_deref(),
+            command.rule_id.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
+                return Err(AdminError::invalid("运行态清理条件不合法"));
+            }
+        }
+        self.openai_provider()?.clear_turn_state_runtime(&command);
+        Ok(())
     }
 
     async fn preview_pricing_sync(

@@ -96,6 +96,11 @@ pub async fn run() -> Result<(), BootstrapError> {
         },
     )
     .await?;
+    let _ = admin
+        .services()
+        .settings()
+        .turn_state_probe_policy()
+        .await?;
     host.report_startup_ready("Admin");
 
     let mut probes = store.health_probes();

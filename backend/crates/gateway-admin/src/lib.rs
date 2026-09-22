@@ -340,7 +340,6 @@ pub async fn initialize(
     let xai = registry
         .require(&provider_kind(XAI_PROVIDER_KIND)?)
         .map_err(map_provider_registry_error)?;
-
     let auth = Arc::new(DefaultAuthService::new(
         config.default_username,
         config.session_ttl_minutes,

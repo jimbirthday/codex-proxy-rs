@@ -168,6 +168,16 @@ pub trait ProviderAdmin: Send + Sync {
         Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
     }
 
+    async fn test_turn_state_policy(
+        &self,
+        _account_id: &ProviderAccountId,
+        _model: &UpstreamModelId,
+        _targets: Vec<TurnStateProbeTarget>,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        Err(ProviderAdminError::new(ProviderAdminErrorKind::Unsupported))
+    }
+
     /// 仅供经过管理员审计的自由探测注入凭据，不可写入普通日志。
     async fn http_probe_headers(
         &self,
@@ -193,6 +203,30 @@ pub trait ProviderAdmin: Send + Sync {
     /// 返回需要自动续采 turn state 的账号与模型；默认 Provider 没有此类运行态。
     fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
         Vec::new()
+    }
+
+    /// 领取一次自动续采扫描；默认 Provider 没有扫描节流状态。
+    fn claim_due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        self.due_turn_state_subjects()
+    }
+
+    /// 提交后的设置快照同步到 Provider 进程内运行态。
+    fn apply_turn_state_probe_policy(
+        &self,
+        _policy: crate::model::turn_state::TurnStateProbePolicy,
+    ) {
+    }
+
+    /// 返回响应头续带缓存的脱敏统计。
+    fn response_header_carry_status(&self) -> crate::model::turn_state::ResponseHeaderCarryStatus {
+        crate::model::turn_state::ResponseHeaderCarryStatus {
+            total_entries: 0,
+            rules: Vec::new(),
+        }
+    }
+
+    /// 清理 Provider 内存中的 State 或响应头续带缓存。
+    fn clear_turn_state_runtime(&self, _command: &crate::model::turn_state::TurnStateRuntimeClear) {
     }
 
     /// 生成一次连接测试所需的 Provider-owned operation；Core 负责实际执行与落账。
@@ -367,6 +401,13 @@ impl ProviderAdminRegistry {
         self.providers
             .values()
             .flat_map(|provider| provider.due_turn_state_subjects())
+            .collect()
+    }
+
+    pub(crate) fn claim_due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        self.providers
+            .values()
+            .flat_map(|provider| provider.claim_due_turn_state_subjects())
             .collect()
     }
 

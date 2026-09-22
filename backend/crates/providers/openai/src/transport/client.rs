@@ -118,6 +118,7 @@ pub struct CodexClientVisibleUpstreamResponse {
     status: u16,
     content_type: Option<Vec<u8>>,
     client_headers: Vec<(String, Bytes)>,
+    response_header_carry_headers: Vec<(String, Bytes)>,
     body: Bytes,
 }
 
@@ -125,6 +126,7 @@ pub(crate) struct CodexClientVisibleUpstreamResponseParts {
     pub(crate) status: u16,
     pub(crate) content_type: Option<Vec<u8>>,
     pub(crate) client_headers: Vec<(String, Bytes)>,
+    pub(crate) response_header_carry_headers: Vec<(String, Bytes)>,
     pub(crate) body: Bytes,
 }
 
@@ -133,12 +135,14 @@ impl CodexClientVisibleUpstreamResponse {
         status: StatusCode,
         content_type: Option<Vec<u8>>,
         client_headers: Vec<(String, Bytes)>,
+        response_header_carry_headers: Vec<(String, Bytes)>,
         body: Bytes,
     ) -> Self {
         Self {
             status: status.as_u16(),
             content_type,
             client_headers,
+            response_header_carry_headers,
             body,
         }
     }
@@ -164,6 +168,7 @@ impl CodexClientVisibleUpstreamResponse {
             status: self.status,
             content_type: self.content_type,
             client_headers: self.client_headers,
+            response_header_carry_headers: self.response_header_carry_headers,
             body: self.body,
         }
     }

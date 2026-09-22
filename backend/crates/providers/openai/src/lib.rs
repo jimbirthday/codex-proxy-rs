@@ -3,6 +3,7 @@
 mod admin;
 pub mod config;
 mod provider;
+mod response_header_carry;
 mod session_transport;
 mod turn_state;
 
@@ -26,6 +27,7 @@ use crate::credential::{
     CodexCredentialRefreshService, CodexCredentialRepository, CodexCredentialSelector,
     CodexOAuthAdmin, CodexOAuthAdminService,
 };
+use crate::response_header_carry::ResponseHeaderCarryStore;
 use crate::transport::profile::{
     CodexArtifactProfileCache, CodexDesktopReleaseService, OfficialCodexDesktopReleaseTransport,
 };
@@ -148,6 +150,7 @@ pub async fn initialize_with_turn_state_capture(
         config.websocket_pool_config(),
     ));
     let turn_states = TurnStateStore::new();
+    let response_header_carry = ResponseHeaderCarryStore::new();
     let catalog = Arc::new(CodexCredentialCatalogService::new(
         repository.clone(),
         profile.clone(),
@@ -197,6 +200,7 @@ pub async fn initialize_with_turn_state_capture(
         )
         .map_err(OpenAiInitializeError::Provider)?
         .with_turn_state_store(turn_states.clone())
+        .with_response_header_carry_store(response_header_carry.clone())
         .with_session_identity(session_identity),
     );
     let token_client = Arc::new(
@@ -249,6 +253,7 @@ pub async fn initialize_with_turn_state_capture(
             catalog: Arc::clone(&catalog),
             base_url: config.base_url().to_owned(),
             turn_states,
+            response_header_carry,
             turn_state_probe_capture,
         },
         websocket_pool,

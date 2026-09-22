@@ -344,6 +344,7 @@ async fn openai_admin_provider_exposes_live_wire_profile_and_validated_billing()
         .await
         .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     let baseline = admin.dashboard_wire_profile().expect("official baseline");
     assert_eq!(
         baseline.release.as_ref().map(|release| release.status),
@@ -737,6 +738,7 @@ async fn openai_admin_provider_projects_cached_quota_models_and_canonical_export
     .await
     .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
 
     let operation = admin
         .connection_test_operation(
@@ -848,6 +850,7 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
     .await
     .expect("OpenAI turn state bundle");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     let model = UpstreamModelId::new("gpt-5.4").expect("upstream model");
     let proxy = OutboundProxy::parse(&server.uri()).expect("probe proxy");
 
@@ -868,7 +871,7 @@ async fn turn_state_probe_short_circuits_after_first_success_and_applies_state()
                 },
             ],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("turn state probe");
@@ -1024,7 +1027,7 @@ async fn turn_state_smart_scheduling_prefers_exact_model_and_keeps_business_refr
             &upstream_model("gpt-5.4"),
             vec![probe_target("probe", &proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("probe state");
@@ -1137,7 +1140,7 @@ async fn turn_state_smart_scheduling_falls_back_on_lease_busy_and_invalidated_st
             &upstream_model("gpt-5.4"),
             vec![probe_target("probe", &proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("probe state");
@@ -1245,7 +1248,11 @@ async fn select_turn_state_business(
         "openai",
         Map::from_iter([
             ("model".to_owned(), json!("client-model-alias")),
-            ("input".to_owned(), json!("state scheduling")),
+            // 每次模拟独立会话，避免相同提示词触发会话亲和并覆盖 Smart 优先级。
+            (
+                "input".to_owned(),
+                json!(format!("state scheduling {request_id}")),
+            ),
         ]),
     )
     .expect("payload")
@@ -1316,7 +1323,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 &manual_model,
                 manual_targets,
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -1348,7 +1355,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("key backoff remains active one second before its boundary");
@@ -1363,7 +1370,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 &upstream_model("other"),
                 targets.clone(),
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -1378,7 +1385,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                 &model,
                 targets.clone(),
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -1391,7 +1398,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("next manual round");
@@ -1429,7 +1436,7 @@ async fn turn_state_probe_enforces_manual_and_automatic_budgets_and_rotates_cand
                     .filter(|target| target.id == "d")
                     .collect(),
                 TurnStateSource::AutomaticRenewal,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -1493,6 +1500,7 @@ async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_se
     let account = store.account("acct_cold_recovery").expect("account");
     let model = upstream_model("gpt-5.4");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     assert!(admin.due_turn_state_subjects().is_empty());
     drain_turn_state_business(
         &bundle,
@@ -1514,7 +1522,7 @@ async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_se
             &model,
             vec![direct.clone()],
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await;
     assert!(rejected.is_err());
@@ -1528,7 +1536,7 @@ async fn turn_state_cold_business_request_requires_proxy_and_recovers_through_se
                 probe_target("b", &second),
             ],
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("cold recovery");
@@ -1582,13 +1590,14 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
     let target = probe_target("bound", &proxy);
     let _clock = PausedTimeGuard::new();
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     admin
         .probe_turn_state(
             account.id(),
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("manual seed");
@@ -1614,7 +1623,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("invalidate applied state");
@@ -1641,7 +1650,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target.clone()],
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("renew active state");
@@ -1653,7 +1662,7 @@ async fn turn_state_renewal_requires_business_activity_and_expires_when_idle() {
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("invalidate unused replacement");
@@ -1698,13 +1707,14 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
     let b = probe_target("b", &proxy_b);
     let _clock = PausedTimeGuard::new();
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     admin
         .probe_turn_state(
             account.id(),
             &model,
             vec![a.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed preferred a");
@@ -1716,7 +1726,7 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
             &model,
             vec![a, b.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("bound b before preferred a");
@@ -1729,7 +1739,7 @@ async fn turn_state_manual_success_does_not_enable_renewal_and_bound_proxy_wins(
             &model,
             vec![b],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("invalidate unused manual state");
@@ -1832,7 +1842,7 @@ async fn turn_state_probe_configuration_failures_consume_budget_without_history(
             &upstream_model("gpt-config"),
             targets.clone(),
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("three configuration failures exhaust manual budget");
@@ -1865,7 +1875,7 @@ async fn turn_state_probe_configuration_failures_consume_budget_without_history(
             &upstream_model("gpt-config"),
             targets,
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("untried candidate remains available next round");
@@ -1966,7 +1976,7 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
             &model,
             targets.clone(),
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("automatic configuration result");
@@ -1990,7 +2000,7 @@ async fn automatic_turn_state_probe_configuration_failures_leave_untried_candida
             &model,
             targets,
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("untried automatic candidate");
@@ -2068,7 +2078,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &first_model_task,
                 first_targets,
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -2109,7 +2119,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &second_model_task,
                 second_targets,
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -2138,7 +2148,7 @@ async fn turn_state_probe_prefers_model_then_account_proxy_without_cross_model_s
                 &first_model,
                 third_targets,
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -2189,7 +2199,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
                     &upstream_model(&format!("gpt-slot-{index}")),
                     vec![task_target],
                     TurnStateSource::ManualProbe,
-                    Default::default(),
+                    acquire_only_policy(),
                 )
                 .await
         }));
@@ -2239,7 +2249,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
                 &upstream_model("gpt-serial-a"),
                 vec![serial_target],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -2251,7 +2261,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
             &upstream_model("gpt-serial-b"),
             vec![probe_target("serial", &serial_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("same account manual probe must conflict");
@@ -2263,7 +2273,7 @@ async fn turn_state_probe_serializes_accounts_and_limits_global_network_concurre
             &upstream_model("gpt-serial-b"),
             vec![probe_target("serial", &serial_proxy)],
             TurnStateSource::AutomaticRenewal,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("busy automatic probe");
@@ -2315,7 +2325,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("407 probe result");
@@ -2328,7 +2338,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &upstream_model("gpt-other-model"),
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect_err("account proxy cooldown must cross models");
@@ -2350,7 +2360,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect_err("proxy cooldown remains active one second before expiry");
@@ -2365,7 +2375,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("proxy cooldown recovery");
@@ -2386,7 +2396,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("post-success 407");
@@ -2400,7 +2410,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -2414,7 +2424,7 @@ async fn turn_state_probe_cooldowns_match_failure_scope_and_cap() {
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("proxy success resets cooldown progression");
@@ -2449,7 +2459,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                 &failed_model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("model failure");
@@ -2463,7 +2473,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                 &failed_model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect_err("same model must be cooled");
@@ -2481,7 +2491,7 @@ async fn turn_state_probe_model_cooldown_does_not_cross_models() {
                     &upstream_model("gpt-model-other"),
                     vec![other_target],
                     TurnStateSource::ManualProbe,
-                    Default::default(),
+                    acquire_only_policy(),
                 )
                 .await
         });
@@ -2530,7 +2540,7 @@ async fn first_manual_failures_do_not_create_automatic_probe_eligibility() {
                 &model,
                 vec![probe_target(account_name, &proxy)],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("first manual failure");
@@ -2588,7 +2598,7 @@ async fn turn_state_probe_accepts_valid_state_on_312_and_short_circuits() {
             &model,
             probe_targets(&proxy, &["a", "b"]),
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("312 state result");
@@ -2630,7 +2640,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-auth-failed"),
                 vec![target.clone(), probe_target("unused", &proxy)],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("auth result");
@@ -2645,7 +2655,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                     &upstream_model("gpt-auth-failed"),
                     vec![target.clone()],
                     TurnStateSource::ManualProbe,
-                    Default::default()
+                    acquire_only_policy()
                 )
                 .await
                 .is_err()
@@ -2657,7 +2667,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-auth-other"),
                 vec![target],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("auth failures do not cool proxy");
@@ -2703,7 +2713,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-a"),
             vec![first_target.clone(), probe_target("unused", &unused_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("429 result");
@@ -2717,7 +2727,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-b"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -2732,7 +2742,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-b"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -2746,7 +2756,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-b"),
             vec![first_target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("429 recovery");
@@ -2759,7 +2769,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-c"),
             vec![first_target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("second 429 after success");
@@ -2773,7 +2783,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
                 &upstream_model("gpt-rate-d"),
                 vec![first_target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -2791,7 +2801,7 @@ async fn turn_state_probe_auth_and_rate_limit_failures_stop_without_switching_pr
             &upstream_model("gpt-rate-d"),
             vec![first_target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("successful probe reset 429 progression");
@@ -2841,7 +2851,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect("401 probe result");
@@ -2859,7 +2869,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
             .expect_err("key backoff remains active before exact boundary");
@@ -2877,7 +2887,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("key backoff recovery");
@@ -2890,7 +2900,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("401 after reset");
@@ -2905,7 +2915,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
                 &model,
                 vec![target.clone()],
                 TurnStateSource::ManualProbe,
-                Default::default()
+                acquire_only_policy()
             )
             .await
             .is_err()
@@ -2919,7 +2929,7 @@ async fn turn_state_probe_key_backoff_uses_deterministic_jitter_and_resets_after
             &model,
             vec![target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("first backoff restored after success");
@@ -2968,7 +2978,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
                 &upstream_model("gpt-timeout"),
                 vec![slow_target_for_task],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -2991,7 +3001,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
                     &upstream_model("gpt-fast"),
                     vec![target],
                     TurnStateSource::ManualProbe,
-                    Default::default(),
+                    acquire_only_policy(),
                 )
                 .await
         }));
@@ -3040,7 +3050,7 @@ async fn turn_state_probe_timeout_cools_account_proxy_without_holding_global_slo
             &upstream_model("gpt-timeout-other"),
             vec![slow_target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("timeout cooldown is account proxy scoped");
@@ -3082,7 +3092,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
             &upstream_model("gpt-cooled"),
             vec![cooled_target.clone()],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("407 result");
@@ -3095,7 +3105,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
             &upstream_model("gpt-cooled-other"),
             vec![cooled_target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("cooled account rejected before slot acquisition");
@@ -3119,7 +3129,7 @@ async fn cooled_account_does_not_occupy_global_probe_slots() {
                     &upstream_model("gpt-active"),
                     vec![target],
                     TurnStateSource::ManualProbe,
-                    Default::default(),
+                    acquire_only_policy(),
                 )
                 .await
         }));
@@ -3179,7 +3189,7 @@ async fn turn_state_probe_network_failure_cools_the_account_proxy() {
                 &upstream_model("gpt-network"),
                 vec![probe_target],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -3199,7 +3209,7 @@ async fn turn_state_probe_network_failure_cools_the_account_proxy() {
             &upstream_model("gpt-network-other"),
             vec![target],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("network cooldown is account proxy scoped");
@@ -3250,7 +3260,7 @@ async fn automatic_turn_state_probe_stops_when_business_refreshes_state() {
             &model,
             targets.clone(),
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("qualifying manual probe");
@@ -3282,7 +3292,7 @@ async fn automatic_turn_state_probe_stops_when_business_refreshes_state() {
                 &automatic_model,
                 targets,
                 TurnStateSource::AutomaticRenewal,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -3380,7 +3390,7 @@ async fn turn_state_probe_stale_results_cannot_replace_newer_business_state() {
                     &probe_model_task,
                     vec![probe_target("stale", &proxy)],
                     TurnStateSource::ManualProbe,
-                    Default::default(),
+                    acquire_only_policy(),
                 )
                 .await
         });
@@ -3449,7 +3459,7 @@ async fn turn_state_probe_exit_change_keeps_only_diagnostics() {
                 &upstream_model("gpt-5.4"),
                 vec![probe_target("old", &proxy)],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -3517,7 +3527,7 @@ async fn turn_state_snapshot_and_late_application_do_not_mark_rotated_state() {
             &model,
             vec![probe_target("old", &proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed old state");
@@ -3611,7 +3621,7 @@ async fn turn_state_proxy_address_change_clears_old_cooldown() {
             &upstream_model("gpt-address-old"),
             vec![probe_target("b", &old_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("old address 407");
@@ -3625,7 +3635,7 @@ async fn turn_state_proxy_address_change_clears_old_cooldown() {
             &upstream_model("gpt-address-new"),
             vec![probe_target("b", &new_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("same ID with new address is not cooled");
@@ -3673,7 +3683,7 @@ async fn turn_state_proxy_address_change_clears_old_preference() {
             &model,
             vec![probe_target("b", &old_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed b preference");
@@ -3686,7 +3696,7 @@ async fn turn_state_proxy_address_change_clears_old_preference() {
             &model,
             vec![probe_target("a", &proxy_a), probe_target("b", &new_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("changed preference candidates");
@@ -3734,7 +3744,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-1"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed b cooldown");
@@ -3747,7 +3757,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-2"),
             vec![probe_target("a", &proxy_a)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("remove b from directory");
@@ -3760,7 +3770,7 @@ async fn removing_candidate_clears_its_old_cooldown() {
             &upstream_model("gpt-delete-cooldown-3"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("restored b has no old cooldown");
@@ -3800,7 +3810,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-1"),
             vec![probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed b account preference");
@@ -3813,7 +3823,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-2"),
             vec![probe_target("a", &proxy_a)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("remove b preference");
@@ -3826,7 +3836,7 @@ async fn removing_candidate_clears_its_old_preference() {
             &upstream_model("gpt-delete-preference-3"),
             vec![probe_target("a", &proxy_a), probe_target("b", &proxy_b)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("deleted b preference does not revive");
@@ -3882,7 +3892,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
             &other_model,
             vec![probe_target("other", &other_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("seed isolated account");
@@ -3900,7 +3910,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
                 &running_model,
                 vec![old_target],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -3916,7 +3926,7 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
             &new_model,
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("old run keeps the removed account gate");
@@ -3953,31 +3963,32 @@ async fn account_removal_during_probe_discards_natural_completion_and_preserves_
     );
 
     tokio::time::advance(Duration::from_secs(4)).await;
-    let replacement_bundle = Arc::clone(&bundle);
-    let replacement_account = account.id().clone();
-    let replacement_model = new_model.clone();
-    let new_target = probe_target("new", &new_proxy);
-    let replacement = tokio::spawn(async move {
-        replacement_bundle
-            .admin_provider()
-            .probe_turn_state(
-                &replacement_account,
-                &replacement_model,
-                vec![new_target],
-                TurnStateSource::ManualProbe,
-                Default::default(),
-            )
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert_eq!(new_count.load(Ordering::SeqCst), 0);
-    assert!(!replacement.is_finished());
-    tokio::time::advance(Duration::from_secs(1)).await;
-    wait_for_request(&new_seen, &new_count, 1).await;
-    let new_result = replacement
+    let cooling_down = bundle
+        .admin_provider()
+        .probe_turn_state(
+            account.id(),
+            &new_model,
+            vec![probe_target("new", &new_proxy)],
+            TurnStateSource::ManualProbe,
+            acquire_only_policy(),
+        )
         .await
-        .expect("replacement task")
+        .expect_err("removed account keeps the previous round interval");
+    assert_eq!(cooling_down.kind(), ProviderAdminErrorKind::Unavailable);
+    assert_eq!(new_count.load(Ordering::SeqCst), 0);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    let new_result = bundle
+        .admin_provider()
+        .probe_turn_state(
+            account.id(),
+            &new_model,
+            vec![probe_target("new", &new_proxy)],
+            TurnStateSource::ManualProbe,
+            acquire_only_policy(),
+        )
+        .await
         .expect("replacement result");
+    wait_for_request(&new_seen, &new_count, 1).await;
     assert_eq!(new_result.active_target_id.as_deref(), Some("new"));
     assert_eq!(old_count.load(Ordering::SeqCst), 1);
     assert_eq!(new_count.load(Ordering::SeqCst), 1);
@@ -4035,7 +4046,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
                 &upstream_model("gpt-cancel-old"),
                 vec![old_target],
                 TurnStateSource::ManualProbe,
-                Default::default(),
+                acquire_only_policy(),
             )
             .await
     });
@@ -4051,7 +4062,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
             &upstream_model("gpt-cancel-new"),
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect_err("removed account cannot create a second gate");
@@ -4077,7 +4088,7 @@ async fn turn_state_probe_cancellation_and_account_removal_release_the_original_
             &upstream_model("gpt-cancel-new"),
             vec![probe_target("new", &new_proxy)],
             TurnStateSource::ManualProbe,
-            Default::default(),
+            acquire_only_policy(),
         )
         .await
         .expect("cancelled gate released");
@@ -4201,6 +4212,7 @@ async fn openai_admin_projects_free_plan_from_cached_quota_when_account_claims_o
     .await
     .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     let quota = admin
         .quota(ProviderQuotaRequest {
             account_id: account.id().clone(),
@@ -4602,6 +4614,7 @@ async fn openai_admin_provider_rejects_unprepared_mutations_before_store_commit(
     .await
     .expect("OpenAI bundle");
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     let import_error = admin
         .prepare_import(PrepareCredentialImport {
             default_outbound_proxy: None,
@@ -4763,6 +4776,9 @@ async fn turn_state_fixture_with_leases(
     )
     .await
     .expect("turn state fixture");
+    bundle
+        .admin_provider()
+        .apply_turn_state_probe_policy(acquire_only_policy());
     (Arc::new(bundle), store)
 }
 
@@ -5806,6 +5822,7 @@ async fn api_key_admin_exposes_only_configuration_and_preserves_key_when_rotatin
     .await
     .unwrap();
     let admin = bundle.admin_provider();
+    admin.apply_turn_state_probe_policy(acquire_only_policy());
     let configuration = admin
         .account_configuration(account.id())
         .await
@@ -5872,7 +5889,7 @@ async fn turn_state_policy_switches_reject_new_manual_and_skip_automatic_request
     let policy = TurnStateProbePolicy {
         manual_enabled: false,
         automatic_enabled: false,
-        ..Default::default()
+        ..acquire_only_policy()
     };
     let manual = bundle
         .admin_provider()
@@ -5903,6 +5920,280 @@ async fn turn_state_policy_switches_reject_new_manual_and_skip_automatic_request
 }
 
 #[tokio::test]
+async fn probe_response_headers_are_carried_only_within_the_same_account() {
+    use gateway_admin::model::turn_state::{
+        ResponseHeaderCarryPolicy, ResponseHeaderCarryRule, ResponseHeaderCarryScope,
+        ResponseHeaderCarrySource, ResponseHeaderMergeMode, ResponseHeaderMissingBehavior,
+        ResponseHeaderValueSelection, TurnStateProbePolicy,
+    };
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let seen = Arc::new(Notify::new());
+    let templates = vec![
+        probe_response(200, Some('a')).insert_header("x-upstream-session", "account-secret"),
+        probe_response(200, Some('b')),
+        probe_response(200, Some('c')),
+    ];
+    let count = mount_turn_state_sequence(&proxy, seen.clone(), templates).await;
+    let (bundle, store) =
+        turn_state_fixture(&base, &["acct_carry_first", "acct_carry_second"]).await;
+    let first = store.account("acct_carry_first").unwrap();
+    let second = store.account("acct_carry_second").unwrap();
+    let mut policy = TurnStateProbePolicy {
+        candidate_limit: 1,
+        ..acquire_only_policy()
+    };
+    policy.schedule.round_min_interval_seconds = 1;
+    policy.schedule.request_spacing_milliseconds = 100;
+    policy.response_header_carry = ResponseHeaderCarryPolicy {
+        rules: vec![ResponseHeaderCarryRule {
+            id: "session".to_owned(),
+            name: "Session".to_owned(),
+            enabled: true,
+            capture_enabled: true,
+            injection_enabled: true,
+            clear_on_disable: false,
+            sources: vec![ResponseHeaderCarrySource::TurnStateProbe],
+            source_header: "x-upstream-session".to_owned(),
+            target_header: "x-next-session".to_owned(),
+            transform: gateway_admin::model::turn_state::ResponseHeaderTransform::Direct,
+            value_selection: ResponseHeaderValueSelection::Last,
+            merge_mode: ResponseHeaderMergeMode::IfAbsent,
+            scope: ResponseHeaderCarryScope::AccountModel,
+            account_ids: Vec::new(),
+            models: Vec::new(),
+            ttl_seconds: 3_600,
+            missing_behavior: ResponseHeaderMissingBehavior::Keep,
+            capture_status_min: 200,
+            capture_status_max: 299,
+            invalidation_statuses: Vec::new(),
+            max_value_bytes: 8_192,
+            max_values: 4,
+        }],
+    };
+    let model = upstream_model("gpt-5.4");
+    let _clock = PausedTimeGuard::new();
+
+    bundle
+        .admin_provider()
+        .probe_turn_state(
+            first.id(),
+            &model,
+            vec![probe_target("a", &proxy)],
+            TurnStateSource::ManualProbe,
+            policy.clone(),
+        )
+        .await
+        .unwrap();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    bundle
+        .admin_provider()
+        .probe_turn_state(
+            first.id(),
+            &model,
+            vec![probe_target("a", &proxy)],
+            TurnStateSource::ManualProbe,
+            policy.clone(),
+        )
+        .await
+        .unwrap();
+    bundle
+        .admin_provider()
+        .probe_turn_state(
+            second.id(),
+            &model,
+            vec![probe_target("a", &proxy)],
+            TurnStateSource::ManualProbe,
+            policy,
+        )
+        .await
+        .unwrap();
+
+    wait_for_request(&seen, &count, 3).await;
+    let requests = proxy.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("x-next-session").is_none());
+    assert_eq!(
+        requests[1].headers.get("x-next-session").unwrap(),
+        "account-secret"
+    );
+    assert!(requests[2].headers.get("x-next-session").is_none());
+}
+
+#[tokio::test]
+async fn probe_set_cookie_can_be_mapped_to_the_next_cookie_request_header() {
+    use gateway_admin::model::turn_state::{
+        ResponseHeaderCarryPolicy, ResponseHeaderCarryRule, ResponseHeaderCarryScope,
+        ResponseHeaderCarrySource, ResponseHeaderMergeMode, ResponseHeaderMissingBehavior,
+        ResponseHeaderTransform, ResponseHeaderValueSelection, TurnStateProbePolicy,
+    };
+    let base = MockServer::start().await;
+    let proxy = MockServer::start().await;
+    let seen = Arc::new(Notify::new());
+    let templates = vec![
+        probe_response(200, Some('a'))
+            .append_header("set-cookie", "probe-pin=secret; Path=/; Max-Age=600"),
+        probe_response(200, Some('b')),
+    ];
+    let count = mount_turn_state_sequence(&proxy, seen.clone(), templates).await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_cookie_carry"]).await;
+    let account = store.account("acct_cookie_carry").unwrap();
+    let mut policy = TurnStateProbePolicy {
+        candidate_limit: 1,
+        ..acquire_only_policy()
+    };
+    policy.schedule.round_min_interval_seconds = 1;
+    policy.schedule.request_spacing_milliseconds = 100;
+    policy.response_header_carry = ResponseHeaderCarryPolicy {
+        rules: vec![ResponseHeaderCarryRule {
+            id: "cookie_bundle".to_owned(),
+            name: "Cookie bundle".to_owned(),
+            enabled: true,
+            capture_enabled: true,
+            injection_enabled: true,
+            clear_on_disable: false,
+            sources: vec![ResponseHeaderCarrySource::TurnStateProbe],
+            source_header: "set-cookie".to_owned(),
+            target_header: "cookie".to_owned(),
+            transform: ResponseHeaderTransform::SetCookieToCookie,
+            value_selection: ResponseHeaderValueSelection::All,
+            merge_mode: ResponseHeaderMergeMode::Replace,
+            scope: ResponseHeaderCarryScope::AccountModel,
+            account_ids: Vec::new(),
+            models: Vec::new(),
+            ttl_seconds: 3_600,
+            missing_behavior: ResponseHeaderMissingBehavior::Keep,
+            capture_status_min: 200,
+            capture_status_max: 299,
+            invalidation_statuses: Vec::new(),
+            max_value_bytes: 8_192,
+            max_values: 16,
+        }],
+    };
+    let model = upstream_model("gpt-5.4");
+    let _clock = PausedTimeGuard::new();
+
+    for _ in 0..2 {
+        bundle
+            .admin_provider()
+            .probe_turn_state(
+                account.id(),
+                &model,
+                vec![probe_target("a", &proxy)],
+                TurnStateSource::ManualProbe,
+                policy.clone(),
+            )
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+
+    wait_for_request(&seen, &count, 2).await;
+    let requests = proxy.received_requests().await.unwrap();
+    assert!(requests[0].headers.get("cookie").is_none());
+    assert_eq!(
+        requests[1].headers.get("cookie").unwrap(),
+        "probe-pin=secret"
+    );
+}
+
+#[tokio::test]
+async fn business_response_rules_can_override_managed_request_headers() {
+    use gateway_admin::model::turn_state::{
+        ResponseHeaderCarryPolicy, ResponseHeaderCarryRule, ResponseHeaderCarryScope,
+        ResponseHeaderCarrySource, ResponseHeaderMergeMode, ResponseHeaderMissingBehavior,
+        ResponseHeaderValueSelection, TurnStateProbePolicy,
+    };
+    let base = MockServer::start().await;
+    let response_index = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/codex/responses"))
+        .respond_with({
+            let response_index = Arc::clone(&response_index);
+            move |_request: &wiremock::Request| {
+                let template = ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(COMPLETED_SESSION_SSE);
+                if response_index.fetch_add(1, Ordering::SeqCst) == 0 {
+                    template.insert_header("authorization", "business-secret")
+                } else {
+                    template
+                }
+            }
+        })
+        .expect(2)
+        .mount(&base)
+        .await;
+    let (bundle, store) = turn_state_fixture(&base, &["acct_business_carry"]).await;
+    let account = store.account("acct_business_carry").unwrap();
+    let policy = TurnStateProbePolicy {
+        response_header_carry: ResponseHeaderCarryPolicy {
+            rules: vec![ResponseHeaderCarryRule {
+                id: "business_session".to_owned(),
+                name: "Business session".to_owned(),
+                enabled: true,
+                capture_enabled: true,
+                injection_enabled: true,
+                clear_on_disable: false,
+                sources: vec![ResponseHeaderCarrySource::BusinessResponse],
+                source_header: "authorization".to_owned(),
+                target_header: "authorization".to_owned(),
+                transform: gateway_admin::model::turn_state::ResponseHeaderTransform::Direct,
+                value_selection: ResponseHeaderValueSelection::Last,
+                merge_mode: ResponseHeaderMergeMode::IfAbsent,
+                scope: ResponseHeaderCarryScope::AccountModel,
+                account_ids: Vec::new(),
+                models: Vec::new(),
+                ttl_seconds: 3_600,
+                missing_behavior: ResponseHeaderMissingBehavior::Keep,
+                capture_status_min: 200,
+                capture_status_max: 299,
+                invalidation_statuses: Vec::new(),
+                max_value_bytes: 8_192,
+                max_values: 4,
+            }],
+        },
+        ..acquire_only_policy()
+    };
+    bundle
+        .admin_provider()
+        .apply_turn_state_probe_policy(policy);
+
+    for request_id in ["req_business_carry_seed", "req_business_carry_reuse"] {
+        let payload = ProtocolPayload::json_object(
+            "openai",
+            Map::from_iter([
+                ("model".to_owned(), json!("gpt-5.4")),
+                ("input".to_owned(), json!("carry response header")),
+            ]),
+        )
+        .unwrap()
+        .with_context(Map::from_iter([("use_websocket".to_owned(), json!(false))]));
+        let operation = Operation::Generate(GenerateRequest::from_protocol_payload(payload));
+        let mut stream = bundle
+            .core_provider()
+            .execute(
+                initialized_provider_request(operation, account.id().as_str()),
+                initialized_attempt_context(request_id, account.id().as_str()),
+            )
+            .await
+            .unwrap();
+        while let Some(event) = stream.next().await {
+            event.unwrap();
+        }
+    }
+
+    let requests = base.received_requests().await.unwrap();
+    assert_ne!(
+        requests[0].headers.get("authorization").unwrap(),
+        "business-secret"
+    );
+    assert_eq!(
+        requests[1].headers.get("authorization").unwrap(),
+        "business-secret"
+    );
+}
+
+#[tokio::test]
 async fn turn_state_policy_fixed_failure_never_falls_back_to_other_saved_proxies() {
     use gateway_admin::model::turn_state::{TurnStateProbePolicy, TurnStateProxyMode};
     let base = MockServer::start().await;
@@ -5925,7 +6216,7 @@ async fn turn_state_policy_fixed_failure_never_falls_back_to_other_saved_proxies
                 mode: TurnStateProxyMode::Fixed,
                 proxy_ids: vec!["b".to_owned()],
                 candidate_limit: 1,
-                ..Default::default()
+                ..acquire_only_policy()
             },
         )
         .await
@@ -5953,7 +6244,7 @@ async fn turn_state_policy_pool_rotates_after_success_within_selected_directory(
         mode: TurnStateProxyMode::Pool,
         proxy_ids: vec!["b".to_owned(), "c".to_owned()],
         candidate_limit: 1,
-        ..Default::default()
+        ..acquire_only_policy()
     };
     for expected in ["b", "c", "b"] {
         let result = bundle
@@ -5997,7 +6288,7 @@ async fn turn_state_policy_random_attempts_selected_candidates_without_replaceme
                     mode: TurnStateProxyMode::Random,
                     proxy_ids: vec!["b".to_owned(), "d".to_owned()],
                     candidate_limit: 3,
-                    ..Default::default()
+                    ..acquire_only_policy()
                 },
             )
             .await
@@ -6016,3 +6307,18 @@ async fn turn_state_policy_random_attempts_selected_candidates_without_replaceme
         BTreeSet::from(["b", "d"])
     );
 }
+
+// 旧合同测试显式选择单次获取模式；默认两阶段合同在 verified_probe 中验收。
+fn acquire_only_policy() -> gateway_admin::model::turn_state::TurnStateProbePolicy {
+    let mut policy = gateway_admin::model::turn_state::TurnStateProbePolicy::default();
+    policy.verification.mode =
+        gateway_admin::model::turn_state::TurnStateVerificationMode::AcquireOnly;
+    policy.schedule.budget_limit = 3;
+    policy.state.capture_business_responses = true;
+    policy.request.body = None;
+    policy.request.compression = gateway_admin::model::turn_state::TurnStateProbeCompression::Zstd;
+    policy.request.extra_headers.clear();
+    policy
+}
+
+mod verified_probe;

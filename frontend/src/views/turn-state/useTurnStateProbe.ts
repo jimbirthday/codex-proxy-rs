@@ -165,7 +165,7 @@ export function useTurnStateProbe() {
         models.value.push({ label: `${targetModel}（历史记录）`, value: targetModel })
       selectedModelId.value = models.value.some(model => model.value === targetModel)
         ? targetModel
-        : models.value[0]?.value ?? ''
+        : models.value.find(model => model.value === 'gpt-6-astra')?.value ?? models.value[0]?.value ?? ''
       if (refresh)
         toast.success(`已刷新 ${models.value.length} 个上游模型`)
       else if (models.value.length === 0)

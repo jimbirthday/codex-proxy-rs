@@ -4794,7 +4794,7 @@ async fn new_or_unidentified_turn_should_not_restore_previous_turn_state() {
 }
 
 #[tokio::test]
-async fn observed_turn_state_should_feed_the_next_request_without_entering_continuation_storage() {
+async fn default_verified_mode_should_not_reuse_unverified_business_state() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_provider_contract").await;
     let server = MockServer::start().await;
@@ -4835,10 +4835,8 @@ async fn observed_turn_state_should_feed_the_next_request_without_entering_conti
         .await
         .expect("captured turn state requests");
     assert!(captured_header_values(&requests[0], "x-codex-turn-state").is_empty());
-    assert_eq!(
-        captured_header_values(&requests[1], "x-codex-turn-state"),
-        vec![turn_state.into_bytes()]
-    );
+    // 默认验证模式中，业务响应单独采集的 State 尚未通过铸票复用验证。
+    assert!(captured_header_values(&requests[1], "x-codex-turn-state").is_empty());
     assert!(
         first_session
             .expect("first response session update")
@@ -4989,10 +4987,8 @@ async fn upstream_312_should_invalidate_observed_turn_state_before_the_next_requ
         .await
         .expect("captured turn state requests");
     assert!(captured_header_values(&requests[0], "x-codex-turn-state").is_empty());
-    assert_eq!(
-        captured_header_values(&requests[1], "x-codex-turn-state"),
-        vec![turn_state.into_bytes()]
-    );
+    // 默认验证模式中，业务响应单独采集的 State 尚未通过铸票复用验证。
+    assert!(captured_header_values(&requests[1], "x-codex-turn-state").is_empty());
     assert!(captured_header_values(&requests[2], "x-codex-turn-state").is_empty());
 }
 

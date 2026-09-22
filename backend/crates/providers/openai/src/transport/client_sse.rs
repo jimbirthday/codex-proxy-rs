@@ -163,6 +163,8 @@ impl CodexBackendClient {
                 .get(CONTENT_TYPE)
                 .map(|value| value.as_bytes().to_vec());
             let client_headers = response_meta::client_headers(response.headers());
+            let response_header_carry_headers =
+                response_meta::response_header_carry_headers(response.headers());
             let raw_body = read_error_response_body(response).await.map_err(|source| {
                 CodexClientError::ErrorBodyRead {
                     source,
@@ -187,6 +189,7 @@ impl CodexBackendClient {
                     status,
                     content_type,
                     client_headers,
+                    response_header_carry_headers,
                     raw_body,
                 ))),
                 retry_after_seconds,

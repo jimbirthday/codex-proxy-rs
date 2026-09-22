@@ -61,6 +61,7 @@ use crate::credential::{
     derive_codex_cyber_policy_session_key, derive_codex_endpoint_session_affinity,
     derive_codex_session_affinity, derive_previous_response_id_hash,
 };
+use crate::response_header_carry::{ResponseHeaderCarryStore, ResponseHeaderContext};
 use crate::session_transport::CodexSessionTransportRecovery;
 use crate::transport::canonical::{
     CodexCanonicalDecoder, CodexCanonicalError, CodexCanonicalOutcome,
@@ -152,6 +153,7 @@ pub struct CodexProvider {
     session_transport_recovery: CodexSessionTransportRecovery,
     stream_max_retries: u32,
     turn_states: TurnStateStore,
+    response_header_carry: ResponseHeaderCarryStore,
 }
 
 impl CodexProvider {
@@ -207,11 +209,20 @@ impl CodexProvider {
             session_transport_recovery: CodexSessionTransportRecovery::default(),
             stream_max_retries,
             turn_states: TurnStateStore::new(),
+            response_header_carry: ResponseHeaderCarryStore::new(),
         })
     }
 
     pub(crate) fn with_turn_state_store(mut self, turn_states: TurnStateStore) -> Self {
         self.turn_states = turn_states;
+        self
+    }
+
+    pub(crate) fn with_response_header_carry_store(
+        mut self,
+        response_header_carry: ResponseHeaderCarryStore,
+    ) -> Self {
+        self.response_header_carry = response_header_carry;
         self
     }
 
@@ -560,16 +571,70 @@ impl Provider for CodexProvider {
             lease.installation_id(),
             account_scope,
         );
+        let mut effective_account = lease.account().clone();
+        let mut verified_headers = None;
+        let previous_bundle_id = previous_session
+            .as_ref()
+            .and_then(|session| session.verified_bundle_id.as_deref());
+        let mut verified_bundle_id = None;
         if matches!(
             lease.authentication(),
             crate::credential::CodexRuntimeAuthentication::OAuth(_)
         ) {
             normalize_non_codex_request_body(upstream_request.body_mut());
-            if upstream_request.turn_state.is_none()
-                && let Some(state) = self.turn_states.state(lease.account_id(), upstream_model)
+            if self.turn_states.injection_enabled()
+                && (upstream_request.turn_state.is_none() || previous_bundle_id.is_some())
             {
-                upstream_request.turn_state = Some(state);
+                let policy = self.turn_states.policy();
+                if policy.verification.mode
+                    == gateway_admin::model::turn_state::TurnStateVerificationMode::MintAndValidate
+                {
+                    if let Some(applied) = self.turn_states.verified_state(
+                        lease.account_id(),
+                        lease.account().revision(),
+                        upstream_model,
+                    ) {
+                        if previous_bundle_id.is_some_and(|id| id != applied.bundle.id) {
+                            return Err(continuation_replay_required_error("scope_unavailable"));
+                        }
+                        let same_proxy =
+                            lease.account().outbound_proxy() == Some(&applied.bundle.proxy);
+                        // 已有续接关系不能转移到新出口；新会话可跟随已验证的代理。
+                        let follows = policy.verification.business_proxy == gateway_admin::model::turn_state::TurnStateBusinessProxy::FollowVerified
+                            && ((!continuation_requested && previous_session.is_none()) || previous_bundle_id == Some(applied.bundle.id.as_str()));
+                        if same_proxy || follows {
+                            effective_account =
+                                effective_account.with_outbound_proxy(Some(applied.bundle.proxy));
+                            upstream_request.turn_state = Some(applied.state);
+                            verified_bundle_id = Some(applied.bundle.id);
+                            verified_headers = Some(applied.bundle.headers);
+                        }
+                    }
+                } else if let Some(state) = self.turn_states.state(
+                    lease.account_id(),
+                    lease.account().revision(),
+                    upstream_model,
+                ) {
+                    upstream_request.turn_state = Some(state);
+                }
             }
+        }
+        // 续接只允许原验证批次；票据过期、代理切换或策略更新后须重新建立上下文。
+        if previous_bundle_id.is_some() && verified_bundle_id.is_none() {
+            return Err(continuation_replay_required_error("scope_unavailable"));
+        }
+        let response_header_carry_token = self.response_header_carry.inject(
+            &ResponseHeaderContext {
+                account_id: lease.account_id(),
+                credential_revision: lease.account().revision(),
+                model: upstream_model,
+                proxy: effective_account.outbound_proxy(),
+            },
+            &mut upstream_request.admin_headers,
+        );
+        if let Some(headers) = verified_headers {
+            // 验证组合最后整体注入，普通续带规则不能拆散 State 与 Cookie。
+            upstream_request.admin_headers.extend(headers);
         }
         // 每次执行从原始请求编码，选定出口后再覆盖，避免换号时携带上次位置。
         if let Some(location) = lease
@@ -624,6 +689,7 @@ impl Provider for CodexProvider {
         let response_store = upstream_request.store();
         let session_capture =
             (!continuation_requested || previous_session.is_some()).then(|| OpenAiSessionCapture {
+                verified_bundle_id,
                 account_id: lease.account_id().as_str().to_owned(),
                 credential_revision: matches!(
                     lease.authentication(),
@@ -648,11 +714,12 @@ impl Provider for CodexProvider {
         let events = cold_response_stream(ColdResponse {
             client: self
                 .client_for_request(&context)?
-                .for_account(lease.account())
+                .for_account(&effective_account)
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
                 .with_authentication(lease.authentication()),
+            effective_account,
             response_origin: self.responses_url.clone(),
             request: upstream_request,
             upstream_model: upstream_model.clone(),
@@ -670,6 +737,8 @@ impl Provider for CodexProvider {
             stream_max_retries: self.stream_max_retries,
             session_capture,
             turn_states: self.turn_states.clone(),
+            response_header_carry: self.response_header_carry.clone(),
+            response_header_carry_token,
         });
         let stream = ProviderStream::new(metadata, events, lease);
         Ok(if allows_account_state_mutation {

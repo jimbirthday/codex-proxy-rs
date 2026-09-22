@@ -4,6 +4,51 @@ use gateway_core::metering::{CalculatedCost, Usage};
 
 use super::*;
 
+#[expect(clippy::too_many_arguments)]
+async fn capture_business_failure_runtime(
+    selector: &CodexCredentialSelector,
+    response_header_carry: &crate::response_header_carry::ResponseHeaderCarryStore,
+    turn_states: &crate::turn_state::TurnStateStore,
+    account: &ProviderAccount,
+    model: &UpstreamModelId,
+    failure: &MappedProviderFailure,
+    turn_state_enabled: bool,
+    response_header_carry_token: crate::response_header_carry::ResponseHeaderCarryCaptureToken,
+) {
+    // Cookie 响应可能推进 credential revision；先读取当前账号，再写入同 revision 的
+    // 续带与 State 运行态，防止旧响应在轮换后污染新凭据。
+    let current_account =
+        if failure.capture_response_cookies && !failure.set_cookie_headers.is_empty() {
+            selector.current_account(account.id()).await.ok()
+        } else {
+            None
+        };
+    let account = current_account.as_ref().unwrap_or(account);
+    let Some(status) = failure.error.upstream_status() else {
+        return;
+    };
+    response_header_carry.capture(
+        &crate::response_header_carry::ResponseHeaderContext {
+            account_id: account.id(),
+            credential_revision: account.revision(),
+            model,
+            proxy: account.outbound_proxy(),
+        },
+        response_header_carry_token,
+        gateway_admin::model::turn_state::ResponseHeaderCarrySource::BusinessResponse,
+        status,
+        &failure.response_header_carry_headers,
+    );
+    if turn_state_enabled && turn_states.invalidates_on_status(status) {
+        turn_states.invalidate(
+            account.id(),
+            account.revision(),
+            model,
+            &format!("upstream_{status}"),
+        );
+    }
+}
+
 impl CodexProvider {
     pub(super) async fn execute_image(
         &self,
@@ -165,6 +210,7 @@ struct RawJsonEndpointRequest {
 }
 
 pub(super) struct ColdResponse {
+    pub(super) effective_account: ProviderAccount,
     pub(super) client: CodexBackendClient,
     pub(super) response_origin: Url,
     pub(super) request: CodexResponsesRequest,
@@ -183,6 +229,9 @@ pub(super) struct ColdResponse {
     pub(super) stream_max_retries: u32,
     pub(super) session_capture: Option<OpenAiSessionCapture>,
     pub(super) turn_states: crate::turn_state::TurnStateStore,
+    pub(super) response_header_carry: crate::response_header_carry::ResponseHeaderCarryStore,
+    pub(super) response_header_carry_token:
+        crate::response_header_carry::ResponseHeaderCarryCaptureToken,
 }
 
 pub(super) struct ColdJsonResponse {
@@ -202,6 +251,8 @@ pub(super) struct ColdJsonResponse {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct OpenAiSessionState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) verified_bundle_id: Option<String>,
     pub(super) account_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) credential_revision: Option<u64>,
@@ -222,6 +273,7 @@ pub(super) enum OpenAiContinuationScope {
 }
 
 pub(super) struct OpenAiSessionCapture {
+    pub(super) verified_bundle_id: Option<String>,
     pub(super) account_id: String,
     pub(super) credential_revision: Option<u64>,
     pub(super) conversation_id: Option<String>,
@@ -268,6 +320,7 @@ fn encode_openai_session_capture(
         ));
     };
     encode_openai_session_state(OpenAiSessionState {
+        verified_bundle_id: capture.verified_bundle_id.clone(),
         account_id: capture.account_id.clone(),
         credential_revision: capture.credential_revision,
         conversation_id: capture.conversation_id.clone(),
@@ -558,6 +611,7 @@ fn image_response_metering(
 
 pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
     let ColdResponse {
+        effective_account,
         client,
         response_origin,
         request,
@@ -576,6 +630,8 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         stream_max_retries,
         mut session_capture,
         turn_states,
+        response_header_carry,
+        response_header_carry_token,
     } = response;
     Box::pin(async_stream::try_stream! {
         let cyber_policy_scope = lease.cyber_policy_scope().cloned();
@@ -593,7 +649,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             allows_account_state_mutation,
             allows_capacity_feedback: !context.is_diagnostic_required_account(),
         };
-        let mut active_account = lease.account().clone();
+        let mut active_account = effective_account;
         let cookie_header = build_cookie_header(lease.cookies())?;
         let authorization = lease
             .authentication()
@@ -616,14 +672,21 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let applied_turn_state = account_turn_state_enabled
             .then(|| request.turn_state.clone())
             .flatten()
-            .map(|state| (active_account.id().clone(), upstream_model.clone(), state));
+            .map(|state| {
+                (
+                    active_account.id().clone(),
+                    active_account.revision(),
+                    upstream_model.clone(),
+                    state,
+                )
+            });
         let activity_account_id = active_account.id().clone();
         let mark_turn_state_applied = || {
             if account_turn_state_enabled && !context.is_diagnostic_required_account() {
                 turn_states.mark_business_activity(&activity_account_id, &upstream_model);
             }
-            if let Some((account_id, model, state)) = applied_turn_state.as_ref() {
-                turn_states.mark_applied(account_id, model, state);
+            if let Some((account_id, revision, model, state)) = applied_turn_state.as_ref() {
+                turn_states.mark_applied(account_id, *revision, model, state);
             }
         };
         let response = create_response_attempt(
@@ -662,9 +725,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let response = match response {
             Ok(response) => response,
             Err(mut failure) => {
-                if account_turn_state_enabled && failure.error.upstream_status() == Some(312) {
-                    turn_states.invalidate(active_account.id(), &upstream_model, "upstream_312");
-                }
                 if let Some(policy) = websocket_failure_policy {
                     apply_websocket_recovery_policy(
                         &mut failure,
@@ -687,6 +747,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 }
                 apply_failure(&failure_context, &active_account, &failure)
                 .await;
+                capture_business_failure_runtime(
+                    &selector,
+                    &response_header_carry,
+                    &turn_states,
+                    &active_account,
+                    &upstream_model,
+                    &failure,
+                    account_turn_state_enabled,
+                    response_header_carry_token,
+                )
+                .await;
                 Err(quota_continuation_replay_error(
                     failure.error,
                     &request,
@@ -695,14 +766,14 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 return;
             }
         };
-        if account_turn_state_enabled && let Some(state) = response.turn_state.clone() {
-            let _ = turn_states.put(
-                active_account.id(),
-                &upstream_model,
-                state,
-                gateway_admin::model::turn_state::TurnStateSource::UpstreamResponse,
-            );
-        }
+        let response_state = turn_states
+            .business_capture_enabled()
+            .then(|| {
+                response.turn_state.clone().or_else(|| {
+                    turn_states.state_from_headers(&response.response_metadata.client_headers)
+                })
+            })
+            .flatten();
         if !accepts_backend_transport(transport_policy, response.transport) {
             let failure = MappedProviderFailure::plain(provider_error(
                 ProviderErrorKind::Protocol,
@@ -712,6 +783,48 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        if allows_account_state_mutation
+            && !response.set_cookie_headers.is_empty()
+            && let Ok(outcome) = selector
+                .capture_response_cookies(
+                    &active_account,
+                    &response_origin,
+                    &response.set_cookie_headers,
+                )
+                .await
+            && let Some(revision) = outcome.credential_revision
+            && let Ok(current) = selector.current_account(active_account.id()).await
+            && current.revision().get() == revision
+        {
+            active_account = current.with_outbound_proxy(active_account.outbound_proxy().cloned());
+        }
+        response_header_carry.capture(
+            &crate::response_header_carry::ResponseHeaderContext {
+                account_id: active_account.id(),
+                credential_revision: active_account.revision(),
+                model: &upstream_model,
+                proxy: active_account.outbound_proxy(),
+            },
+            response_header_carry_token,
+            gateway_admin::model::turn_state::ResponseHeaderCarrySource::BusinessResponse,
+            response.diagnostics.status_code.unwrap_or(200),
+            &response.response_metadata.response_header_carry_headers,
+        );
+        if account_turn_state_enabled
+            && turn_states.accepts_served_model(
+                &upstream_model,
+                response.response_metadata.effective_model.as_deref(),
+            )
+            && let Some(state) = response_state.clone()
+        {
+            let _ = turn_states.put(
+                active_account.id(),
+                active_account.revision(),
+                &upstream_model,
+                state,
+                gateway_admin::model::turn_state::TurnStateSource::UpstreamResponse,
+            );
         }
         if let Some(capture) = session_capture.as_mut() {
             capture.continuation_scope = Some(if capture.response_store {
@@ -724,7 +837,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 OpenAiContinuationScope::ReplayRequired
             });
             if capture.turn_state.is_some() {
-                capture.turn_state = response.turn_state.clone().or(capture.turn_state.clone());
+                capture.turn_state = response_state.or(capture.turn_state.clone());
             }
         }
         let mut observation_state = OpenAiResponseObservationState::from_backend_response(
@@ -741,21 +854,6 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 error = %error,
                 "OpenAI model ETag observation was rejected"
             );
-        }
-        if allows_account_state_mutation
-            && !response.set_cookie_headers.is_empty()
-            && let Ok(outcome) = selector
-                .capture_response_cookies(
-                    &active_account,
-                    &response_origin,
-                    &response.set_cookie_headers,
-                )
-                .await
-                && let Some(revision) = outcome.credential_revision
-                && let Ok(current) = selector.current_account(active_account.id()).await
-                && current.revision().get() == revision
-        {
-            active_account = current;
         }
         let response_transport = response.transport;
         let websocket_connection_id = response.websocket_connection_id;
@@ -784,8 +882,10 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         let turn_state_capture = AccountTurnStateCapture {
             store: &turn_states,
             account_id: active_account.id(),
+            credential_revision: active_account.revision(),
             model: &upstream_model,
-            enabled: account_turn_state_enabled,
+            enabled: account_turn_state_enabled && turn_states.business_capture_enabled(),
+            proxy: active_account.outbound_proxy(),
         };
         let mut pre_commit_events = PreCommitClientEvents::new();
         loop {
@@ -852,6 +952,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                         &mut observation_state,
                         &mut decoder,
                         &turn_state_capture,
+                        &response_header_carry,
+                        response_header_carry_token,
+                        response.diagnostics.status_code.unwrap_or(200),
                     )
                     .await;
                     let observation_event = if rate_limits_changed || metadata_merge.is_some() {
@@ -895,6 +998,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                     }
                     apply_failure(&failure_context, &active_account, &failure)
                     .await;
+                    capture_business_failure_runtime(
+                        &selector,
+                        &response_header_carry,
+                        &turn_states,
+                        &active_account,
+                        &upstream_model,
+                        &failure,
+                        account_turn_state_enabled,
+                        response_header_carry_token,
+                    )
+                    .await;
                     Err(quota_continuation_replay_error(
                         failure.error,
                         &request,
@@ -927,6 +1041,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
                 &mut observation_state,
                 &mut decoder,
                 &turn_state_capture,
+                &response_header_carry,
+                response_header_carry_token,
+                response.diagnostics.status_code.unwrap_or(200),
             )
             .await;
             let metadata_changed = metadata_merge.unwrap_or(false);
@@ -985,6 +1102,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             }
             if let Some((failure, _)) = terminal_failure.as_ref() {
                 apply_failure(&failure_context, &active_account, failure)
+                .await;
+                capture_business_failure_runtime(
+                    &selector,
+                    &response_header_carry,
+                    &turn_states,
+                    &active_account,
+                    &upstream_model,
+                    failure,
+                    account_turn_state_enabled,
+                    response_header_carry_token,
+                )
                 .await;
             }
             attach_openai_session_update(&mut events, &mut session_capture);
@@ -1098,6 +1226,17 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
         if let Some((failure, _)) = terminal_failure.as_ref() {
             apply_failure(&failure_context, &active_account, failure)
             .await;
+            capture_business_failure_runtime(
+                &selector,
+                &response_header_carry,
+                &turn_states,
+                &active_account,
+                &upstream_model,
+                failure,
+                account_turn_state_enabled,
+                response_header_carry_token,
+            )
+            .await;
         }
         let metadata_changed = merge_response_metadata_updates(
             response_metadata_updates.as_ref(),
@@ -1105,6 +1244,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             &mut observation_state,
             &mut decoder,
             &turn_state_capture,
+            &response_header_carry,
+            response_header_carry_token,
+            response.diagnostics.status_code.unwrap_or(200),
         )
         .await
         .unwrap_or(false);
@@ -1176,30 +1318,55 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
 struct AccountTurnStateCapture<'a> {
     store: &'a crate::turn_state::TurnStateStore,
     account_id: &'a gateway_core::account::ProviderAccountId,
+    credential_revision: gateway_core::account::CredentialRevision,
     model: &'a gateway_core::routing::UpstreamModelId,
     enabled: bool,
+    proxy: Option<&'a gateway_core::account::OutboundProxy>,
 }
 
+#[expect(clippy::too_many_arguments)]
 async fn merge_response_metadata_updates(
     updates: Option<&CodexResponseMetadataUpdates>,
     session_capture: &mut Option<OpenAiSessionCapture>,
     observation_state: &mut OpenAiResponseObservationState,
     decoder: &mut CodexCanonicalDecoder,
     turn_state_capture: &AccountTurnStateCapture<'_>,
+    response_header_carry: &crate::response_header_carry::ResponseHeaderCarryStore,
+    response_header_carry_token: crate::response_header_carry::ResponseHeaderCarryCaptureToken,
+    response_status: u16,
 ) -> Option<bool> {
     let updates = updates?;
     let mut pending = updates.lock().await;
     let turn_state = pending.turn_state.take();
     let reported_model = pending.reported_model.clone();
+    let response_headers = std::mem::take(&mut pending.response_headers);
     drop(pending);
-    if turn_state.is_none() && reported_model.is_none() {
+    if turn_state.is_none() && reported_model.is_none() && response_headers.is_empty() {
         return None;
+    }
+    if !response_headers.is_empty() {
+        response_header_carry.capture(
+            &crate::response_header_carry::ResponseHeaderContext {
+                account_id: turn_state_capture.account_id,
+                credential_revision: turn_state_capture.credential_revision,
+                model: turn_state_capture.model,
+                proxy: turn_state_capture.proxy,
+            },
+            response_header_carry_token,
+            gateway_admin::model::turn_state::ResponseHeaderCarrySource::BusinessResponse,
+            response_status,
+            &response_headers
+                .into_iter()
+                .map(|(name, value)| (name, bytes::Bytes::from(value)))
+                .collect::<Vec<_>>(),
+        );
     }
     let mut changed = false;
     if let Some(turn_state) = turn_state {
         if turn_state_capture.enabled {
             let _ = turn_state_capture.store.put(
                 turn_state_capture.account_id,
+                turn_state_capture.credential_revision,
                 turn_state_capture.model,
                 turn_state.clone(),
                 gateway_admin::model::turn_state::TurnStateSource::UpstreamResponse,

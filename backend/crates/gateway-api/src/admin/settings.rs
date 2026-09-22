@@ -374,6 +374,18 @@ where
             get(turn_state_probe_policy::<S>).post(update_turn_state_probe_policy::<S>),
         )
         .route(
+            "/api/admin/settings/turn-state-probe/defaults",
+            get(turn_state_probe_defaults),
+        )
+        .route(
+            "/api/admin/settings/turn-state-probe/preview",
+            post(preview_turn_state_policy),
+        )
+        .route(
+            "/api/admin/settings/turn-state-probe/runtime",
+            get(turn_state_runtime_status::<S>).post(clear_turn_state_runtime::<S>),
+        )
+        .route(
             "/api/admin/settings/client-profiles/{provider}",
             get(client_profile_options::<S>),
         )
@@ -792,6 +804,13 @@ where
     ))
 }
 
+async fn turn_state_probe_defaults(_auth: AdminAuth) -> impl IntoResponse {
+    AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(gateway_admin::model::turn_state::TurnStateProbePolicy::default()),
+    )
+}
+
 async fn turn_state_probe_policy<S>(
     _auth: AdminAuth,
     State(state): State<S>,
@@ -818,14 +837,74 @@ async fn update_turn_state_probe_policy<S>(
 where
     S: SessionState + Send + Sync,
 {
-    state
+    let saved = state
         .admin_services()
         .settings()
-        .update_turn_state_probe_policy(&auth.context().mutation_context(), policy.clone())
+        .update_turn_state_probe_policy(&auth.context().mutation_context(), policy)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(StatusCode::OK, AdminEnvelope::ok(saved)))
+}
+
+async fn turn_state_runtime_status<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let status = state
+        .admin_services()
+        .settings()
+        .response_header_carry_status()
         .await
         .map_err(map_service_error)?;
     Ok(AdminResponse::new(
         StatusCode::OK,
-        AdminEnvelope::ok(policy),
+        AdminEnvelope::ok(status),
+    ))
+}
+
+async fn clear_turn_state_runtime<S>(
+    auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(command): AdminJson<gateway_admin::model::turn_state::TurnStateRuntimeClear>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    state
+        .admin_services()
+        .settings()
+        .clear_turn_state_runtime(command)
+        .await
+        .map_err(map_service_error)?;
+    let _ = auth;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(serde_json::json!({ "cleared": true })),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnStatePreviewRequest {
+    model: String,
+    policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+}
+async fn preview_turn_state_policy(
+    _auth: AdminAuth,
+    AdminJson(request): AdminJson<TurnStatePreviewRequest>,
+) -> Result<impl IntoResponse, AdminError> {
+    request.policy.validate().map_err(map_service_error)?;
+    let preview = |template: &gateway_admin::model::turn_state::TurnStateProbeRequest| {
+        let headers = template.extra_headers.iter().map(|header| serde_json::json!({"name": header.name, "value": "[configured]", "source": "管理员覆盖"})).collect::<Vec<_>>();
+        serde_json::json!({"body": template.render_body(&request.model), "headers": headers, "automaticHeaders": ["Authorization: [账号凭据]", "ChatGPT-Account-ID: [账号标识]"], "compression": template.compression})
+    };
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(
+            serde_json::json!({"mint": preview(&request.policy.request), "reuse": preview(&request.policy.reuse_request), "reuseContext": "本次铸票的 State 与 Cookie"}),
+        ),
     ))
 }

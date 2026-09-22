@@ -32,6 +32,7 @@ pub(super) struct ReducedWebSocketEvent {
     pub(super) action: ExchangeAction,
     pub(super) diagnostic_event_type: Option<String>,
     pub(super) turn_state_update: Option<String>,
+    pub(super) response_headers: Vec<(String, String)>,
 }
 
 pub(super) fn reduce_websocket_event(
@@ -46,6 +47,7 @@ pub(super) fn reduce_websocket_event(
             action: ExchangeAction::Ignore,
             diagnostic_event_type: None,
             turn_state_update: None,
+            response_headers: Vec::new(),
         });
     };
     let diagnostic_event_type = diagnostic_event_type(websocket_event_type(&value));
@@ -56,12 +58,14 @@ pub(super) fn reduce_websocket_event(
             action: ExchangeAction::RateLimits(parsed),
             diagnostic_event_type,
             turn_state_update: None,
+            response_headers: Vec::new(),
         });
     }
 
+    let response_headers = websocket_metadata_headers(&value);
     response_meta::merge_response_metadata(
         &mut metadata.response_metadata,
-        websocket_metadata_headers(&value),
+        response_headers.clone(),
     );
     if let Some(model) = response_meta::reported_model_from_event(&value) {
         metadata.response_metadata.effective_model = Some(model.to_owned());
@@ -95,6 +99,7 @@ pub(super) fn reduce_websocket_event(
         action,
         diagnostic_event_type,
         turn_state_update,
+        response_headers,
     })
 }
 

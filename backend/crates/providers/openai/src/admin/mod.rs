@@ -1,5 +1,7 @@
 //! OpenAI 管理边界：Provider preparation 与 Redis OAuth pending 适配。
 
+mod verified_probe;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -71,6 +73,7 @@ use crate::credential::{
 use crate::credential::{
     CodexCredentialCodec, CodexOAuthSecret, oauth_owner_ref, parse_access_token_expiration,
 };
+use crate::response_header_carry::{ResponseHeaderCarryStore, ResponseHeaderContext};
 use crate::transport::CodexWebSocketPool;
 use crate::transport::client::read_capped_response_body;
 use crate::transport::profile::{
@@ -87,18 +90,6 @@ use crate::turn_state::{
 
 const PROVIDER_NAME: &str = "openai";
 const PENDING_DOCUMENT_SCHEMA_VERSION: u64 = 3;
-const MAX_TURN_STATE_PROBE_BODY_BYTES: usize = 64 * 1024;
-const TURN_STATE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-
-fn single_turn_state_header(headers: &reqwest::header::HeaderMap) -> Option<&str> {
-    let mut values = headers.get_all("x-codex-turn-state").iter();
-    let value = values.next()?;
-    if values.next().is_some() {
-        return None;
-    }
-    value.to_str().ok()
-}
-
 enum TurnStateProbeIoResult {
     Response { status: u16, state: Option<String> },
     ConnectionFailed,
@@ -125,6 +116,7 @@ struct TurnStateProbeIoExchange {
     status_code: Option<u16>,
     request_headers: Vec<TurnStateProbeHeader>,
     response_headers: Vec<TurnStateProbeHeader>,
+    carry_headers: Vec<(String, bytes::Bytes)>,
     http_version: Option<String>,
 }
 
@@ -138,17 +130,28 @@ fn captured_headers(headers: &reqwest::header::HeaderMap) -> Vec<TurnStateProbeH
         .collect()
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "探测 IO 同时接收请求、响应和策略边界"
+)]
 async fn send_turn_state_probe_request(
     client: &reqwest::Client,
     url: &str,
     mut headers: reqwest::header::HeaderMap,
     body: Vec<u8>,
     capture_headers: bool,
+    compressed: bool,
+    timeout: Duration,
+    max_response_body_bytes: usize,
+    turn_states: &TurnStateStore,
+    requested_model: &UpstreamModelId,
 ) -> TurnStateProbeIoExchange {
-    headers.insert(
-        reqwest::header::CONTENT_ENCODING,
-        reqwest::header::HeaderValue::from_static("zstd"),
-    );
+    if compressed {
+        headers.insert(
+            reqwest::header::CONTENT_ENCODING,
+            reqwest::header::HeaderValue::from_static("zstd"),
+        );
+    }
     let request = match client.post(url).headers(headers).body(body).build() {
         Ok(request) => request,
         Err(_) => {
@@ -157,6 +160,7 @@ async fn send_turn_state_probe_request(
                 status_code: None,
                 request_headers: Vec::new(),
                 response_headers: Vec::new(),
+                carry_headers: Vec::new(),
                 http_version: None,
             };
         }
@@ -166,7 +170,7 @@ async fn send_turn_state_probe_request(
     } else {
         Vec::new()
     };
-    let deadline = tokio::time::Instant::now() + TURN_STATE_PROBE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + timeout;
     let response = match tokio::time::timeout_at(deadline, client.execute(request)).await {
         Ok(Ok(response)) => response,
         Ok(Err(error)) if error.is_timeout() => {
@@ -175,6 +179,7 @@ async fn send_turn_state_probe_request(
                 status_code: None,
                 request_headers,
                 response_headers: Vec::new(),
+                carry_headers: Vec::new(),
                 http_version: None,
             };
         }
@@ -184,6 +189,7 @@ async fn send_turn_state_probe_request(
                 status_code: None,
                 request_headers,
                 response_headers: Vec::new(),
+                carry_headers: Vec::new(),
                 http_version: None,
             };
         }
@@ -193,11 +199,13 @@ async fn send_turn_state_probe_request(
                 status_code: None,
                 request_headers,
                 response_headers: Vec::new(),
+                carry_headers: Vec::new(),
                 http_version: None,
             };
         }
     };
     let status = response.status().as_u16();
+    let carry_headers = crate::transport::response_header_carry_headers(response.headers());
     let response_headers = if capture_headers {
         captured_headers(response.headers())
     } else {
@@ -214,12 +222,22 @@ async fn send_turn_state_probe_request(
             status_code: Some(status),
             request_headers,
             response_headers,
+            carry_headers,
             http_version,
         };
     }
-    let header_state = single_turn_state_header(response.headers())
-        .filter(|value| TurnStateStore::is_valid_state(value))
-        .map(ToOwned::to_owned);
+    let served_model = carry_headers.iter().find_map(|(name, value)| {
+        matches!(
+            name.to_ascii_lowercase().as_str(),
+            "openai-model" | "x-openai-model"
+        )
+        .then(|| std::str::from_utf8(value).ok())
+        .flatten()
+    });
+    let header_state = (turn_states.probe_capture_enabled()
+        && turn_states.accepts_served_model(requested_model, served_model))
+    .then(|| turn_states.state_from_headers(&carry_headers))
+    .flatten();
     if header_state.is_some() {
         return TurnStateProbeIoExchange {
             result: TurnStateProbeIoResult::Response {
@@ -229,12 +247,13 @@ async fn send_turn_state_probe_request(
             status_code: Some(status),
             request_headers,
             response_headers,
+            carry_headers,
             http_version,
         };
     }
     let body = match tokio::time::timeout_at(
         deadline,
-        read_capped_response_body(response, MAX_TURN_STATE_PROBE_BODY_BYTES),
+        read_capped_response_body(response, max_response_body_bytes),
     )
     .await
     {
@@ -245,6 +264,7 @@ async fn send_turn_state_probe_request(
                 status_code: Some(status),
                 request_headers,
                 response_headers,
+                carry_headers,
                 http_version,
             };
         }
@@ -254,6 +274,7 @@ async fn send_turn_state_probe_request(
                 status_code: Some(status),
                 request_headers,
                 response_headers,
+                carry_headers,
                 http_version,
             };
         }
@@ -261,25 +282,27 @@ async fn send_turn_state_probe_request(
     let json = (!body.limit_exceeded())
         .then(|| serde_json::from_str::<Value>(&body.into_string()).ok())
         .flatten();
-    let state = json
-        .as_ref()
-        .and_then(|value| value.get("current_turn_state"))
-        .and_then(Value::as_str)
-        .filter(|value| TurnStateStore::is_valid_state(value))
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            json.as_ref()
-                .and_then(|value| value.get("error"))
-                .and_then(|value| value.get("current_turn_state"))
+    let served_model = served_model.or_else(|| {
+        json.as_ref().and_then(|value| {
+            value
+                .pointer("/response/model")
+                .or_else(|| value.get("model"))
                 .and_then(Value::as_str)
-                .filter(|value| TurnStateStore::is_valid_state(value))
-                .map(ToOwned::to_owned)
-        });
+        })
+    });
+    let state = (turn_states.probe_capture_enabled()
+        && turn_states.accepts_served_model(requested_model, served_model))
+    .then(|| {
+        json.as_ref()
+            .and_then(|value| turn_states.state_from_json(value))
+    })
+    .flatten();
     TurnStateProbeIoExchange {
         result: TurnStateProbeIoResult::Response { status, state },
         status_code: Some(status),
         request_headers,
         response_headers,
+        carry_headers,
         http_version,
     }
 }
@@ -316,6 +339,8 @@ pub(crate) struct OpenAiAdminProvider {
     desktop_release: CodexDesktopReleaseStatus,
     base_url: String,
     turn_states: TurnStateStore,
+    draft_turn_states: TurnStateStore,
+    response_header_carry: ResponseHeaderCarryStore,
     turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureSink>,
 }
 
@@ -327,6 +352,7 @@ pub(crate) struct OpenAiAdminServices {
     pub(crate) catalog: Arc<CodexCredentialCatalogService>,
     pub(crate) base_url: String,
     pub(crate) turn_states: TurnStateStore,
+    pub(crate) response_header_carry: ResponseHeaderCarryStore,
     pub(crate) turn_state_probe_capture: Arc<dyn TurnStateProbeCaptureSink>,
 }
 
@@ -353,6 +379,8 @@ impl OpenAiAdminProvider {
             desktop_release,
             base_url: services.base_url,
             turn_states: services.turn_states,
+            draft_turn_states: TurnStateStore::new(),
+            response_header_carry: services.response_header_carry,
             turn_state_probe_capture: services.turn_state_probe_capture,
         }
     }
@@ -419,6 +447,16 @@ impl OpenAiAdminProvider {
         policy
             .validate()
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        self.turn_states.set_policy(policy.clone());
+        self.response_header_carry
+            .set_policy(policy.response_header_carry.clone());
+        if policy.verification.mode
+            == gateway_admin::model::turn_state::TurnStateVerificationMode::MintAndValidate
+        {
+            return self
+                .probe_verified(account_id, model, targets, trigger, policy, true)
+                .await;
+        }
         if trigger == TurnStateSource::ManualProbe && !policy.manual_enabled {
             return Err(provider_admin_error(ProviderAdminErrorKind::Conflict)
                 .with_public_message("手动状态探测已关闭"));
@@ -446,7 +484,10 @@ impl OpenAiAdminProvider {
             account_id,
             model,
             account.revision(),
-            crate::turn_state::TurnStateProbeCandidates { targets, policy },
+            crate::turn_state::TurnStateProbeCandidates {
+                targets,
+                policy: policy.clone(),
+            },
             account.outbound_proxy(),
             trigger,
         ) {
@@ -521,16 +562,23 @@ impl OpenAiAdminProvider {
                     .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?,
             );
         }
-        let body = serde_json::json!({
-            "model": model.as_str(),
-            "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Reply with exactly OK."}]}],
-            "stream": true,
-            "store": false
-        });
-        let body = serde_json::to_vec(&body)
+        for header in &policy.request.extra_headers {
+            let name = reqwest::header::HeaderName::from_bytes(header.name.as_bytes())
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            let value = reqwest::header::HeaderValue::from_str(&header.value)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+            headers.insert(name, value);
+        }
+        let body = serde_json::to_vec(&policy.request.render_body(model.as_str()))
             .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
-        let body = zstd::stream::encode_all(std::io::Cursor::new(body), 3)
-            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        let compressed = policy.request.compression
+            == gateway_admin::model::turn_state::TurnStateProbeCompression::Zstd;
+        let body = if compressed {
+            zstd::stream::encode_all(std::io::Cursor::new(body), policy.request.compression_level)
+                .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?
+        } else {
+            body
+        };
         let url = endpoint_url(&self.base_url, CODEX_RESPONSES_PATH);
         let candidates = run.candidates().to_vec();
         let mut attempts = Vec::new();
@@ -591,6 +639,15 @@ impl OpenAiAdminProvider {
                 reqwest::header::HeaderName::from_static("x-client-request-id"),
                 request_id_header,
             );
+            let response_header_carry_token = self.response_header_carry.inject(
+                &ResponseHeaderContext {
+                    account_id,
+                    credential_revision: current.revision(),
+                    model,
+                    proxy: target.proxy.as_ref(),
+                },
+                &mut request_headers,
+            );
             let attempt_started = Instant::now();
             let attempt_started_at = Utc::now();
             let capture_enabled = self.turn_state_probe_capture.enabled();
@@ -602,6 +659,11 @@ impl OpenAiAdminProvider {
                     request_headers,
                     body.clone(),
                     capture_enabled,
+                    compressed,
+                    Duration::from_secs(policy.schedule.request_timeout_seconds),
+                    policy.request.max_response_body_bytes as usize,
+                    &self.turn_states,
+                    model,
                 )
                 .await
             };
@@ -612,8 +674,23 @@ impl OpenAiAdminProvider {
                 status_code,
                 request_headers,
                 response_headers,
+                carry_headers,
                 http_version,
             } = exchange;
+            if let Some(status) = status_code {
+                self.response_header_carry.capture(
+                    &ResponseHeaderContext {
+                        account_id,
+                        credential_revision: current.revision(),
+                        model,
+                        proxy: target.proxy.as_ref(),
+                    },
+                    response_header_carry_token,
+                    gateway_admin::model::turn_state::ResponseHeaderCarrySource::TurnStateProbe,
+                    status,
+                    &carry_headers,
+                );
+            }
             let exchange_id = if capture_enabled {
                 let id = Uuid::now_v7().to_string();
                 let capture = TurnStateProbeExchangeCapture {
@@ -827,6 +904,7 @@ impl ProviderAdmin for OpenAiAdminProvider {
     async fn account_unavailable(&self, account_id: &ProviderAccountId) {
         self.websocket_pool.evict_account(account_id.as_str()).await;
         self.turn_states.remove_account(account_id);
+        self.response_header_carry.remove_account(account_id);
     }
 
     async fn account_facts_changed(&self, account_ids: &[ProviderAccountId]) {
@@ -853,6 +931,27 @@ impl ProviderAdmin for OpenAiAdminProvider {
     ) -> Result<TurnStateProbeResult, ProviderAdminError> {
         self.probe_turn_state_impl(account_id, model, targets, trigger, policy)
             .await
+    }
+
+    async fn test_turn_state_policy(
+        &self,
+        account_id: &ProviderAccountId,
+        model: &UpstreamModelId,
+        targets: Vec<TurnStateProbeTarget>,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+    ) -> Result<TurnStateProbeResult, ProviderAdminError> {
+        policy
+            .validate()
+            .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Invalid))?;
+        self.probe_verified(
+            account_id,
+            model,
+            targets,
+            TurnStateSource::ManualProbe,
+            policy,
+            false,
+        )
+        .await
     }
 
     async fn http_probe_headers(
@@ -907,6 +1006,37 @@ impl ProviderAdmin for OpenAiAdminProvider {
 
     fn due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
         self.turn_states.due_subjects()
+    }
+
+    fn claim_due_turn_state_subjects(&self) -> Vec<TurnStateProbeSubject> {
+        self.turn_states.claim_due_subjects()
+    }
+
+    fn apply_turn_state_probe_policy(
+        &self,
+        policy: gateway_admin::model::turn_state::TurnStateProbePolicy,
+    ) {
+        self.turn_states.set_policy(policy.clone());
+        self.response_header_carry
+            .set_policy(policy.response_header_carry);
+    }
+
+    fn response_header_carry_status(
+        &self,
+    ) -> gateway_admin::model::turn_state::ResponseHeaderCarryStatus {
+        self.response_header_carry.status()
+    }
+
+    fn clear_turn_state_runtime(
+        &self,
+        command: &gateway_admin::model::turn_state::TurnStateRuntimeClear,
+    ) {
+        if command.response_headers {
+            self.response_header_carry.clear(command);
+        }
+        if command.turn_state || command.response_headers {
+            self.turn_states.clear_runtime(command);
+        }
     }
 
     fn connection_test_operation(

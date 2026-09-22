@@ -188,6 +188,74 @@ pub struct HttpProxyProbe {
 type ProxyClientBuilder =
     dyn Fn(reqwest::ClientBuilder) -> Result<reqwest::Client, &'static str> + Send + Sync;
 
+fn proxy_connection_failure(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        return "代理连接超时";
+    }
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    let mut fallback = "代理连接失败，请检查地址、认证和网络";
+    // reqwest 未公开 SOCKS 错误类型，只匹配锁定依赖的固定错误文本。
+    // 原错误可能包含 URL 或认证数据，绝不能直接作为管理端提示返回。
+    for _ in 0..16 {
+        let Some(cause) = source else { break };
+        let message = cause.to_string().to_ascii_lowercase();
+        match message.as_str() {
+            "socks error: credentials not accepted" => {
+                return "SOCKS5 认证被代理拒绝，请检查用户名、密码及服务商授权条件";
+            }
+            "socks error: server does not support user/pass authentication"
+            | "socks error: server implements authentication incorrectly" => {
+                return "SOCKS5 认证方式协商失败，请核对代理协议和端口";
+            }
+            "socks error: connection not allowed" => {
+                return "SOCKS5 代理拒绝连接检测目标，请检查服务商访问规则";
+            }
+            "socks error: network unreachable" | "socks error: host unreachable" => {
+                return "SOCKS5 代理报告目标不可达，请检查出口资源和目标域名解析";
+            }
+            "socks error: connection refused" => {
+                return "SOCKS5 代理报告目标连接被拒绝";
+            }
+            "socks error: general server failure" => return "SOCKS5 代理报告服务端故障",
+            "socks error: command not supported" | "socks error: address type not supported" => {
+                return "SOCKS5 代理不支持本次连接命令或目标地址类型";
+            }
+            "socks error: ttl expired" => return "SOCKS5 代理报告连接存活时间已耗尽",
+            "socks error: failed parsing server response" => {
+                return "SOCKS5 握手响应格式错误，请核对代理协议和端口";
+            }
+            "socks error: io error during socks handshake" => {
+                return "SOCKS5 握手期间连接中断，请检查代理服务和网络";
+            }
+            "dns error" | "error resolving for socks proxy" => {
+                return "代理或检测目标域名解析失败";
+            }
+            _ => {}
+        }
+        if message.contains("certificate") {
+            return "代理测试的 TLS 证书校验失败，请检查证书信任配置";
+        }
+        if message.contains("tls") || message.contains("ssl") {
+            fallback = "代理测试的 TLS 握手失败，请检查代理转发链路和目标访问限制";
+        } else if message.contains("unexpected eof") || message.contains("connection reset") {
+            fallback = "连接被提前关闭，未取得出口检测响应，请检查代理转发链路";
+        }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => {
+                    return "代理 TCP 连接被拒绝，请核对地址和端口";
+                }
+                std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset => {
+                    fallback = "连接被提前关闭，未取得出口检测响应，请检查代理转发链路";
+                }
+                _ => {}
+            }
+        }
+        source = cause.source();
+    }
+    fallback
+}
+
 impl Default for HttpProxyProbe {
     fn default() -> Self {
         // 分别向 IPv4 和 IPv6 专用端点并发探测，以获取真实的双栈出口地址。
@@ -243,13 +311,11 @@ impl HttpProxyProbe {
             .timeout(Duration::from_secs(12))
             .redirect(reqwest::redirect::Policy::none());
         let client = (self.build_client)(builder)?;
-        let mut response = client.get(endpoint).send().await.map_err(|error| {
-            if error.is_timeout() {
-                "代理连接超时"
-            } else {
-                "代理连接失败，请检查地址、认证和网络"
-            }
-        })?;
+        let mut response = client
+            .get(endpoint)
+            .send()
+            .await
+            .map_err(|error| proxy_connection_failure(&error))?;
         if !response.status().is_success() {
             return Err(
                 if response.status() == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED {

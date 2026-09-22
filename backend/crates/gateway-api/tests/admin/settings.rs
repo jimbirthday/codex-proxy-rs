@@ -1068,7 +1068,39 @@ async fn turn_state_policy_routes_require_auth_and_round_trip_validated_settings
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
-    let policy = json!({"manualEnabled":false,"automaticEnabled":true,"mode":"pool","proxyIds":["proxy-b","proxy-c"],"candidateLimit":2});
+    let policy = json!({
+        "manualEnabled": false,
+        "automaticEnabled": true,
+        "mode": "pool",
+        "proxyIds": ["proxy-b", "proxy-c"],
+        "candidateLimit": 2,
+        "responseHeaderCarry": {
+            "rules": [{
+                "id": "cookie_bundle",
+                "name": "Cookie bundle",
+                "enabled": true,
+                "captureEnabled": true,
+                "injectionEnabled": true,
+                "clearOnDisable": false,
+                "sources": ["business_response", "turn_state_probe"],
+                "sourceHeader": "set-cookie",
+                "targetHeader": "cookie",
+                "transform": "set_cookie_to_cookie",
+                "valueSelection": "all",
+                "mergeMode": "replace",
+                "scope": "account_model",
+                "accountIds": [],
+                "models": [],
+                "ttlSeconds": 3600,
+                "missingBehavior": "keep",
+                "captureStatusMin": 200,
+                "captureStatusMax": 299,
+                "invalidationStatuses": [401, 403],
+                "maxValueBytes": 8192,
+                "maxValues": 16
+            }]
+        }
+    });
     let response = app
         .clone()
         .oneshot(request(
@@ -1079,7 +1111,19 @@ async fn turn_state_policy_routes_require_auth_and_round_trip_validated_settings
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response_json(response).await["data"], policy);
+    let saved_policy = response_json(response).await["data"].clone();
+    assert_eq!(saved_policy["manualEnabled"], policy["manualEnabled"]);
+    assert_eq!(saved_policy["automaticEnabled"], policy["automaticEnabled"]);
+    assert_eq!(saved_policy["mode"], policy["mode"]);
+    assert_eq!(saved_policy["proxyIds"], policy["proxyIds"]);
+    assert_eq!(saved_policy["candidateLimit"], policy["candidateLimit"]);
+    assert!(saved_policy["schedule"].is_object());
+    assert!(saved_policy["request"].is_object());
+    assert!(saved_policy["state"].is_object());
+    assert_eq!(
+        saved_policy["responseHeaderCarry"],
+        policy["responseHeaderCarry"]
+    );
     let response = app
         .clone()
         .oneshot(request(
@@ -1089,7 +1133,7 @@ async fn turn_state_policy_routes_require_auth_and_round_trip_validated_settings
         ))
         .await
         .unwrap();
-    assert_eq!(response_json(response).await["data"], policy);
+    assert_eq!(response_json(response).await["data"], saved_policy);
     for (invalid, status) in [
         (json!({"mode":"direct"}), StatusCode::UNPROCESSABLE_ENTITY),
         (
@@ -1112,4 +1156,58 @@ async fn turn_state_policy_routes_require_auth_and_round_trip_validated_settings
             .unwrap();
         assert_eq!(response.status(), status);
     }
+}
+
+#[tokio::test]
+async fn verified_probe_defaults_and_preview_require_auth_and_redact_headers() {
+    let fixture = AdminTestFixture::new().await;
+    fixture.auth.insert_session("valid-session");
+    let app = app(fixture.state());
+    for (method, path) in [
+        (Method::GET, "/api/admin/settings/turn-state-probe/defaults"),
+        (Method::POST, "/api/admin/settings/turn-state-probe/preview"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+    let response = app
+        .clone()
+        .oneshot(request(
+            Method::GET,
+            "/api/admin/settings/turn-state-probe/defaults",
+            None,
+        ))
+        .await
+        .unwrap();
+    let mut policy = response_json(response).await["data"].clone();
+    assert_eq!(policy["verification"]["mode"], "mint_and_validate");
+    assert_eq!(policy["verification"]["reuseCount"], 3);
+    policy["request"]["extraHeaders"] =
+        json!([{"name":"Authorization","value":"synthetic-preview-secret"}]);
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/api/admin/settings/turn-state-probe/preview",
+            Some(json!({"model":"gpt-preview", "policy":policy})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let preview = response_json(response).await;
+    assert_eq!(preview["data"]["mint"]["body"]["model"], "gpt-preview");
+    assert!(!preview.to_string().contains("synthetic-preview-secret"));
+    assert_eq!(
+        preview["data"]["mint"]["headers"][0]["value"],
+        "[configured]"
+    );
 }

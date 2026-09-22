@@ -338,6 +338,8 @@ fn websocket_opening_error(response: &WsResponse<Option<Vec<u8>>>) -> CodexWebSo
         .get("content-type")
         .map(|value| value.as_bytes().to_vec());
     let client_headers = response_meta::client_headers(response.headers());
+    let response_header_carry_headers =
+        response_meta::response_header_carry_headers(response.headers());
     let retry_after_seconds = response
         .headers()
         .get("retry-after")
@@ -355,6 +357,7 @@ fn websocket_opening_error(response: &WsResponse<Option<Vec<u8>>>) -> CodexWebSo
                     status,
                     content_type,
                     client_headers,
+                    response_header_carry_headers,
                     raw_body,
                 ))
             }),

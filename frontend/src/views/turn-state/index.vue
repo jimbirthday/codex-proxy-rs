@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import { Activity, Clock3, DatabaseZap, PlayCircle, RefreshCw, RotateCw, ShieldCheck } from '@lucide/vue'
-import { computed } from 'vue'
+import { computed, shallowRef } from 'vue'
 
+import { clearTurnStateRuntime } from '@/api/modules/turn-state-policy'
 import BaseButton from '@/components/base/BaseButton.vue'
 import BaseCard from '@/components/base/BaseCard.vue'
 import BaseIconButton from '@/components/base/BaseIconButton.vue'
 import BasePageHeader from '@/components/base/BasePageHeader.vue'
 import BaseSelect from '@/components/base/BaseSelect.vue'
+import { toast } from '@/components/base/BaseToast'
+import { errorMessage } from '@/utils/async'
 import { formatDateTime } from '@/utils/date'
 import TurnStateOverview from './TurnStateOverview.vue'
 import TurnStatePolicyCard from './TurnStatePolicyCard.vue'
@@ -35,8 +38,10 @@ const {
   loadAccounts,
   loadOverview,
   loadModels,
+  loadSnapshot,
   runProbe,
 } = useTurnStateProbe()
+const clearingState = shallowRef(false)
 
 function refreshOverview() {
   void loadAccounts()
@@ -77,6 +82,29 @@ function invalidationMessage(reason: string | null | undefined) {
     ? '上游返回 312，当前模型的 State 已失效'
     : '当前模型的 State 已失效'
 }
+
+async function clearSelectedState() {
+  if (!selectedAccountId.value || !selectedModelId.value || clearingState.value)
+    return
+  clearingState.value = true
+  error.value = ''
+  try {
+    await clearTurnStateRuntime({
+      accountId: selectedAccountId.value,
+      model: selectedModelId.value,
+      responseHeaders: false,
+      turnState: true,
+    })
+    await Promise.all([loadSnapshot(), loadOverview()])
+    toast.success('所选账号与模型的 Turn State 已清空')
+  }
+  catch (cause) {
+    error.value = errorMessage(cause, '清空 Turn State 失败')
+  }
+  finally {
+    clearingState.value = false
+  }
+}
 </script>
 
 <template>
@@ -103,7 +131,7 @@ function invalidationMessage(reason: string | null | undefined) {
       </template>
     </BasePageHeader>
 
-    <TurnStatePolicyCard @manual-enabled="manualEnabled = $event" />
+    <TurnStatePolicyCard :account-id="selectedAccountId" :model="selectedModelId" @manual-enabled="manualEnabled = $event" />
 
     <TurnStateOverview
       :accounts="accounts"
@@ -176,6 +204,11 @@ function invalidationMessage(reason: string | null | undefined) {
       </BaseCard>
 
       <BaseCard title="当前状态" :description="selectedModelId || '等待选择模型'">
+        <template #actions>
+          <BaseButton size="sm" variant="ghost" :loading="clearingState" :disabled="!selectedAccountId || !selectedModelId || !snapshot" @click="clearSelectedState">
+            清空当前 State
+          </BaseButton>
+        </template>
         <div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-3" aria-live="polite" :aria-busy="loadingSnapshot || undefined">
           <div class="min-h-23 rounded-cp bg-cp-fill-quaternary px-3.5 py-3">
             <span class="inline-flex items-center gap-2 text-cp-xs font-heavy text-cp-text-quaternary">

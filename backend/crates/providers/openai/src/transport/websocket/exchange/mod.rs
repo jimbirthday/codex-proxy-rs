@@ -61,6 +61,8 @@ pub struct CodexWebSocketResponseMetadataUpdate {
     pub turn_state: Option<String>,
     /// 当前响应最新的服务端模型报告。
     pub reported_model: Option<String>,
+    /// 请求级 metadata 中的安全响应头，供账号内续带规则消费。
+    pub response_headers: Vec<(String, String)>,
 }
 
 pub type CodexWebSocketResponseMetadataUpdates = Arc<Mutex<CodexWebSocketResponseMetadataUpdate>>;

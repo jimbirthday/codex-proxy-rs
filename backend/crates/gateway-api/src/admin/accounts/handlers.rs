@@ -10,6 +10,10 @@ where
     S: SessionState + Clone + Send + Sync + 'static,
 {
     Router::new()
+        .route(
+            "/api/admin/accounts/turn-state/test",
+            post(test_turn_state_policy::<S>),
+        )
         .merge(super::import_tasks::router::<S>())
         .merge(super::free_probe::router::<S>())
         .route("/api/admin/accounts", get(list_accounts::<S>))
@@ -829,5 +833,31 @@ where
     Ok(AdminResponse::new(
         StatusCode::OK,
         AdminEnvelope::ok(TurnStateProbeExchangeDetailData::from_detail(detail, true)),
+    ))
+}
+
+async fn test_turn_state_policy<S>(
+    _auth: AdminAuth,
+    State(state): State<S>,
+    AdminJson(request): AdminJson<TurnStateDraftRequest>,
+) -> Result<impl IntoResponse, AdminError>
+where
+    S: SessionState + Send + Sync,
+{
+    let (account_id, model) = TurnStateRequest {
+        account_id: request.account_id,
+        model_id: request.model,
+    }
+    .into_command()
+    .map_err(map_wire_error)?;
+    let result = state
+        .admin_services()
+        .accounts()
+        .test_turn_state_policy(account_id, model, request.policy)
+        .await
+        .map_err(map_service_error)?;
+    Ok(AdminResponse::new(
+        StatusCode::OK,
+        AdminEnvelope::ok(TurnStateProbeData::from(result)),
     ))
 }
