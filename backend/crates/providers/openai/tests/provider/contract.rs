@@ -9567,6 +9567,7 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
         }
         assert_eq!(request.headers["originator"], "codex_cli_rs");
         assert_eq!(request.headers["version"], "0.144.0");
+        assert!(!request.headers.contains_key("x-codex-routing-hint"));
         assert_eq!(
             request.headers["user-agent"],
             wire_profile().snapshot().user_agent()
@@ -9591,6 +9592,7 @@ async fn api_key_default_http_uses_own_prefix_plain_json_and_only_own_authentica
             );
             assert_eq!(model_request.headers["originator"], "codex_cli_rs");
             assert_eq!(model_request.headers["version"], "0.144.0");
+            assert!(!model_request.headers.contains_key("x-codex-routing-hint"));
             for header in ["cookie", "chatgpt-account-id"] {
                 assert!(
                     !model_request.headers.contains_key(header),
@@ -9777,6 +9779,7 @@ async fn api_key_websocket_uses_api_path_and_bearer_without_oauth_identity() {
                 assert!(!request.headers().contains_key("cookie"));
                 assert_eq!(request.headers()["originator"], "codex_cli_rs");
                 assert_eq!(request.headers()["version"], "0.144.0");
+                assert!(!request.headers().contains_key("x-codex-routing-hint"));
                 assert_eq!(
                     request.headers()["user-agent"],
                     wire_profile().snapshot().user_agent()

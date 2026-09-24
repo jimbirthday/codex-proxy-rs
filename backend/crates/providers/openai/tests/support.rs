@@ -980,6 +980,7 @@ pub(crate) fn profile(account_id: &str) -> CodexAccountProfile {
         chatgpt_user_id: format!("user-{account_id}"),
         email: Some(format!("{account_id}@example.com")),
         plan_type: Some("pro".to_owned()),
+        is_fedramp_account: false,
         access_token_expires_at: Some(now + chrono::Duration::hours(1)),
     }
 }

@@ -73,6 +73,7 @@ pub fn build_profile_avatar_request(
     base_url: &str,
     profile: &CodexWireProfile,
     source: &str,
+    is_fedramp_account: bool,
     context: CodexRequestContext<'_>,
 ) -> Result<Request, CodexProfileAvatarFetchError> {
     let source = Url::parse(source).map_err(|_| CodexProfileAvatarFetchError::InvalidSource)?;
@@ -90,9 +91,10 @@ pub fn build_profile_avatar_request(
                 base_url,
                 &format!("{PROVIDER_AVATAR_PATH_PREFIX}{opaque_path}"),
             );
-            let headers =
+            let mut headers =
                 build_codex_download_headers(profile, context.authorization, context.account_id)
                     .map_err(|_| CodexProfileAvatarFetchError::TransportUnavailable)?;
+            super::headers::insert_fedramp_header(&mut headers, is_fedramp_account);
             client.get(target).headers(headers)
         }
         AUTH0_AVATAR_ORIGIN => {
@@ -119,9 +121,17 @@ pub async fn fetch_profile_avatar(
     base_url: &str,
     profile: &CodexWireProfile,
     source: &str,
+    is_fedramp_account: bool,
     context: CodexRequestContext<'_>,
 ) -> Result<CodexProfileAvatar, CodexProfileAvatarFetchError> {
-    let request = build_profile_avatar_request(client, base_url, profile, source, context)?;
+    let request = build_profile_avatar_request(
+        client,
+        base_url,
+        profile,
+        source,
+        is_fedramp_account,
+        context,
+    )?;
     let response = timeout(PROFILE_AVATAR_HEADERS_TIMEOUT, client.execute(request))
         .await
         .map_err(|_| CodexProfileAvatarFetchError::TransportUnavailable)?

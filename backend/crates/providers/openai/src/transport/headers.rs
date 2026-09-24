@@ -30,6 +30,8 @@ pub(super) fn is_managed_identity_header(name: &str) -> bool {
             | "chatgpt-project-id"
             | "openai-organization"
             | "openai-project"
+            | "x-openai-fedramp"
+            | "x-openai-account-routing-override"
             // 安装身份由当前账号写入 client_metadata，不继承下游安装头。
             | "x-codex-installation-id"
     )
@@ -113,6 +115,7 @@ impl CodexBackendClient {
             OpenAiUpstreamProtocol::ResponsesApi => (None, None),
         };
         let mut headers = build_codex_model_headers(profile, context.authorization, account_id)?;
+        insert_fedramp_header(&mut headers, self.is_fedramp_account);
         insert_optional_header(&mut headers, "cookie", cookie_header)?;
         Ok(headers)
     }
@@ -126,6 +129,7 @@ impl CodexBackendClient {
             context.authorization,
             context.account_id,
         )?;
+        insert_fedramp_header(&mut headers, self.is_fedramp_account);
         insert_optional_header(&mut headers, "cookie", context.cookie_header)?;
         Ok(headers)
     }
@@ -143,6 +147,7 @@ impl CodexBackendClient {
             X_OPENAI_INTERNAL_CODEX_RESPONSES_LITE_HEADER,
             request.responses_lite.as_deref(),
         );
+        insert_optional_protocol_header(&mut headers, "x-codex-turn-state", context.turn_state);
         headers.extend(request.admin_headers.clone());
         Ok(headers)
     }
@@ -157,6 +162,11 @@ impl CodexBackendClient {
             HeaderName::from_static("openai-beta"),
             HeaderValue::from_static("responses_websockets=2026-02-06"),
         );
+        insert_optional_protocol_header(
+            &mut headers,
+            "x-responsesapi-include-timing-metrics",
+            context.include_timing_metrics,
+        );
         headers.extend(request.admin_headers.clone());
         Ok(headers)
     }
@@ -168,6 +178,7 @@ impl CodexBackendClient {
         context: CodexRequestContext<'_>,
     ) -> CodexClientResult<HeaderMap> {
         let mut headers = self.model_request_headers(&self.profile.snapshot(), context)?;
+        self.insert_workspace_routing_header(&mut headers);
         headers.insert(
             HeaderName::from_static("x-client-request-id"),
             HeaderValue::from_str(context.request_id)?,
@@ -184,13 +195,8 @@ impl CodexBackendClient {
             ("session-id", context.session_id),
             ("thread-id", context.thread_id),
             ("x-codex-window-id", context.codex_window_id),
-            ("x-codex-turn-state", context.turn_state),
             ("x-codex-turn-metadata", context.turn_metadata),
             ("x-codex-beta-features", context.beta_features),
-            (
-                "x-responsesapi-include-timing-metrics",
-                context.include_timing_metrics,
-            ),
             ("x-codex-parent-thread-id", context.parent_thread_id),
             (
                 X_OPENAI_MEMGEN_REQUEST_HEADER,
@@ -202,13 +208,45 @@ impl CodexBackendClient {
         if let Some(subagent) = openai_subagent_from_metadata(request.client_metadata()) {
             insert_optional_protocol_header(&mut headers, "x-openai-subagent", Some(&subagent));
         }
-        let routing_hint = match request.service_tier() {
-            Some(tier) => format!("model={};tier={tier}", request.model()),
-            None => format!("model={}", request.model()),
-        };
-        insert_optional_protocol_header(&mut headers, "x-codex-routing-hint", Some(&routing_hint));
+        let guardian_reviewer = request
+            .passthrough_headers
+            .get("x-codex-guardian")
+            .is_some_and(|value| value.as_bytes() == b"reviewer");
+        if self.protocol == OpenAiUpstreamProtocol::Codex && !guardian_reviewer {
+            let routing_hint = match request.service_tier() {
+                Some(tier) => format!("model={};tier={tier}", request.model()),
+                None => format!("model={}", request.model()),
+            };
+            insert_optional_protocol_header(
+                &mut headers,
+                "x-codex-routing-hint",
+                Some(&routing_hint),
+            );
+        }
         append_passthrough_headers(&mut headers, request);
         Ok(headers)
+    }
+
+    pub(super) fn insert_workspace_routing_header(&self, headers: &mut HeaderMap) {
+        if self.protocol != OpenAiUpstreamProtocol::Codex {
+            return;
+        }
+        let Some(value) = self
+            .workspace_routing
+            .as_ref()
+            .and_then(|routing| routing.routing_override.as_deref())
+        else {
+            return;
+        };
+        // 路由值在 discovery 阶段已收敛为官方允许的两个静态值。
+        headers.insert(
+            HeaderName::from_static("x-openai-account-routing-override"),
+            HeaderValue::from_static(match value {
+                "us" => "us",
+                "us_cr" => "us_cr",
+                _ => return,
+            }),
+        );
     }
 }
 
@@ -224,6 +262,8 @@ fn append_passthrough_headers(headers: &mut HeaderMap, request: &CodexResponsesR
                 | "chatgpt-account-id"
                 | "cookie"
                 | "x-openai-internal-codex-residency"
+                | "x-openai-fedramp"
+                | "x-openai-account-routing-override"
                 | "openai-beta"
                 | "accept"
                 | "content-type"
@@ -241,6 +281,15 @@ fn append_passthrough_headers(headers: &mut HeaderMap, request: &CodexResponsesR
         for value in request.passthrough_headers.get_all(name) {
             headers.append(name.clone(), value.clone());
         }
+    }
+}
+
+pub(crate) fn insert_fedramp_header(headers: &mut HeaderMap, is_fedramp_account: bool) {
+    if is_fedramp_account {
+        headers.insert(
+            HeaderName::from_static("x-openai-fedramp"),
+            HeaderValue::from_static("true"),
+        );
     }
 }
 

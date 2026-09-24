@@ -861,6 +861,7 @@ pub(super) fn map_client_error(
         | CodexClientError::RequestBodyEncode(_)
         | CodexClientError::RequestCompression(_)
         | CodexClientError::ModelCatalog(_)
+        | CodexClientError::WorkspaceRouting
         | CodexClientError::CustomCa(_) => MappedProviderFailure::plain(provider_error(
             ProviderErrorKind::Protocol,
             UpstreamSendState::NotSent,
@@ -1061,6 +1062,11 @@ fn client_diagnostic(error: &CodexClientError) -> Option<ProviderDiagnostic> {
             "prepare",
             "model_catalog_invalid",
             "OpenAI model catalog validation failed".to_owned(),
+        ),
+        CodexClientError::WorkspaceRouting => (
+            "prepare",
+            "workspace_routing_invalid",
+            "OpenAI workspace routing discovery failed validation".to_owned(),
         ),
         CodexClientError::Upstream { .. } => return None,
     };

@@ -691,6 +691,7 @@ impl CodexCredentialCatalogService {
                     detail: error.to_string(),
                 })?
                 .with_authentication(&credential.authentication)
+                .with_fedramp_account(credential.is_fedramp_account)
                 .fetch_models_with_context(
                     CodexRequestContext::auxiliary(
                         authorization.expose_secret(),

@@ -751,6 +751,7 @@ impl CodexCredentialSelector {
                                     .is_none_or(|expires| expires > chrono::Utc::now())
                                     && self.cookie_policy.may_replay(
                                         request.request_url,
+                                        &cookie.name,
                                         &cookie.domain,
                                         &cookie.path,
                                         cookie.host_only,
@@ -775,6 +776,7 @@ impl CodexCredentialSelector {
                         }
                         return Ok(CodexCredentialLease {
                             installation_id: runtime.installation_id,
+                            is_fedramp_account: runtime.is_fedramp_account,
                             account,
                             authentication: runtime.authentication,
                             cookies,
@@ -1423,6 +1425,7 @@ pub struct CodexCredentialLease {
     authentication: CodexRuntimeAuthentication,
     cookies: Vec<RuntimeCodexCookie>,
     installation_id: String,
+    is_fedramp_account: bool,
     cyber_policy_scope: Option<CodexCyberPolicyScope>,
     allows_account_state_mutation: bool,
     affinity_telemetry: AffinityTelemetry,
@@ -1455,6 +1458,11 @@ impl CodexCredentialLease {
     #[must_use]
     pub fn installation_id(&self) -> &str {
         &self.installation_id
+    }
+
+    #[must_use]
+    pub const fn is_fedramp_account(&self) -> bool {
+        self.is_fedramp_account
     }
 
     #[must_use]
@@ -1506,6 +1514,7 @@ impl fmt::Debug for CodexCredentialLease {
             .field("authentication", &"<redacted>")
             .field("cookies", &self.cookies)
             .field("installation_id", &"<pseudonymous>")
+            .field("is_fedramp_account", &self.is_fedramp_account)
             .finish()
     }
 }

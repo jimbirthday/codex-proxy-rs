@@ -179,6 +179,11 @@ API Key 与 OAuth 共用模拟客户端画像（`User-Agent`、`originator`、`v
 包括会话、线程、Lite 和其他业务扩展头。
 上游认证只来自选中的账号；API Key 不携带 OAuth Cookie、ChatGPT 账号身份或下游的
 `X-OpenAI-Actor-Authorization` 托管认证声明。
+OAuth/Codex Responses 与 compaction 会在官方基址上通过 `accounts/check` 发现账号 workspace：只接受唯一
+账号匹配和 HTTPS origin，替换 origin 时保留 `/backend-api` 路径；`us` / `us_cr` 生成
+`x-openai-account-routing-override`，`NO_CONSTRAINT` 不生成。发现缓存和 WebSocket 连接按账号出口、凭据
+revision、实际 origin 与路由值隔离。下游同名路由头和 `x-oai-attestation` 不会透传；服务端未配置可信的
+设备证明生成器时不发送 attestation。
 
 Responses 也不透传 `x-stainless-*`、`Origin`、`Referer`、`sec-ch-ua*` 和 `sec-fetch-*`
 携带的下游 SDK/浏览器环境或页面来源。过滤规则适用于所有下游客户端，与 User-Agent 无关；
@@ -619,7 +624,8 @@ HTTP 客户端负责合法协议编码，报头观测不包含 HTTP/2 伪头、T
 OpenAI/Codex Provider 按 OAuth 账号与实际上游模型维护隔离的内存态 `current_turn_state`。只有恰好一个、
 原始长度为 292 字节且可作为 HTTP HeaderValue 的 `x-codex-turn-state` 才会进入缓存；成功采集后固定保留
 1 小时，读取不会续期。后续 Responses HTTP/SSE 与 WebSocket 请求在账号和模型选择完成后，若客户端没有
-同一 turn 的 state，则通过 `x-codex-turn-state` 请求头注入精确匹配的缓存值。上游返回 312 时只清除当前
+同一 turn 的 state；HTTP/SSE 通过 `x-codex-turn-state` 请求头注入，WebSocket 通过首个
+`response.create.client_metadata.x-codex-turn-state` 注入。上游返回 312 时只清除当前
 账号与模型的状态；服务重启会清空运行态，核心 state 缓存不会写入 PostgreSQL、Redis、审计或日志。
 
 管理端从所选账号的实时模型目录取得 `modelId`，不在前后端写死探测模型。

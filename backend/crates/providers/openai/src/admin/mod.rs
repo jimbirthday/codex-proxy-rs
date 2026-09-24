@@ -538,6 +538,10 @@ impl OpenAiAdminProvider {
             account.upstream_account_id(),
         )
         .map_err(|_| provider_admin_error(ProviderAdminErrorKind::Internal))?;
+        crate::transport::headers::insert_fedramp_header(
+            &mut headers,
+            credential.is_fedramp_account,
+        );
         headers.insert(
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),

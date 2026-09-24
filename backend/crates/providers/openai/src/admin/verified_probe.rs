@@ -303,6 +303,7 @@ impl OpenAiAdminProvider {
             reqwest::header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         );
+        crate::transport::headers::insert_fedramp_header(&mut base, credential.is_fedramp_account);
         base.insert(
             reqwest::header::ACCEPT,
             HeaderValue::from_static("text/event-stream"),

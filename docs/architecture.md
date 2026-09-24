@@ -214,6 +214,11 @@ OpenAI 模型目录用于发现，不因目录缺项拒绝请求；管理员配�
 - OpenAI 是透明边界。Responses 请求保留未知字段和字段顺序；SSE、WebSocket、Images 与 standalone
   Search 的业务正文按原始字节转发，原生续写额度恢复遵循下述 continuation 例外。
   canonical facts 从同一数据旁路提取，用于路由、恢复判断、观测和计费。
+- OAuth/Codex Responses 与 compaction 在官方基址上先按账号调用 `accounts/check`。唯一匹配的 workspace
+  可替换上游 origin，但保留 `/backend-api` 路径；只有官方值 `us` / `us_cr` 会生成
+  `x-openai-account-routing-override`。发现结果按账号出口和凭据 revision 隔离，WebSocket 池同时按实际
+  origin、路由值、连接画像及 revision 隔离。下游提供的同名路由头和 `x-oai-attestation` 均不透传；
+  当前网关没有设备证明生成器，因此不会伪造 attestation。
 - Responses 的业务扩展头保留原始多值字节。API 负责剥离鉴权、账号身份和 HTTP 传输字段，
   并提取会话语义；`gateway-protocol` 共享 HTTP 传输与网关链路字段分类。客户端兼容规则集中在
   `providers/openai/src/transport/downstream/`：`headers.rs` 管理下游环境头和已提取语义的头部别名，
@@ -290,8 +295,9 @@ OpenAI Provider 按 OAuth 账号与实际上游模型维护不透明的 `current
 进程内存，只接受单个且原始长度恰好为 292 字节的合法 HeaderValue，并在采集 1 小时后固定过期，读取不续期。
 正常 Responses 响应携带有效 `x-codex-turn-state` 时刷新对应账号/模型状态；收到上游 312 时只使当前键失效。
 业务响应的 312 会刷新该键的续采活跃窗口；探测收到的 312 只撤销状态，不延长活跃期。
-账号和模型选择完成后，若请求没有同一客户端 turn 的 state，Provider 将精确匹配的值注入上游
-`x-codex-turn-state` 请求头，HTTP/SSE 与 WebSocket 共用这一规则。
+账号和模型选择完成后，若请求没有同一客户端 turn 的 state，Provider 将精确匹配的值注入上游：
+HTTP/SSE 使用 `x-codex-turn-state` 请求头，WebSocket 按官方协议写入首个
+`response.create.client_metadata.x-codex-turn-state`，不把该值放进 opening 握手。
 
 Smart 选号在固定账号、会话亲和及最高权重约束之后，优先选择当前上游模型具有有效 state 的 OAuth
 账号，再按既有健康评分与近似最优轮换选择。探测与正常业务响应采集的 state 同等参与；不适用此状态的

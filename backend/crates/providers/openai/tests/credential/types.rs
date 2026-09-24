@@ -27,6 +27,7 @@ fn account_profile_debug_redacts_identity_fields() {
         chatgpt_account_id: "chatgpt-private".to_owned(),
         chatgpt_user_id: "user-private".to_owned(),
         plan_type: Some("pro".to_owned()),
+        is_fedramp_account: true,
         access_token_expires_at: Some(Utc::now()),
     };
     let debug = format!("{profile:?}");
@@ -44,6 +45,7 @@ fn plaintext_provider_schema_round_trips_dynamic_cookie_data() {
             oauth_subject: "subject-private".to_owned(),
             poid: Some("poid-private".to_owned()),
         }),
+        is_fedramp_account: true,
         installation_id: "00000000-0000-4000-8000-000000000001".to_owned(),
         access_token: "at".to_owned(),
         refresh_token: Some("rt".to_owned()),
@@ -64,6 +66,7 @@ fn plaintext_provider_schema_round_trips_dynamic_cookie_data() {
     let decoded: CodexCredentialData =
         serde_json::from_value(encoded).expect("deserialize provider JSON");
     assert_eq!(decoded.oauth().expect("OAuth data").schema_version, 1);
+    assert!(decoded.oauth().expect("OAuth data").is_fedramp_account);
     assert_eq!(decoded.cookies()[0].name, "oai-did");
     assert!(!format!("{decoded:?}").contains("cookie-private"));
 }

@@ -475,7 +475,8 @@ async fn first_exchange_uses_official_id_token_claim_mapping_without_signature_v
             "chatgpt_plan_type": "pro",
             "chatgpt_user_id": "chatgpt-user",
             "user_id": "fallback-user",
-            "chatgpt_account_id": "workspace-id"
+            "chatgpt_account_id": "workspace-id",
+            "chatgpt_account_is_fedramp": true
         }
     })))
     .await
@@ -488,6 +489,11 @@ async fn first_exchange_uses_official_id_token_claim_mapping_without_signature_v
     assert_eq!(account.account.upstream_user_id(), Some("chatgpt-user"));
     assert_eq!(account.account.upstream_account_id(), Some("workspace-id"));
     assert_eq!(account.account.plan_type(), Some("pro"));
+    assert!(
+        CodexCredentialCodec::decode(&account.credential)
+            .expect("stored credential")
+            .is_fedramp_account
+    );
     assert_eq!(
         account
             .account

@@ -24,6 +24,7 @@ fn auth0_default_avatar_uses_the_public_origin_without_account_credentials() {
         "http://127.0.0.1:9/backend-api",
         &super::test_wire_profile().snapshot(),
         source,
+        false,
         context,
     )
     .expect("public avatar request");
@@ -65,6 +66,7 @@ async fn profile_avatar_streams_unrestricted_content_type_and_body_size() {
         &server.uri(),
         &super::test_wire_profile().snapshot(),
         OFFICIAL_AVATAR_SOURCE,
+        false,
         CodexRequestContext::auxiliary(
             "Bearer avatar-token",
             Some("avatar-account"),
@@ -129,6 +131,7 @@ async fn profile_avatar_rejects_non_official_sources_before_request() {
             "http://127.0.0.1:9",
             &super::test_wire_profile().snapshot(),
             source,
+            false,
             CodexRequestContext::auxiliary(
                 "Bearer avatar-token",
                 Some("avatar-account"),

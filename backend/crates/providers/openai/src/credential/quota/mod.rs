@@ -1370,6 +1370,7 @@ async fn list_reset_credits_once(
     client
         .for_account(&prepared.account)
         .map_err(ResetCreditAttemptError::Upstream)?
+        .with_fedramp_account(prepared.credential.is_fedramp_account)
         .list_rate_limit_reset_credits(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             prepared.account.upstream_account_id(),
@@ -1395,6 +1396,7 @@ async fn consume_reset_credit_once(
     client
         .for_account(&prepared.account)
         .map_err(ResetCreditAttemptError::Upstream)?
+        .with_fedramp_account(prepared.credential.is_fedramp_account)
         .consume_rate_limit_reset_credit(
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
@@ -1478,6 +1480,7 @@ async fn fetch_usage_once(
     client
         .for_account(&prepared.account)
         .map_err(CodexQuotaFetchAttemptError::Upstream)?
+        .with_fedramp_account(prepared.credential.is_fedramp_account)
         .fetch_usage(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             prepared.account.upstream_account_id(),

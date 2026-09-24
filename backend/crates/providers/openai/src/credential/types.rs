@@ -39,6 +39,7 @@ pub struct CodexAccountProfile {
     pub chatgpt_account_id: String,
     pub chatgpt_user_id: String,
     pub plan_type: Option<String>,
+    pub is_fedramp_account: bool,
     pub access_token_expires_at: Option<DateTime<Utc>>,
 }
 
@@ -51,6 +52,7 @@ pub(crate) struct CodexOAuthMetadata {
     pub(crate) chatgpt_plan_type: Option<String>,
     pub(crate) chatgpt_user_id: Option<String>,
     pub(crate) chatgpt_account_id: Option<String>,
+    pub(crate) is_fedramp_account: bool,
 }
 
 impl fmt::Debug for CodexOAuthMetadata {
@@ -67,6 +69,7 @@ impl fmt::Debug for CodexOAuthMetadata {
                 &self.chatgpt_account_id.as_ref().map(|_| "<redacted>"),
             )
             .field("chatgpt_plan_type", &self.chatgpt_plan_type)
+            .field("is_fedramp_account", &self.is_fedramp_account)
             .finish()
     }
 }
@@ -92,6 +95,7 @@ pub(crate) fn parse_chatgpt_jwt_claims(jwt: &str) -> Result<CodexOAuthMetadata, 
         chatgpt_plan_type: auth.chatgpt_plan_type.map(ChatgptPlanType::into_raw_value),
         chatgpt_user_id: auth.chatgpt_user_id.or(auth.user_id),
         chatgpt_account_id: auth.chatgpt_account_id,
+        is_fedramp_account: auth.chatgpt_account_is_fedramp,
     })
 }
 
@@ -139,7 +143,7 @@ struct AuthClaims {
     #[serde(default)]
     chatgpt_account_id: Option<String>,
     #[serde(rename = "chatgpt_account_is_fedramp", default)]
-    _chatgpt_account_is_fedramp: bool,
+    chatgpt_account_is_fedramp: bool,
 }
 
 /// 与官方 `codex_protocol::auth::PlanType` 同构的 claims 反序列化类型。
@@ -229,6 +233,7 @@ impl fmt::Debug for CodexAccountProfile {
             .field("chatgpt_account_id", &"<redacted>")
             .field("chatgpt_user_id", &"<redacted>")
             .field("plan_type", &self.plan_type)
+            .field("is_fedramp_account", &self.is_fedramp_account)
             .field("access_token_expires_at", &self.access_token_expires_at)
             .finish()
     }
@@ -288,6 +293,8 @@ pub struct CodexOAuthCredentialData {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<CodexCredentialPrincipal>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_fedramp_account: bool,
     pub installation_id: String,
     pub access_token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -302,12 +309,17 @@ pub struct CodexOAuthCredentialData {
     pub cookies: Vec<CodexCookie>,
 }
 
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 impl fmt::Debug for CodexOAuthCredentialData {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CodexOAuthCredentialData")
             .field("schema_version", &self.schema_version)
             .field("principal", &self.principal)
+            .field("is_fedramp_account", &self.is_fedramp_account)
             .field("installation_id", &"<pseudonymous>")
             .field("access_token", &"<redacted>")
             .field(

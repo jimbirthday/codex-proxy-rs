@@ -135,7 +135,7 @@ impl CodexCredentialProfileService {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<Option<CodexSubscription>, CodexProfileStatisticsError> {
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, is_fedramp_account) =
             self.account_authentication(account_id).await?;
         let Some(upstream_account_id) = upstream_account_id else {
             return Ok(None);
@@ -148,6 +148,7 @@ impl CodexCredentialProfileService {
         )
         .for_account(&account)
         .map_err(map_client_error)?
+        .with_fedramp_account(is_fedramp_account)
         .fetch_subscription(
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
@@ -181,7 +182,7 @@ impl CodexCredentialProfileService {
         &self,
         account_id: &ProviderAccountId,
     ) -> Result<CodexProfileStatistics, CodexProfileStatisticsError> {
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, is_fedramp_account) =
             self.account_authentication(account_id).await?;
         let request_id = format!("profile_statistics_{}", Uuid::now_v7().simple());
         let statistics = CodexBackendClient::new(
@@ -191,6 +192,7 @@ impl CodexCredentialProfileService {
         )
         .for_account(&account)
         .map_err(map_client_error)?
+        .with_fedramp_account(is_fedramp_account)
         .fetch_profile_statistics(CodexRequestContext::auxiliary(
             authorization.expose_secret(),
             upstream_account_id.as_deref(),
@@ -212,6 +214,7 @@ impl CodexCredentialProfileService {
             SecretString,
             Option<String>,
             gateway_core::account::ProviderAccount,
+            bool,
         ),
         CodexProfileStatisticsError,
     > {
@@ -246,6 +249,7 @@ impl CodexCredentialProfileService {
             authorization,
             account.upstream_account_id().map(str::to_owned),
             account,
+            credential.is_fedramp_account,
         ))
     }
 
@@ -261,7 +265,7 @@ impl CodexCredentialProfileService {
                 .image_url
                 .ok_or(CodexProfileAvatarError::Missing)?,
         };
-        let (authorization, upstream_account_id, account) =
+        let (authorization, upstream_account_id, account, is_fedramp_account) =
             self.account_authentication(account_id).await?;
         let http = if account.outbound_proxy().is_some() {
             crate::transport::client::build_account_http_client(
@@ -277,6 +281,7 @@ impl CodexCredentialProfileService {
             &self.base_url,
             &self.profile.snapshot(),
             &source,
+            is_fedramp_account,
             CodexRequestContext::auxiliary(
                 authorization.expose_secret(),
                 upstream_account_id.as_deref(),

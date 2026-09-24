@@ -164,7 +164,8 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
         format!("http://{address}"),
         test_wire_profile(),
     )
-    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(1))));
+    .with_websocket_pool(Arc::new(CodexWebSocketPool::new(Duration::from_mins(1))))
+    .with_fedramp_account(true);
     let payload_sent_count = AtomicUsize::new(0);
     let payload_sent = || {
         payload_sent_count.fetch_add(1, Ordering::SeqCst);
@@ -213,6 +214,10 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
         metadata.get("ws_request_header_x_openai_internal_codex_responses_lite"),
         Some(&json!("true"))
     );
+    assert_eq!(
+        metadata.get("x-codex-turn-state"),
+        Some(&json!("turn-state"))
+    );
     assert!(
         metadata
             .get("x-codex-ws-stream-request-start-ms")
@@ -223,7 +228,6 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
     for (name, expected) in [
         ("x-client-request-id", "cp_derived"),
         ("openai-beta", "responses_websockets=2026-02-06"),
-        ("x-codex-turn-state", "turn-state"),
         ("x-codex-turn-metadata", "{\"thread_source\":\"subagent\"}"),
         ("x-codex-beta-features", "feature-a"),
         ("x-responsesapi-include-timing-metrics", "true"),
@@ -233,6 +237,7 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
         ("x-openai-subagent", "future_codex_mode"),
         ("x-openai-memgen-request", "true"),
         ("session-id", "cp_derived"),
+        ("x-openai-fedramp", "true"),
     ] {
         assert!(
             headers
@@ -249,6 +254,7 @@ async fn backend_websocket_should_forward_context_headers_and_preserve_payload_f
         "session_id",
         "thread-id",
         "x-openai-internal-codex-responses-lite",
+        "x-codex-turn-state",
     ] {
         assert!(headers.iter().all(|(header, _)| header != forbidden));
     }
@@ -356,7 +362,6 @@ async fn backend_http_should_send_codex_context_without_browser_headers() {
         "x-codex-turn-state",
         "x-codex-turn-metadata",
         "x-codex-beta-features",
-        "x-responsesapi-include-timing-metrics",
         "version",
         "x-codex-parent-thread-id",
     ] {
@@ -374,6 +379,7 @@ async fn backend_http_should_send_codex_context_without_browser_headers() {
         "sec-fetch-mode",
         "sec-fetch-dest",
         "openai-beta",
+        "x-responsesapi-include-timing-metrics",
     ] {
         assert!(header_names.iter().all(|name| name != forbidden));
     }

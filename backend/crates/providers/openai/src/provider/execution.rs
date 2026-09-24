@@ -175,7 +175,8 @@ impl CodexProvider {
                 .map_err(|_| {
                     provider_error(ProviderErrorKind::Unavailable, UpstreamSendState::NotSent)
                 })?
-                .with_authentication(lease.authentication()),
+                .with_authentication(lease.authentication())
+                .with_fedramp_account(lease.is_fedramp_account()),
             response_origin: request.response_origin,
             endpoint_path: request.endpoint_path,
             body: request.body,

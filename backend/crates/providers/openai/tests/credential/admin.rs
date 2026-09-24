@@ -294,7 +294,7 @@ fn pat_identity() -> serde_json::Value {
         "chatgpt_user_id": "pat-user",
         "chatgpt_account_id": "pat-workspace",
         "chatgpt_plan_type": "team",
-        "chatgpt_account_is_fedramp": false
+        "chatgpt_account_is_fedramp": true
     })
 }
 
@@ -345,6 +345,7 @@ async fn pat_import_verifies_identity_and_becomes_schedulable_without_oauth_refr
     assert!(account.access_token_expires_at().is_none());
     assert!(account.next_refresh_at().is_none());
     let runtime = CodexCredentialCodec::decode(&prepared.credential).expect("stored PAT");
+    assert!(runtime.is_fedramp_account);
     let secret = runtime
         .authentication
         .oauth()

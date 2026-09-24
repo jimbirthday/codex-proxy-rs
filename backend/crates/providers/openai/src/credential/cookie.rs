@@ -14,6 +14,7 @@ const MAX_SET_COOKIE_TOTAL_BYTES: usize = 64 * 1024;
 #[derive(Clone, Debug)]
 pub struct CodexCookiePolicy {
     allowed_names: HashSet<String>,
+    allowed_name_prefixes: Vec<String>,
     allowed_domains: HashSet<String>,
 }
 
@@ -36,22 +37,32 @@ impl CodexCookiePolicy {
         }
         Ok(Self {
             allowed_names,
+            allowed_name_prefixes: Vec::new(),
             allowed_domains,
         })
     }
 
     pub fn official() -> Result<Self, CookiePolicyError> {
-        Self::new(
+        let mut policy = Self::new(
             [
                 "__Secure-next-auth.session-token",
                 "__Secure-authjs.session-token",
                 "oai-did",
-                "cf_clearance",
                 "__cf_bm",
+                "__cflb",
+                "__cfruid",
+                "__cfseq",
+                "__cfwaitingroom",
+                "__oailb",
                 "_cfuvid",
+                "cf_clearance",
+                "cf_ob_info",
+                "cf_use_ob",
             ],
             ["chatgpt.com", "openai.com"],
-        )
+        )?;
+        policy.allowed_name_prefixes.push("cf_chl_".to_owned());
+        Ok(policy)
     }
 
     pub fn validate_capture(
@@ -61,7 +72,12 @@ impl CodexCookiePolicy {
         name: &str,
         path: &str,
     ) -> Result<ValidatedCookieScope, CookiePolicyError> {
-        if !self.allowed_names.contains(name) {
+        if !self.allowed_names.contains(name)
+            && !self
+                .allowed_name_prefixes
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        {
             return Err(CookiePolicyError::NameNotAllowed);
         }
         if name.len() > 256 || path.is_empty() || path.len() > 1_024 || !path.starts_with('/') {
@@ -73,6 +89,11 @@ impl CodexCookiePolicy {
             .transpose()?
             .ok_or(CookiePolicyError::InvalidOrigin)?;
         if !matches!(origin.scheme(), "https" | "http") || !self.is_allowed_domain(&origin_host) {
+            return Err(CookiePolicyError::InvalidOrigin);
+        }
+        if is_infrastructure_cookie(name)
+            && (origin.scheme() != "https" || !is_allowed_chatgpt_host(&origin_host))
+        {
             return Err(CookiePolicyError::InvalidOrigin);
         }
 
@@ -97,6 +118,7 @@ impl CodexCookiePolicy {
     pub fn may_replay(
         &self,
         target: &Url,
+        name: &str,
         domain: &str,
         path: &str,
         host_only: bool,
@@ -109,6 +131,8 @@ impl CodexCookiePolicy {
             return false;
         };
         if !self.is_allowed_domain(&target_host)
+            || (is_infrastructure_cookie(name)
+                && (target.scheme() != "https" || !is_allowed_chatgpt_host(&target_host)))
             || (secure && target.scheme() != "https")
             || !cookie_path_matches(target.path(), path)
         {
@@ -201,6 +225,30 @@ impl CodexCookiePolicy {
             .iter()
             .any(|allowed| domain_matches(domain, allowed))
     }
+}
+
+fn is_infrastructure_cookie(name: &str) -> bool {
+    matches!(
+        name,
+        "__cf_bm"
+            | "__cflb"
+            | "__cfruid"
+            | "__cfseq"
+            | "__cfwaitingroom"
+            | "__oailb"
+            | "_cfuvid"
+            | "cf_clearance"
+            | "cf_ob_info"
+            | "cf_use_ob"
+    ) || name.starts_with("cf_chl_")
+}
+
+fn is_allowed_chatgpt_host(host: &str) -> bool {
+    matches!(
+        host,
+        "chatgpt.com" | "chat.openai.com" | "chatgpt-staging.com"
+    ) || host.ends_with(".chatgpt.com")
+        || host.ends_with(".chatgpt-staging.com")
 }
 
 pub(crate) struct ParsedCookieBatch {

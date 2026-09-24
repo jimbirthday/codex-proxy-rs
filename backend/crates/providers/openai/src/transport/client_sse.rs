@@ -69,6 +69,11 @@ impl CodexBackendClient {
             websocket_origin_key: websocket_origin_key(&base_url),
             outbound_proxy: None,
             egress_key: String::new(),
+            is_fedramp_account: false,
+            workspace_routing: None,
+            workspace_routing_cache: Arc::new(
+                super::workspace_routing::WorkspaceRoutingCache::default(),
+            ),
             base_url,
             official_base_url: crate::OFFICIAL_CODEX_BASE_URL.to_owned(),
             protocol: OpenAiUpstreamProtocol::Codex,
@@ -252,16 +257,18 @@ impl CodexBackendClient {
         pool_account_id: Option<&str>,
         payload_sent: Option<&(dyn Fn() + Sync)>,
     ) -> CodexClientResult<CodexBackendStreamingResponse> {
-        let prepared = self
+        let routed = self.resolve_workspace_routing(context).await?;
+        let prepared = routed
             .prepare_response_transport_with_pool_account(request, context, pool_account_id)
             .await?;
-        self.create_response_stream_with_prepared_and_payload_sent(
-            request,
-            context,
-            prepared,
-            payload_sent,
-        )
-        .await
+        routed
+            .create_response_stream_with_prepared_and_payload_sent(
+                request,
+                context,
+                prepared,
+                payload_sent,
+            )
+            .await
     }
 
     /// 在发送 payload 前完成 transport 选择和可取消的 WebSocket opening。
@@ -290,7 +297,7 @@ impl CodexBackendClient {
             });
         }
 
-        let websocket_request = websocket_upstream_request(request);
+        let websocket_request = websocket_upstream_request(request, context.turn_state);
         let headers = self.request_headers_for_websocket_response(&websocket_request, context)?;
         let mut websocket_create = CodexWebSocketConnection::responses_create_request_for_path(
             &self.base_url,
@@ -668,14 +675,19 @@ async fn read_model_catalog_body(response: ReqwestResponse) -> CodexClientResult
 }
 
 fn websocket_connection_profile(headers: &HeaderMap) -> String {
-    ["originator", "user-agent", X_OPENAI_MEMGEN_REQUEST_HEADER]
-        .map(|name| {
-            headers
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .unwrap_or_default()
-        })
-        .join("\0")
+    [
+        "originator",
+        "user-agent",
+        X_OPENAI_MEMGEN_REQUEST_HEADER,
+        "x-openai-account-routing-override",
+    ]
+    .map(|name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    })
+    .join("\0")
 }
 
 fn http_sse_stream(
@@ -762,5 +774,22 @@ async fn append_http_sse_rate_limit_updates(
     }
     if !observations.is_empty() {
         updates.lock().await.extend(observations);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_routing_override_changes_websocket_connection_profile() {
+        let headers = HeaderMap::new();
+        let default_profile = websocket_connection_profile(&headers);
+        let mut routed = headers;
+        routed.insert(
+            "x-openai-account-routing-override",
+            HeaderValue::from_static("us_cr"),
+        );
+        assert_ne!(default_profile, websocket_connection_profile(&routed));
     }
 }

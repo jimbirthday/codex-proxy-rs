@@ -36,6 +36,7 @@ use super::websocket::{
     CodexWebSocketRateLimitUpdates, CodexWebSocketRequest, CodexWebSocketResponseMetadataUpdates,
     PreparedWebSocket, WebSocketOriginBreaker, WebSocketPoolDecision,
 };
+use super::workspace_routing::{WorkspaceRouting, WorkspaceRoutingCache};
 
 // ---------------------------------------------------------------------------
 // 常量
@@ -223,6 +224,9 @@ pub enum CodexClientError {
     /// 模型目录不是一个完整、安全的官方快照。
     #[error("invalid Codex model catalog: {0}")]
     ModelCatalog(#[from] super::catalog::CodexModelCatalogError),
+    /// ChatGPT workspace 路由发现结果不完整或不安全。
+    #[error("invalid ChatGPT workspace routing")]
+    WorkspaceRouting,
     /// HTTP/SSE 上游在空闲窗口内没有发送任何数据。
     #[error("upstream HTTP/SSE stream idle for {timeout:?}")]
     StreamIdleTimeout {
@@ -291,6 +295,7 @@ impl fmt::Debug for CodexClientError {
                 .debug_tuple("CodexClientError::ModelCatalog")
                 .field(error)
                 .finish(),
+            Self::WorkspaceRouting => formatter.write_str("CodexClientError::WorkspaceRouting"),
             Self::StreamIdleTimeout { timeout } => formatter
                 .debug_struct("CodexClientError::StreamIdleTimeout")
                 .field("timeout", timeout)
@@ -339,6 +344,7 @@ impl CodexClientError {
             Self::CustomCa(_)
             | Self::InvalidHeaderName(_)
             | Self::InvalidHeaderValue(_)
+            | Self::WorkspaceRouting
             | Self::WebSocketEncode(_)
             | Self::RequestBodyEncode(_)
             | Self::RequestCompression(_) => None,
@@ -676,6 +682,9 @@ pub struct CodexBackendClient {
     pub(super) websocket_origin_key: String,
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
+    pub(super) is_fedramp_account: bool,
+    pub(super) workspace_routing: Option<WorkspaceRouting>,
+    pub(super) workspace_routing_cache: Arc<WorkspaceRoutingCache>,
 }
 
 impl CodexBackendClient {
@@ -714,12 +723,19 @@ impl CodexBackendClient {
         if let crate::credential::CodexRuntimeAuthentication::ApiKey(auth) = authentication {
             self.base_url = auth.configuration.base_url.trim_end_matches('/').to_owned();
             self.protocol = OpenAiUpstreamProtocol::ResponsesApi;
+            self.workspace_routing = None;
             self.websocket_origin_key = format!(
                 "{}:{}",
                 websocket_origin_key(&self.base_url),
                 self.egress_key
             );
         }
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_fedramp_account(mut self, is_fedramp_account: bool) -> Self {
+        self.is_fedramp_account = is_fedramp_account;
         self
     }
 
@@ -730,11 +746,10 @@ impl CodexBackendClient {
         let mut client = self.clone();
         client.outbound_proxy = account.outbound_proxy().cloned();
         client.egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
-        if account.authentication_kind() == crate::credential::CODEX_AUTHENTICATION_KIND_API_KEY {
-            client
-                .egress_key
-                .push_str(&format!(":revision:{}", account.revision().get()));
-        }
+        client
+            .egress_key
+            .push_str(&format!(":revision:{}", account.revision().get()));
+        client.workspace_routing = None;
         client.websocket_origin_key = format!(
             "{}:{}",
             websocket_origin_key(&self.base_url),
@@ -907,7 +922,10 @@ pub(super) async fn read_error_response_body(
 // 请求辅助函数
 // ---------------------------------------------------------------------------
 
-pub(super) fn websocket_upstream_request(request: &CodexResponsesRequest) -> CodexResponsesRequest {
+pub(super) fn websocket_upstream_request(
+    request: &CodexResponsesRequest,
+    turn_state: Option<&str>,
+) -> CodexResponsesRequest {
     let mut request = request.clone();
     // 上游通过流式事件执行，下游仍按客户端原来的偏好返回响应。
     if !request.stream() {
@@ -915,11 +933,14 @@ pub(super) fn websocket_upstream_request(request: &CodexResponsesRequest) -> Cod
             .body_mut()
             .insert("stream".to_owned(), Value::Bool(true));
     }
-    project_websocket_client_metadata(&mut request);
+    project_websocket_client_metadata(&mut request, turn_state);
     request
 }
 
-fn project_websocket_client_metadata(request: &mut CodexResponsesRequest) {
+fn project_websocket_client_metadata(
+    request: &mut CodexResponsesRequest,
+    turn_state: Option<&str>,
+) {
     let mut metadata = match request.client_metadata() {
         Some(Value::Object(metadata)) => metadata.clone(),
         None => Map::new(),
@@ -930,12 +951,11 @@ fn project_websocket_client_metadata(request: &mut CodexResponsesRequest) {
             .entry(WS_REQUEST_HEADER_RESPONSES_LITE_CLIENT_METADATA_KEY.to_owned())
             .or_insert(Value::String(responses_lite));
     }
-    let turn_state = request.turn_state.clone();
     match turn_state {
         Some(turn_state) => {
             metadata.insert(
                 X_CODEX_TURN_STATE_CLIENT_METADATA_KEY.to_owned(),
-                Value::String(turn_state),
+                Value::String(turn_state.to_owned()),
             );
         }
         None => {
@@ -1065,5 +1085,43 @@ pub(super) fn websocket_origin_key(base_url: &str) -> String {
     match custom_ca_env_cache_key() {
         Some(tls_profile) => format!("{origin}\0{tls_profile}"),
         None => origin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gateway_core::{
+        account::{CredentialRevision, ProviderAccount, ProviderAccountId},
+        routing::ProviderKind,
+    };
+
+    use super::*;
+    use crate::transport::profile::CodexWireProfileState;
+
+    fn oauth_account(revision: u64) -> ProviderAccount {
+        ProviderAccount::new(
+            ProviderAccountId::new("acct_pool_revision").expect("account ID"),
+            ProviderKind::new("openai").expect("provider"),
+            "workspace".to_owned(),
+            None,
+            crate::credential::CODEX_AUTHENTICATION_KIND_OAUTH.to_owned(),
+            CredentialRevision::new(revision).expect("revision"),
+            None,
+        )
+    }
+
+    #[test]
+    fn oauth_credential_revision_changes_websocket_egress_scope() {
+        let client = CodexBackendClient::new(
+            reqwest::Client::new(),
+            "https://chatgpt.com/backend-api",
+            CodexWireProfileState::new(Default::default()),
+        );
+        let first = client.for_account(&oauth_account(1)).expect("first client");
+        let second = client
+            .for_account(&oauth_account(2))
+            .expect("second client");
+        assert_ne!(first.egress_key, second.egress_key);
+        assert_ne!(first.websocket_origin_key, second.websocket_origin_key);
     }
 }

@@ -567,10 +567,12 @@ impl CodexCredentialAdmin {
             chatgpt_plan_type: plan_type,
             chatgpt_user_id: upstream_user_id,
             chatgpt_account_id: upstream_account_id,
+            is_fedramp_account,
         } = input.metadata;
         let has_upstream_user_id = upstream_user_id.is_some();
         let credential = CodexCredentialCodec::encode_unresolved(
             &input.secret,
+            is_fedramp_account,
             input.installation_id,
             Vec::new(),
         )
@@ -775,6 +777,7 @@ impl CodexCredentialAdmin {
                 poid: input.verified_account.poid.clone(),
             });
         }
+        oauth.is_fedramp_account = input.verified_account.is_fedramp_account;
         oauth.access_token = input.secret.access_token.expose_secret().to_owned();
         oauth.refresh_token = input
             .secret
@@ -1059,6 +1062,8 @@ impl CodexCredentialAdminService {
                     chatgpt_account_id: id_metadata
                         .chatgpt_account_id
                         .or(access_metadata.chatgpt_account_id),
+                    is_fedramp_account: id_metadata.is_fedramp_account
+                        || access_metadata.is_fedramp_account,
                 }
             };
             let prepared =

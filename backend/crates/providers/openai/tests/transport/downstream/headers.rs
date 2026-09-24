@@ -245,7 +245,7 @@ async fn backend_http_should_preserve_business_headers_without_downstream_transp
     assert!(raw_header_values(&raw, "openai-beta").is_empty());
     assert_eq!(
         raw_header_values(&raw, "x-codex-turn-state"),
-        vec![b"turn-ascii".to_vec(), b"turn-\x80".to_vec()]
+        vec![b"typed-turn-state".to_vec()]
     );
     for (name, value) in [
         ("accept", b"text/event-stream".as_slice()),

@@ -19,6 +19,7 @@ const MAX_COOKIES: usize = 128;
 pub struct CodexRuntimeCredential {
     pub authentication: CodexRuntimeAuthentication,
     pub principal: Option<CodexCredentialPrincipal>,
+    pub is_fedramp_account: bool,
     pub installation_id: String,
     pub cookies: Vec<RuntimeCodexCookie>,
     pub oauth_client_id: Option<String>,
@@ -31,6 +32,7 @@ impl std::fmt::Debug for CodexRuntimeCredential {
             .debug_struct("CodexRuntimeCredential")
             .field("authentication", &self.authentication)
             .field("principal", &self.principal)
+            .field("is_fedramp_account", &self.is_fedramp_account)
             .field("installation_id", &"<pseudonymous>")
             .field("cookies", &self.cookies)
             .field("oauth_client_id", &self.oauth_client_id)
@@ -100,6 +102,7 @@ impl CodexCredentialCodec {
                 oauth_subject: account.oauth_subject.clone(),
                 poid: account.poid.clone(),
             }),
+            account.is_fedramp_account,
             uuid::Uuid::new_v4().to_string(),
             cookies,
         )
@@ -108,21 +111,24 @@ impl CodexCredentialCodec {
     /// 为尚未解析资料的 OAuth 账号编码凭据。
     pub(crate) fn encode_unresolved(
         secret: &CodexOAuthSecret,
+        is_fedramp_account: bool,
         installation_id: String,
         cookies: Vec<CodexCookie>,
     ) -> Result<PlaintextCredential, CodexCredentialDataError> {
-        Self::encode_oauth(secret, None, installation_id, cookies)
+        Self::encode_oauth(secret, None, is_fedramp_account, installation_id, cookies)
     }
 
     fn encode_oauth(
         secret: &CodexOAuthSecret,
         principal: Option<CodexCredentialPrincipal>,
+        is_fedramp_account: bool,
         installation_id: String,
         cookies: Vec<CodexCookie>,
     ) -> Result<PlaintextCredential, CodexCredentialDataError> {
         Self::encode_complete(CodexCredentialData::OAuth(CodexOAuthCredentialData {
             schema_version: CODEX_CREDENTIAL_SCHEMA_VERSION,
             principal,
+            is_fedramp_account,
             installation_id,
             access_token: secret.access_token.expose_secret().to_owned(),
             refresh_token: secret
@@ -172,35 +178,45 @@ impl CodexCredentialCodec {
         let data = serde_json::from_value::<CodexCredentialData>(value)
             .map_err(|_| CodexCredentialDataError::Invalid)?;
         validate(&data)?;
-        let (authentication, principal, installation_id, cookies, oauth_client_id, oauth_scope) =
-            match data {
-                CodexCredentialData::ApiKey(data) => (
-                    CodexRuntimeAuthentication::ApiKey(ApiKeyAuthentication {
-                        configuration: data.configuration(),
-                        secret: SecretString::from(data.api_key),
-                    }),
-                    None,
-                    data.installation_id,
-                    Vec::new(),
-                    None,
-                    None,
-                ),
-                CodexCredentialData::OAuth(data) => (
-                    CodexRuntimeAuthentication::OAuth(CodexOAuthSecret {
-                        access_token: SecretString::from(data.access_token),
-                        refresh_token: data.refresh_token.map(SecretString::from),
-                        id_token: data.id_token.map(SecretString::from),
-                    }),
-                    data.principal,
-                    data.installation_id,
-                    data.cookies,
-                    data.oauth_client_id,
-                    data.oauth_scope,
-                ),
-            };
+        let (
+            authentication,
+            principal,
+            is_fedramp_account,
+            installation_id,
+            cookies,
+            oauth_client_id,
+            oauth_scope,
+        ) = match data {
+            CodexCredentialData::ApiKey(data) => (
+                CodexRuntimeAuthentication::ApiKey(ApiKeyAuthentication {
+                    configuration: data.configuration(),
+                    secret: SecretString::from(data.api_key),
+                }),
+                None,
+                false,
+                data.installation_id,
+                Vec::new(),
+                None,
+                None,
+            ),
+            CodexCredentialData::OAuth(data) => (
+                CodexRuntimeAuthentication::OAuth(CodexOAuthSecret {
+                    access_token: SecretString::from(data.access_token),
+                    refresh_token: data.refresh_token.map(SecretString::from),
+                    id_token: data.id_token.map(SecretString::from),
+                }),
+                data.principal,
+                data.is_fedramp_account,
+                data.installation_id,
+                data.cookies,
+                data.oauth_client_id,
+                data.oauth_scope,
+            ),
+        };
         Ok(CodexRuntimeCredential {
             authentication,
             principal,
+            is_fedramp_account,
             installation_id,
             cookies: cookies
                 .into_iter()
