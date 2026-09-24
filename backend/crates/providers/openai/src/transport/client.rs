@@ -17,8 +17,8 @@ use gateway_protocol::openai::{
     sse::SseError,
 };
 use reqwest::{
-    Client, Response as ReqwestResponse, StatusCode,
-    header::{HeaderMap, RETRY_AFTER},
+    Client, Response as ReqwestResponse, StatusCode, Url,
+    header::{HeaderMap, HeaderValue, RETRY_AFTER},
 };
 use serde_json::{Value, map::Map};
 use thiserror::Error;
@@ -28,6 +28,7 @@ use crate::transport::protocol::responses::{
     CodexResponsesRequest, TransportRequirement, X_CODEX_TURN_STATE_CLIENT_METADATA_KEY,
 };
 
+use super::cookies::InfrastructureCookieStore;
 use super::diagnostics::{CodexUpstreamDiagnostics, CodexUpstreamFailure, CodexUpstreamSendPhase};
 use super::response_meta::CodexResponseMetadata;
 use super::tls::{CustomCaError, build_reqwest_client_with_custom_ca, custom_ca_env_cache_key};
@@ -48,6 +49,7 @@ const X_CODEX_WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str =
     "x-codex-ws-stream-request-start-ms";
 type ReqwestClientCacheKey = (Option<String>, String);
 type ReqwestClientCache = Mutex<HashMap<ReqwestClientCacheKey, Client>>;
+type InfrastructureCookieStores = Arc<Mutex<HashMap<String, Arc<InfrastructureCookieStore>>>>;
 
 /// 构建带缓存、自动协商 HTTP/2 的 reqwest Client。
 pub fn build_reqwest_client() -> Result<Client, CustomCaError> {
@@ -682,12 +684,46 @@ pub struct CodexBackendClient {
     pub(super) websocket_origin_key: String,
     pub(super) outbound_proxy: Option<gateway_core::account::OutboundProxy>,
     pub(super) egress_key: String,
+    pub(super) infrastructure_cookies: Arc<InfrastructureCookieStore>,
+    pub(super) infrastructure_cookie_stores: InfrastructureCookieStores,
     pub(super) is_fedramp_account: bool,
     pub(super) workspace_routing: Option<WorkspaceRouting>,
     pub(super) workspace_routing_cache: Arc<WorkspaceRoutingCache>,
 }
 
 impl CodexBackendClient {
+    pub(crate) fn seed_infrastructure_cookies(
+        &self,
+        response_origin: &Url,
+        cookies: &[crate::credential::RuntimeCodexCookie],
+    ) {
+        self.infrastructure_cookies
+            .seed_legacy(response_origin, cookies);
+    }
+
+    pub(crate) fn capture_infrastructure_cookies(&self, response_origin: &Url, headers: &[String]) {
+        self.infrastructure_cookies
+            .store_response_headers(response_origin, headers);
+    }
+
+    pub(crate) fn clear_infrastructure_cookies(&self) {
+        self.infrastructure_cookies.clear();
+    }
+
+    pub(super) fn model_infrastructure_cookie_header(&self) -> Option<HeaderValue> {
+        let target = Url::parse(&super::endpoints::endpoint_url(
+            &self.base_url,
+            self.protocol.responses_path(),
+        ))
+        .ok()?;
+        self.infrastructure_cookies.cookies(&target)
+    }
+
+    pub(super) fn account_infrastructure_cookie_header(&self) -> Option<HeaderValue> {
+        let target = Url::parse(&format!("{}/", self.base_url.trim_end_matches('/'))).ok()?;
+        self.infrastructure_cookies.cookies(&target)
+    }
+
     /// 覆盖官方账号接口基址，用于隔离上游联调与协议测试。
     #[must_use]
     pub fn with_official_base_url(mut self, official_base_url: impl Into<String>) -> Self {
@@ -745,7 +781,22 @@ impl CodexBackendClient {
     ) -> Result<Self, CodexClientError> {
         let mut client = self.clone();
         client.outbound_proxy = account.outbound_proxy().cloned();
-        client.egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
+        let cookie_egress_key = egress_key(account.id().as_str(), account.outbound_proxy());
+        client.infrastructure_cookies = {
+            let mut stores = self
+                .infrastructure_cookie_stores
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if stores.len() >= 256 {
+                stores.retain(|_, store| Arc::strong_count(store) > 1);
+            }
+            Arc::clone(
+                stores
+                    .entry(cookie_egress_key.clone())
+                    .or_insert_with(|| Arc::new(InfrastructureCookieStore::default())),
+            )
+        };
+        client.egress_key = cookie_egress_key;
         client
             .egress_key
             .push_str(&format!(":revision:{}", account.revision().get()));

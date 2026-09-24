@@ -15,6 +15,10 @@ const OPENAI_ACCOUNT_SCORE_FAILURE_REASONS: &[&str] = &[
     "server_error",
     "service_unavailable_error",
 ];
+const CAPACITY_RETRY_MAX_RETRIES: NonZeroU32 = NonZeroU32::new(3).unwrap();
+const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(500);
+const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_secs(8);
+const CAPACITY_RETRY_AFTER_LIMIT: Duration = Duration::from_secs(30);
 
 fn is_openai_account_score_failure_reason(value: &str) -> bool {
     let value = value.trim();
@@ -355,6 +359,20 @@ pub(super) async fn apply_failure(
     account: &ProviderAccount,
     failure: &MappedProviderFailure,
 ) {
+    if !failure.set_cookie_headers.is_empty() {
+        context
+            .client
+            .capture_infrastructure_cookies(context.response_origin, &failure.set_cookie_headers);
+    }
+    if matches!(
+        failure.account_failure,
+        Some(
+            CodexAccountFailure::CloudflareChallenge { .. }
+                | CodexAccountFailure::CloudflarePathBlocked
+        )
+    ) {
+        context.client.clear_infrastructure_cookies();
+    }
     if !context.allows_account_state_mutation {
         return;
     }
@@ -522,6 +540,7 @@ pub(super) fn apply_websocket_recovery_policy(
     // 明确账号拒绝走已有换号路径，容量拒绝走请求内退避；两者都不消耗 WS 传输预算。
     if failure.error.replay_is_safe()
         && (failure.account_failure.is_some()
+            || failure.upstream_capacity_failure
             || matches!(
                 failure.error.pre_delivery_retry(),
                 Some(gateway_core::error::PreDeliveryRetry::SameAccountTransientRetry { .. })
@@ -661,6 +680,31 @@ pub(super) fn websocket_retry_backoff(retry_index: NonZeroU32) -> Duration {
         1_000
     };
     Duration::from_millis(base_ms.saturating_mul(jitter_per_mille) / 1_000)
+}
+
+fn capacity_retry_delays(retry_after_seconds: Option<u64>) -> Option<(Duration, Duration)> {
+    let mut random = [0_u8; 2];
+    let jitter_per_mille = if getrandom::fill(&mut random).is_ok() {
+        900_u64 + u64::from(u16::from_le_bytes(random) % 200)
+    } else {
+        1_000
+    };
+    capacity_retry_delays_with_jitter(retry_after_seconds, jitter_per_mille)
+}
+
+fn capacity_retry_delays_with_jitter(
+    retry_after_seconds: Option<u64>,
+    jitter_per_mille: u64,
+) -> Option<(Duration, Duration)> {
+    let retry_after = retry_after_seconds.map(Duration::from_secs);
+    if retry_after.is_some_and(|delay| delay > CAPACITY_RETRY_AFTER_LIMIT) {
+        return None;
+    }
+    let jittered_initial = CAPACITY_RETRY_INITIAL_DELAY
+        .saturating_mul(u32::try_from(jitter_per_mille).unwrap_or(1_000))
+        / 1_000;
+    let initial_delay = retry_after.map_or(jittered_initial, |delay| delay.max(jittered_initial));
+    Some((initial_delay, CAPACITY_RETRY_MAX_DELAY.max(initial_delay)))
 }
 
 pub(super) fn continuation_replay_required_error(reason: &'static str) -> ProviderError {
@@ -1308,16 +1352,11 @@ pub(super) fn map_upstream_failure(
     if let Some(retry_after) = failure.retry_after_seconds.map(Duration::from_secs) {
         error = error.with_retry_after(retry_after);
     }
-    if capacity_unavailable && error.replay_is_safe() {
-        let max_delay = Duration::from_secs(8);
-        error = error.with_transient_retry(
-            NonZeroU32::new(3).unwrap_or(NonZeroU32::MIN),
-            failure
-                .retry_after_seconds
-                .map_or(Duration::from_millis(500), Duration::from_secs)
-                .min(max_delay),
-            max_delay,
-        );
+    if capacity_unavailable
+        && error.replay_is_safe()
+        && let Some((initial_delay, max_delay)) = capacity_retry_delays(failure.retry_after_seconds)
+    {
+        error = error.with_transient_retry(CAPACITY_RETRY_MAX_RETRIES, initial_delay, max_delay);
     }
     if let Some(code) = failure.persistable_code() {
         error = error.with_upstream_code(OpaqueUpstreamValue::new(code.to_owned()));

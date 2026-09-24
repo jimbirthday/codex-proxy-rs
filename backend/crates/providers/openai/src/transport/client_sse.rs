@@ -1,6 +1,10 @@
 use gateway_core::diagnostics::{StreamCapture, StreamFormat, TraceContext, diagnostic_json};
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use futures::{StreamExt, TryStreamExt};
 use gateway_protocol::openai::{
@@ -44,6 +48,7 @@ use crate::transport::{
 };
 
 use super::client::*;
+use super::cookies::InfrastructureCookieStore;
 
 impl CodexBackendClient {
     pub(crate) const fn profile_state(&self) -> &CodexWireProfileState {
@@ -63,12 +68,16 @@ impl CodexBackendClient {
         profile: CodexWireProfileState,
     ) -> Self {
         let base_url = base_url.into().trim_end_matches('/').to_string();
+        let infrastructure_cookies = Arc::new(InfrastructureCookieStore::default());
+        let infrastructure_cookie_stores = Arc::new(Mutex::new(HashMap::new()));
         Self {
             direct_client: client.clone(),
             client,
             websocket_origin_key: websocket_origin_key(&base_url),
             outbound_proxy: None,
             egress_key: String::new(),
+            infrastructure_cookies,
+            infrastructure_cookie_stores,
             is_fedramp_account: false,
             workspace_routing: None,
             workspace_routing_cache: Arc::new(

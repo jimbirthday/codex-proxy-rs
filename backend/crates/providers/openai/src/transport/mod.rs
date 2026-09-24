@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod client;
 mod client_json;
 mod client_sse;
+mod cookies;
 pub mod diagnostics;
 mod downstream;
 pub mod endpoints;

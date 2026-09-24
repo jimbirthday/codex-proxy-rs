@@ -265,6 +265,9 @@ OpenAI / xAI 导入用例。并发槽位由单个 Worker 统一管理，条目�
 
 连接池按出口隔离。修改代理推进配置 revision，使后续请求使用新出口；已执行请求可沿原连接完成。
 代理变更不推进 `credential_revision`，不会使进行中的令牌刷新因凭据版本冲突而丢失结果。
+ChatGPT 的 Cloudflare 与 `__oailb` 基础设施 Cookie 按账号和固定出口保存在进程内 Jar，HTTP SSE 与
+WebSocket 共用同一分桶；它们不写入账号凭据，也不推进 `credential_revision`，进程重启或出口变更后
+自然丢弃。账号会话 Cookie 仍按凭据归属持久化，基础设施 Jar 只接受 HTTPS ChatGPT 域名和固定白名单。
 xAI 的推理连接池继续按账号绑定隔离；OAuth、目录/计费辅助请求在各自 transport 内复用有界出口
 client，OIDC 的 JWKS 缓存与单飞归属对应出口状态。自动刷新提交凭据后的目录预热重新读取当前账号
 出口，不从 token-only 路径绕过代理；JWKS 过期或获取失败仍不使用 stale fallback。

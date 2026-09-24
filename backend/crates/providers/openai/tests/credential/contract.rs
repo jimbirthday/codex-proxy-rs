@@ -1629,14 +1629,14 @@ fn repeated_cloudflare_path_block_marks_only_the_affected_account_invalid() {
 }
 
 #[test]
-fn cloudflare_challenge_expires_provider_owned_cookies_at_cooldown_boundary() {
+fn response_infrastructure_cookies_do_not_advance_credential_revision() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_primary", "at-primary");
     let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
     let required = ProviderAccountId::new("acct_primary").expect("account id");
     let request_url =
         Url::parse("https://chatgpt.com/backend-api/codex/responses").expect("request URL");
-    let first_attempt = attempt_with_required(BTreeSet::new(), Some(required.clone()));
+    let first_attempt = attempt_with_required(BTreeSet::new(), Some(required));
     let first = block_on(selector.select(&SelectCodexCredential {
         upstream_model: "gpt-5.4",
         request_url: &request_url,
@@ -1644,39 +1644,23 @@ fn cloudflare_challenge_expires_provider_owned_cookies_at_cooldown_boundary() {
         session_affinity_key: None,
     }))
     .expect("select account");
-    block_on(selector.capture_response_cookies(
+    let outcome = block_on(selector.capture_response_cookies(
         first.account(),
         &request_url,
         &["cf_clearance=old; Path=/; Domain=chatgpt.com; Secure; Max-Age=3600".to_owned()],
     ))
     .expect("capture cookie");
 
-    let second_attempt = attempt_with_required(BTreeSet::new(), Some(required));
-    let second = block_on(selector.select(&SelectCodexCredential {
-        upstream_model: "gpt-5.4",
-        request_url: &request_url,
-        attempt: &second_attempt,
-        session_affinity_key: None,
-    }))
-    .expect("select revised account");
-    block_on(selector.record_failure(
-        second.account(),
-        CodexAccountFailure::CloudflareChallenge { retry_after: None },
-        None,
-    ))
-    .expect("record challenge");
-
     let account = store.account("acct_primary").expect("account");
     let data = block_on(store.repository().load_complete_data(&account)).expect("credential data");
-    assert_eq!(data.cookies().len(), 1);
-    assert!(data.cookies()[0].expires_at.is_some_and(|expires_at| {
-        let expires_at = SystemTime::from(expires_at);
-        expires_at > SystemTime::now() && expires_at <= SystemTime::now() + Duration::from_secs(120)
-    }));
+    assert_eq!(outcome.credential_revision, None);
+    assert_eq!(outcome.rejected, 0);
+    assert_eq!(account.revision(), first.account().revision());
+    assert!(data.cookies().is_empty());
 }
 
 #[test]
-fn cloudflare_path_block_deletes_provider_owned_cookies() {
+fn cloudflare_path_block_preserves_account_owned_cookies() {
     let store = Arc::new(MemoryAccountStore::default());
     create_account(&store, "acct_primary", "at-primary");
     let selector = selector(&store, Arc::new(TestLeaseCoordinator::default()));
@@ -1694,7 +1678,7 @@ fn cloudflare_path_block_deletes_provider_owned_cookies() {
     block_on(selector.capture_response_cookies(
         first.account(),
         &request_url,
-        &["__cf_bm=old; Path=/; Domain=chatgpt.com; Secure; Max-Age=3600".to_owned()],
+        &["oai-did=device-a; Path=/; Domain=chatgpt.com; Secure; Max-Age=3600".to_owned()],
     ))
     .expect("capture cookie");
 
@@ -1715,7 +1699,8 @@ fn cloudflare_path_block_deletes_provider_owned_cookies() {
 
     let account = store.account("acct_primary").expect("account");
     let data = block_on(store.repository().load_complete_data(&account)).expect("credential data");
-    assert!(data.cookies().is_empty());
+    assert_eq!(data.cookies().len(), 1);
+    assert_eq!(data.cookies()[0].name, "oai-did");
 }
 
 #[test]
@@ -1740,7 +1725,7 @@ fn response_cookie_rotation_returns_a_current_account_for_later_fenced_writes() 
     let outcome = block_on(selector.capture_response_cookies(
         lease.account(),
         &request_url,
-        &["cf_clearance=updated; Path=/; Domain=chatgpt.com; Secure; Max-Age=3600".to_owned()],
+        &["oai-did=updated; Path=/; Domain=chatgpt.com; Secure; Max-Age=3600".to_owned()],
     ))
     .expect("capture response cookie");
     let current = block_on(selector.current_account(lease.account_id())).expect("current account");

@@ -1330,10 +1330,19 @@ impl CodexCredentialSelector {
         let Some(cookies) = data.cookies_mut() else {
             return Ok(());
         };
+        if !cookies
+            .iter()
+            .any(|cookie| super::cookie::is_infrastructure_cookie(&cookie.name))
+        {
+            return Ok(());
+        }
         match recovery {
             CookieRecovery::ExpireAt(expires_at) => {
                 let expires_at = chrono::DateTime::<chrono::Utc>::from(expires_at);
-                for cookie in cookies {
+                for cookie in cookies
+                    .iter_mut()
+                    .filter(|cookie| super::cookie::is_infrastructure_cookie(&cookie.name))
+                {
                     cookie.expires_at = Some(
                         cookie
                             .expires_at
@@ -1341,7 +1350,9 @@ impl CodexCredentialSelector {
                     );
                 }
             }
-            CookieRecovery::Clear => cookies.clear(),
+            CookieRecovery::Clear => {
+                cookies.retain(|cookie| !super::cookie::is_infrastructure_cookie(&cookie.name))
+            }
         }
         self.repository.compare_and_swap_data(account, data).await?;
         Ok(())

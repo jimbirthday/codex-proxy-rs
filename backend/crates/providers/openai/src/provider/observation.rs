@@ -709,7 +709,10 @@ pub(super) fn build_cookie_header(
         return Ok(None);
     }
     let mut header = String::new();
-    for cookie in cookies {
+    for cookie in cookies
+        .iter()
+        .filter(|cookie| !crate::credential::cookie::is_infrastructure_cookie(&cookie.name))
+    {
         let value = cookie.value.expose_secret();
         if !valid_cookie_name(&cookie.name)
             || value.is_empty()
@@ -734,7 +737,7 @@ pub(super) fn build_cookie_header(
             ));
         }
     }
-    Ok(Some(SecretString::from(header)))
+    Ok((!header.is_empty()).then(|| SecretString::from(header)))
 }
 
 pub(super) fn valid_cookie_name(name: &str) -> bool {

@@ -116,7 +116,10 @@ impl CodexBackendClient {
         };
         let mut headers = build_codex_model_headers(profile, context.authorization, account_id)?;
         insert_fedramp_header(&mut headers, self.is_fedramp_account);
-        insert_optional_header(&mut headers, "cookie", cookie_header)?;
+        let infrastructure = (self.protocol == OpenAiUpstreamProtocol::Codex)
+            .then(|| self.model_infrastructure_cookie_header())
+            .flatten();
+        insert_cookie_header(&mut headers, infrastructure, cookie_header)?;
         Ok(headers)
     }
 
@@ -130,7 +133,11 @@ impl CodexBackendClient {
             context.account_id,
         )?;
         insert_fedramp_header(&mut headers, self.is_fedramp_account);
-        insert_optional_header(&mut headers, "cookie", context.cookie_header)?;
+        insert_cookie_header(
+            &mut headers,
+            self.account_infrastructure_cookie_header(),
+            context.cookie_header,
+        )?;
         Ok(headers)
     }
 
@@ -248,6 +255,28 @@ impl CodexBackendClient {
             }),
         );
     }
+}
+
+fn insert_cookie_header(
+    headers: &mut HeaderMap,
+    infrastructure: Option<HeaderValue>,
+    account: Option<&str>,
+) -> CodexClientResult<()> {
+    let mut value = infrastructure
+        .map(|header| header.as_bytes().to_vec())
+        .unwrap_or_default();
+    if let Some(account) = account {
+        if !value.is_empty() {
+            value.extend_from_slice(b"; ");
+        }
+        value.extend_from_slice(account.as_bytes());
+    }
+    if !value.is_empty() {
+        let mut value = HeaderValue::from_bytes(&value)?;
+        value.set_sensitive(true);
+        headers.insert(reqwest::header::COOKIE, value);
+    }
+    Ok(())
 }
 
 fn append_passthrough_headers(headers: &mut HeaderMap, request: &CodexResponsesRequest) {

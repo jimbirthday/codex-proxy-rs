@@ -467,6 +467,10 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             allows_capacity_feedback: !request.context.is_diagnostic_required_account(),
         };
         let active_account = request.lease.account().clone();
+        request.client.seed_infrastructure_cookies(
+            &request.response_origin,
+            request.lease.cookies(),
+        );
         let cookie_header = build_cookie_header(request.lease.cookies())?;
         let authorization = request
             .lease
@@ -531,6 +535,12 @@ pub(super) fn cold_json_response_stream(request: ColdJsonResponse) -> EventStrea
             openai_response_timings(&metrics, &response.response_metadata),
         ) {
             yield ProviderEvent::observation(observation);
+        }
+        if !response.set_cookie_headers.is_empty() {
+            request.client.capture_infrastructure_cookies(
+                &request.response_origin,
+                &response.set_cookie_headers,
+            );
         }
         if allows_account_state_mutation {
             synchronize_passive_quota_headers(
@@ -651,6 +661,7 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             allows_capacity_feedback: !context.is_diagnostic_required_account(),
         };
         let mut active_account = effective_account;
+        client.seed_infrastructure_cookies(&response_origin, lease.cookies());
         let cookie_header = build_cookie_header(lease.cookies())?;
         let authorization = lease
             .authentication()
@@ -784,6 +795,9 @@ pub(super) fn cold_response_stream(response: ColdResponse) -> EventStream {
             .await;
             Err(failure.error)?;
             return;
+        }
+        if !response.set_cookie_headers.is_empty() {
+            client.capture_infrastructure_cookies(&response_origin, &response.set_cookie_headers);
         }
         if allows_account_state_mutation
             && !response.set_cookie_headers.is_empty()

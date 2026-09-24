@@ -168,6 +168,13 @@ impl CodexCookiePolicy {
         let mut inputs = Vec::with_capacity(headers.len());
         let mut rejected = 0;
         for header in headers {
+            if header.len() <= MAX_SET_COOKIE_HEADER_BYTES
+                && Cookie::parse(header.as_str())
+                    .ok()
+                    .is_some_and(|cookie| is_infrastructure_cookie(cookie.name()))
+            {
+                continue;
+            }
             let Some(input) = self.parse_response_header(
                 account_id,
                 expected_credential_revision,
@@ -227,7 +234,7 @@ impl CodexCookiePolicy {
     }
 }
 
-fn is_infrastructure_cookie(name: &str) -> bool {
+pub(crate) fn is_infrastructure_cookie(name: &str) -> bool {
     matches!(
         name,
         "__cf_bm"
@@ -243,7 +250,7 @@ fn is_infrastructure_cookie(name: &str) -> bool {
     ) || name.starts_with("cf_chl_")
 }
 
-fn is_allowed_chatgpt_host(host: &str) -> bool {
+pub(crate) fn is_allowed_chatgpt_host(host: &str) -> bool {
     matches!(
         host,
         "chatgpt.com" | "chat.openai.com" | "chatgpt-staging.com"

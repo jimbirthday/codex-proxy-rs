@@ -6931,13 +6931,18 @@ async fn capacity_http_and_websocket_opening_rejections_use_bounded_business_ret
                 "message": "Selected model is at capacity. Please try a different model.",
                 "extension": {"preserved": true}
             }});
+            let retry_after = match status {
+                400 => Some("3"),
+                429 => Some("129600"),
+                _ => None,
+            };
+            let mut response = ResponseTemplate::new(status).set_body_json(body.clone());
+            if let Some(retry_after) = retry_after {
+                response = response.insert_header("retry-after", retry_after);
+            }
             Mock::given(method(if use_websocket { "GET" } else { "POST" }))
                 .and(path("/codex/responses"))
-                .respond_with(
-                    ResponseTemplate::new(status)
-                        .insert_header("retry-after", "129600")
-                        .set_body_json(body.clone()),
-                )
+                .respond_with(response)
                 .expect(1)
                 .mount(&server)
                 .await;
@@ -6963,11 +6968,30 @@ async fn capacity_http_and_websocket_opening_rejections_use_bounded_business_ret
             assert_eq!(error.kind(), ProviderErrorKind::UpstreamCapacityUnavailable);
             assert_eq!(error.upstream_status(), Some(status));
             assert!(error.replay_is_safe());
-            assert!(
-                matches!(error.pre_delivery_retry(), Some(PreDeliveryRetry::SameAccountTransientRetry {
-                max_retries, initial_delay, max_delay,
-            }) if max_retries.get() == 3 && initial_delay == Duration::from_secs(8) && max_delay == Duration::from_secs(8))
-            );
+            match status {
+                400 => assert!(matches!(
+                    error.pre_delivery_retry(),
+                    Some(PreDeliveryRetry::SameAccountTransientRetry {
+                        max_retries,
+                        initial_delay,
+                        max_delay,
+                    }) if max_retries.get() == 3
+                        && initial_delay == Duration::from_secs(3)
+                        && max_delay == Duration::from_secs(8)
+                )),
+                429 => assert_eq!(error.pre_delivery_retry(), None),
+                _ => assert!(matches!(
+                    error.pre_delivery_retry(),
+                    Some(PreDeliveryRetry::SameAccountTransientRetry {
+                        max_retries,
+                        initial_delay,
+                        max_delay,
+                    }) if max_retries.get() == 3
+                        && (Duration::from_millis(450)..Duration::from_millis(550))
+                            .contains(&initial_delay)
+                        && max_delay == Duration::from_secs(8)
+                )),
+            }
             assert!(provider_openai::openai_failure_affects_account_score(
                 &error
             ));
