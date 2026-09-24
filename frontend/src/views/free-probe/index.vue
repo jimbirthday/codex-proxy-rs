@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import type { FreeProbeExchange, ProbeHeader } from '@/api/modules/free-probe'
+import type { SelectOption } from '@/components/base/BaseSelect.vue'
 
 import { Plus, Trash2 } from '@lucide/vue'
-import { computed, onMounted, onScopeDispose, ref, shallowRef } from 'vue'
+import { useStorage } from '@vueuse/core'
+import { computed, onMounted, onScopeDispose, ref, shallowRef, watch } from 'vue'
 import { getAccounts, getProxies } from '@/api'
 import { probeBodyUrl, sendFreeProbe } from '@/api/modules/free-probe'
 import BaseButton from '@/components/base/BaseButton.vue'
@@ -17,21 +19,61 @@ import BaseTextarea from '@/components/base/BaseTextarea.vue'
 import { useCopyText } from '@/composables/useCopyText'
 import { errorMessage } from '@/utils/async'
 
-const mode = shallowRef('websocket_prewarm')
-const model = shallowRef('gpt-5.4')
-const method = shallowRef('POST')
-const url = shallowRef('')
-const accountId = shallowRef('')
-const useAccountHeaders = shallowRef(true)
-const proxyId = shallowRef('')
-const proxyUrl = shallowRef('')
-const timeout = shallowRef('60')
-const body = shallowRef('')
-const bodyEncoding = shallowRef('text')
+interface ProbeHeaderDraft {
+  id: number
+  enabled: boolean
+  name: string
+  value: string
+  encoding: string
+}
+
+interface FreeProbeDraft {
+  mode: string
+  model: string
+  method: string
+  url: string
+  accountId: string
+  useAccountHeaders: boolean
+  proxyId: string
+  proxyUrl: string
+  timeout: string
+  body: string
+  bodyEncoding: string
+  headers: ProbeHeaderDraft[]
+}
+
+const defaultHeaders: ProbeHeaderDraft[] = [{ id: 1, enabled: true, name: 'Content-Type', value: 'application/json', encoding: 'text' }]
+const storedDraft = useStorage<FreeProbeDraft>('codex-proxy-rs-free-probe', {
+  mode: 'websocket_prewarm',
+  model: 'gpt-5.4',
+  method: 'POST',
+  url: '',
+  accountId: '',
+  useAccountHeaders: true,
+  proxyId: '',
+  proxyUrl: '',
+  timeout: '60',
+  body: '',
+  bodyEncoding: 'text',
+  headers: defaultHeaders,
+})
+const mode = shallowRef(storedDraft.value.mode)
+const model = shallowRef(storedDraft.value.model)
+const method = shallowRef(storedDraft.value.method)
+const url = shallowRef(storedDraft.value.url)
+const accountId = shallowRef(storedDraft.value.accountId)
+const useAccountHeaders = shallowRef(storedDraft.value.useAccountHeaders)
+const proxyId = shallowRef(storedDraft.value.proxyId)
+const proxyUrl = shallowRef(storedDraft.value.proxyUrl)
+const timeout = shallowRef(storedDraft.value.timeout)
+const body = shallowRef(storedDraft.value.body)
+const bodyEncoding = shallowRef(storedDraft.value.bodyEncoding)
 let nextHeaderId = 1
-const headers = ref([{ id: nextHeaderId++, enabled: true, name: 'Content-Type', value: 'application/json', encoding: 'text' }])
-const accounts = shallowRef([{ label: '不使用账号', value: '' }])
-const proxies = shallowRef([{ label: '直连', value: '' }, { label: '自定义代理地址', value: 'custom' }])
+const headers = ref<ProbeHeaderDraft[]>(
+  (storedDraft.value.headers?.length ? storedDraft.value.headers : defaultHeaders).map(header => ({ ...header, id: nextHeaderId++ })),
+)
+const accounts = shallowRef<SelectOption[]>([{ label: '不使用账号', value: '' }])
+const proxies = shallowRef<SelectOption[]>([{ label: '直连', value: '' }, { label: '自定义代理地址', value: 'custom' }])
 const loadingCatalog = shallowRef(false)
 const catalogError = shallowRef('')
 const busy = shallowRef(false)
@@ -47,6 +89,27 @@ let controller: AbortController | undefined
 const catalogController = new AbortController()
 const encodings = [{ label: '文本 UTF-8', value: 'text' }, { label: 'Base64', value: 'base64' }]
 const views = [...encodings, { label: '十六进制', value: 'hex' }]
+
+function saveDraft() {
+  storedDraft.value = {
+    mode: mode.value,
+    model: model.value,
+    method: method.value,
+    url: url.value,
+    accountId: accountId.value,
+    useAccountHeaders: useAccountHeaders.value,
+    proxyId: proxyId.value,
+    proxyUrl: proxyUrl.value,
+    timeout: timeout.value,
+    body: body.value,
+    bodyEncoding: bodyEncoding.value,
+    headers: headers.value.map(header => ({ ...header })),
+  }
+}
+
+function accountIdentifier(account: Awaited<ReturnType<typeof getAccounts>>['items'][number]) {
+  return account.email?.trim() || account.accountId?.trim() || account.userId?.trim() || account.id
+}
 
 function bytes(value: string) {
   return Uint8Array.from(atob(value), char => char.charCodeAt(0))
@@ -98,7 +161,7 @@ async function loadCatalog() {
         const rows = [{ label: '不使用账号', value: '' }]
         for (let page = 1; ; page++) {
           const response = await getAccounts({ page, pageSize: 200 }, { signal: catalogController.signal, silent: true })
-          rows.push(...response.items.map(item => ({ label: `${item.name} · ${item.provider}`, value: item.id })))
+          rows.push(...response.items.map(item => ({ label: item.name || item.provider, description: accountIdentifier(item), value: item.id })))
           if (page >= response.page.totalPages)
             return rows
         }
@@ -115,6 +178,10 @@ async function loadCatalog() {
     ])
     accounts.value = accountRows
     proxies.value = proxyRows
+    if (accountId.value && !accountRows.some(option => option.value === accountId.value))
+      accountId.value = ''
+    if (proxyId.value && proxyId.value !== 'custom' && !proxyRows.some(option => option.value === proxyId.value))
+      proxyId.value = ''
   }
   catch (cause) {
     if (!catalogController.signal.aborted)
@@ -124,6 +191,8 @@ async function loadCatalog() {
     loadingCatalog.value = false
   }
 }
+
+watch([mode, model, method, url, accountId, useAccountHeaders, proxyId, proxyUrl, timeout, body, bodyEncoding, headers], saveDraft, { deep: true })
 
 async function send() {
   if (busy.value)
